@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VPN Client",
+  "version": "0.2.1",
+  "identifier": "local.vpn-client.app",
+  "build": { "frontendDist": "../ui" },
+  "app": { "windows": [{ "title": "VPN Client", "width": 760, "height": 620 }], "security": { "csp": "default-src 'self'; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost" } },
+  "bundle": { "active": false }
+}
