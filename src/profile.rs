@@ -24,6 +24,8 @@ pub fn vless_xhttp_config(link: &str, socks_port: u16) -> Result<Value, String> 
     let mut host = None;
     let mut mode = None;
     let mut encryption = None;
+    let mut alpn = None;
+    let mut fingerprint = None;
     for (key, value) in url.query_pairs() {
         let target = match key.as_ref() {
             "type" => &mut network,
@@ -33,6 +35,8 @@ pub fn vless_xhttp_config(link: &str, socks_port: u16) -> Result<Value, String> 
             "host" => &mut host,
             "mode" => &mut mode,
             "encryption" => &mut encryption,
+            "alpn" => &mut alpn,
+            "fp" => &mut fingerprint,
             _ => return Err(format!("Unsupported VLESS parameter: {key}")),
         };
         if target.replace(value.into_owned()).is_some() {
@@ -73,7 +77,7 @@ pub fn vless_xhttp_config(link: &str, socks_port: u16) -> Result<Value, String> 
     Ok(json!({
         "log": {"loglevel": "warning"},
         "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": true}}],
-        "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": server, "port": port, "users": [{"id": id, "encryption": "none"}]}]}, "streamSettings": {"network": "xhttp", "security": "tls", "tlsSettings": {"serverName": sni, "alpn": ["h2"], "fingerprint": "firefox"}, "xhttpSettings": xhttp}}]
+        "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": server, "port": port, "users": [{"id": id, "encryption": "none"}]}]}, "streamSettings": {"network": "xhttp", "security": "tls", "tlsSettings": {"serverName": sni, "alpn": alpn.as_deref().map(|v| v.split(',').map(str::to_owned).collect::<Vec<_>>()).unwrap_or_else(|| vec!["h2".into()]), "fingerprint": fingerprint.unwrap_or_else(|| "firefox".into())}, "xhttpSettings": xhttp}}]
     }))
 }
 

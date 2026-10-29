@@ -27,11 +27,11 @@ impl TrayStatus {
 }
 
 pub fn install(app: &mut tauri::App) -> tauri::Result<()> {
-    let connect = MenuItem::with_id(app, "connect", "Подключить VPN", true, None::<&str>)?;
     let disconnect = MenuItem::with_id(app, "disconnect", "Отключить VPN", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Открыть VPN Client", true, None::<&str>)?;
+    let admin = MenuItem::with_id(app, "admin", "Администрирование", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Завершить VPN Client", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&connect, &disconnect, &show, &quit])?;
+    let menu = Menu::with_items(app, &[&disconnect, &show, &admin, &quit])?;
     let connected = crate::helper::status().unwrap_or(false) || vpn_core::xray::has_running_process();
     let title = if connected { "VPN ●" } else { "VPN ○" };
     let tray = tauri::tray::TrayIconBuilder::with_id("vpn-status")
@@ -43,14 +43,6 @@ pub fn install(app: &mut tauri::App) -> tauri::Result<()> {
         })
         .menu(&menu)
         .on_menu_event(|app: &AppHandle, event| match event.id().as_ref() {
-            "connect" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    let state = app.state::<crate::xray::XrayState>();
-                    let tray = app.state::<TrayStatus>();
-                    let _ = crate::xray::connect_profile_inner(&state, &tray, 6, "vpn-client-test");
-                });
-            }
             "disconnect" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn_blocking(move || {
@@ -65,17 +57,13 @@ pub fn install(app: &mut tauri::App) -> tauri::Result<()> {
                     let _ = window.set_focus();
                 }
             }
+            "admin" => { let _ = crate::open_admin_window(app); }
             "quit" => app.exit(0),
             _ => {}
         })
         .build(app)?;
     app.manage(TrayStatus(Mutex::new(Some(tray))));
     Ok(())
-}
-
-#[tauri::command]
-pub fn get_vpn_status() -> bool {
-    crate::helper::status().unwrap_or(false) || vpn_core::xray::has_running_process()
 }
 
 #[tauri::command]
