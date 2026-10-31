@@ -4101,6 +4101,7 @@ dependencies = [
 name = "vpn-desktop"
 version = "0.2.5"
 dependencies = [
+ "libc",
  "qrcode",
  "serde",
  "serde_json",

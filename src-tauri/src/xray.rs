@@ -46,7 +46,9 @@ pub fn stop_vpn_inner(
 pub fn xray_stop(
     state: tauri::State<'_, XrayState>,
     tray: tauri::State<'_, crate::tray::TrayStatus>,
+    control: tauri::State<'_, crate::control::ControlState>,
 ) -> Result<(), String> {
+    let _guard = control.operation.lock().map_err(|_| "Управление VPN недоступно")?;
     stop_vpn_inner(&state, &tray)
 }
 

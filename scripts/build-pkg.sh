@@ -22,24 +22,26 @@ trap 'rm -rf "$STAGE"' EXIT
 if [ "${UNIVERSAL:-0}" = 1 ]; then
   [ -x "${XRAY_X86_64:-}" ] || { echo "UNIVERSAL=1 needs XRAY_X86_64" >&2; exit 1; }
   for t in aarch64-apple-darwin x86_64-apple-darwin; do
-    (cd "$ROOT" && cargo build --release --target "$t" --bin vpn-tun-helper)
+    (cd "$ROOT" && cargo build --release --target "$t" --bin vpn-tun-helper --bin vpn-core)
     (cd "$ROOT/src-tauri" && cargo build --release --target "$t" --features tauri/custom-protocol)
   done
   mkdir -p "$STAGE/bin"
   lipo -create -output "$STAGE/bin/app" "$ROOT/src-tauri/target/aarch64-apple-darwin/release/vpn-desktop" "$ROOT/src-tauri/target/x86_64-apple-darwin/release/vpn-desktop"
   lipo -create -output "$STAGE/bin/helper" "$ROOT/target/aarch64-apple-darwin/release/vpn-tun-helper" "$ROOT/target/x86_64-apple-darwin/release/vpn-tun-helper"
+  lipo -create -output "$STAGE/bin/mcp" "$ROOT/target/aarch64-apple-darwin/release/vpn-core" "$ROOT/target/x86_64-apple-darwin/release/vpn-core"
   lipo -create -output "$STAGE/bin/xray" "$XRAY_BIN" "$XRAY_X86_64"
-  APP_BIN="$STAGE/bin/app"; HELPER_BIN="$STAGE/bin/helper"; XRAY_OUT="$STAGE/bin/xray"
+  APP_BIN="$STAGE/bin/app"; HELPER_BIN="$STAGE/bin/helper"; MCP_BIN="$STAGE/bin/mcp"; XRAY_OUT="$STAGE/bin/xray"
 else
-  (cd "$ROOT" && cargo build --release --bin vpn-tun-helper)
+  (cd "$ROOT" && cargo build --release --bin vpn-tun-helper --bin vpn-core)
   (cd "$ROOT/src-tauri" && cargo build --release --features tauri/custom-protocol)
-  APP_BIN="$ROOT/src-tauri/target/release/vpn-desktop"; HELPER_BIN="$ROOT/target/release/vpn-tun-helper"; XRAY_OUT="$XRAY_BIN"
+  APP_BIN="$ROOT/src-tauri/target/release/vpn-desktop"; HELPER_BIN="$ROOT/target/release/vpn-tun-helper"; MCP_BIN="$ROOT/target/release/vpn-core"; XRAY_OUT="$XRAY_BIN"
 fi
 
 APP="$STAGE/root/Applications/VPNClient.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$OUT"
 cp "$APP_BIN" "$APP/Contents/MacOS/VPNClient"
 cp "$HELPER_BIN" "$APP/Contents/Helpers/vpn-tun-helper"
+cp "$MCP_BIN" "$APP/Contents/Helpers/vpn-mcp"
 cp "$XRAY_OUT" "$APP/Contents/Helpers/xray"
 
 cat > "$APP/Contents/Info.plist" <<EOF
@@ -67,7 +69,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-codesign --force --sign - "$APP/Contents/Helpers/xray" "$APP/Contents/Helpers/vpn-tun-helper"
+codesign --force --sign - "$APP/Contents/Helpers/xray" "$APP/Contents/Helpers/vpn-tun-helper" "$APP/Contents/Helpers/vpn-mcp"
 codesign --force --sign - "$APP"
 
 PKG="$OUT/VPNClient-$VERSION.pkg"

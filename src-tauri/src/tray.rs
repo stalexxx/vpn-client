@@ -46,6 +46,8 @@ pub fn install(app: &mut tauri::App) -> tauri::Result<()> {
             "disconnect" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn_blocking(move || {
+                    let control = app.state::<crate::control::ControlState>();
+                    let Ok(_guard) = control.operation.lock() else { return; };
                     let state = app.state::<crate::xray::XrayState>();
                     let tray = app.state::<TrayStatus>();
                     let _ = crate::xray::stop_vpn_inner(&state, &tray);

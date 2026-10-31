@@ -3,6 +3,11 @@ use std::{fs, os::unix::fs::OpenOptionsExt, path::PathBuf, time::Duration};
 
 const SERVICE: &str = "local.vpn-client.3x-ui";
 
+pub fn mcp_control_socket_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or("HOME is unavailable")?;
+    Ok(PathBuf::from(home).join("Library/Application Support/VpnClient/mcp/control.sock"))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Panel {
     pub name: String,

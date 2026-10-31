@@ -50,6 +50,7 @@
     list_connectable_profiles: () => (readPins(), servers.flatMap(server => profilesFor(server.id).filter(p => usable(p) && (pinnedProfiles === null || pinnedProfiles.some(k=>sameKey(k,{server_id:server.id,inbound_id:p.inbound_id,email:p.email})))).map(p => ({...p, server_id:server.id, server_name:server.name, country:server.country})))),
     list_pinned_profiles: () => { readPins(); return pinnedProfiles === null ? null : pinnedProfiles.map(k=>({...k})); },
     set_profile_pinned: ({serverId,inboundId,email,pinned}) => { if(fail('set_profile_pinned')) throw 'Не удалось изменить отметку (mock)'; readPins(); const key={server_id:serverId,inbound_id:inboundId,email}, all=allKeys(); if(pinned && !all.some(k=>sameKey(k,key))) throw 'Клиент недоступен'; if(pinnedProfiles===null) pinnedProfiles=all; pinnedProfiles=pinnedProfiles.filter(k=>!sameKey(k,key)); if(pinned) pinnedProfiles.push(key); savePins(); return null; },
+    select_mcp_profile: () => null,
     open_admin: () => null,
     panel_hostname: ({url}) => { try { return new URL(url).hostname; } catch { throw 'Некорректный адрес панели'; } },
     save_server: ({id, name, url, country, sshTarget, panelHost, token}) => {

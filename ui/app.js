@@ -6,6 +6,7 @@ const canConnect = p => !!p && p.enabled && p.inbound_enabled && p.protocol === 
 let profiles = [], selectedProfileKey = localStorage.getItem('vpn.selectedProfile') || null;
 let mode = 'off', busy = false;
 function key(p) { return `${p.server_id}:${p.inbound_id}:${p.email}`; }
+async function syncMcpSelection() { const p=profiles.find(p=>key(p)===selectedProfileKey); await invoke('select_mcp_profile',{profile:p ? {server_id:p.server_id,inbound_id:p.inbound_id,email:p.email} : null}); }
 function connectionState(value) {
   mode = value; const connected = mode !== 'off';
   $('connection-state').dataset.state = connected ? 'on' : 'off';
@@ -26,7 +27,7 @@ function renderProfiles() {
     const copy = document.createElement('span'); copy.className='profile-copy';
     const server = document.createElement('strong'); server.className='profile-server'; server.textContent=p.server_name || 'Сервер';
     const client = document.createElement('span'); client.className='profile-client'; client.textContent=p.email;
-    copy.append(server,client); row.append(country,copy); row.addEventListener('click',()=>{ selectedProfileKey=key(p); localStorage.setItem('vpn.selectedProfile', selectedProfileKey); renderProfiles(); connectionState(mode); }); list.append(row);
+    copy.append(server,client); row.append(country,copy); row.addEventListener('click',()=>{ selectedProfileKey=key(p); localStorage.setItem('vpn.selectedProfile', selectedProfileKey); syncMcpSelection().catch(e=>{ $('connection-error').textContent=`Не удалось сохранить выбор для MCP: ${e}`; $('connection-error').hidden=false; }); renderProfiles(); connectionState(mode); }); list.append(row);
   }
   const chosen = profiles.find(p=>key(p)===selectedProfileKey);
   $('active-profile-label').textContent = chosen ? `${flag(chosen.country)} ${chosen.server_name} · ${chosen.email}` : 'Выберите конфигурацию';
@@ -34,7 +35,7 @@ function renderProfiles() {
 }
 async function loadProfiles() {
   $('refresh').disabled=true;
-  try { profiles=await invoke('list_connectable_profiles'); if (!profiles.some(p=>key(p)===selectedProfileKey)) selectedProfileKey=profiles[0] ? key(profiles[0]) : null; if (selectedProfileKey) localStorage.setItem('vpn.selectedProfile',selectedProfileKey); else localStorage.removeItem('vpn.selectedProfile'); renderProfiles(); }
+  try { profiles=await invoke('list_connectable_profiles'); if (!profiles.some(p=>key(p)===selectedProfileKey)) selectedProfileKey=profiles[0] ? key(profiles[0]) : null; if (selectedProfileKey) localStorage.setItem('vpn.selectedProfile',selectedProfileKey); else localStorage.removeItem('vpn.selectedProfile'); await syncMcpSelection(); renderProfiles(); }
   catch(e) { $('profiles').innerHTML=''; const err=document.createElement('p'); err.className='empty-state'; err.textContent=`Не удалось загрузить конфигурации: ${e}`; $('profiles').append(err); }
   finally { $('refresh').disabled=false; }
 }
@@ -51,3 +52,5 @@ invoke('get_vpn_mode').then(connectionState).catch(()=>connectionState('off'));
 loadProfiles();
 
 window.addEventListener('focus', loadProfiles);
+
+setInterval(async()=>{ if(busy)return; try { const current=await invoke('get_vpn_mode'); if(!busy && current!==mode) connectionState(current); } catch {} },2000);

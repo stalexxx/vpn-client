@@ -2,6 +2,7 @@ mod tray;
 mod install;
 mod helper;
 mod xray;
+mod control;
 
 #[tauri::command]
 fn build_info() -> String {
@@ -81,7 +82,8 @@ fn client_qr(server_id: String, inbound_id: u64, email: String) -> Result<serde_
     Ok(serde_json::json!({"link": link, "size": size, "pixels": pixels}))
 }
 #[tauri::command]
-fn connect_profile(state: tauri::State<'_, xray::XrayState>, tray: tauri::State<'_, tray::TrayStatus>, server_id: String, inbound_id: u64, email: String) -> Result<String, String> {
+fn connect_profile(state: tauri::State<'_, xray::XrayState>, tray: tauri::State<'_, tray::TrayStatus>, control: tauri::State<'_, control::ControlState>, server_id: String, inbound_id: u64, email: String) -> Result<String, String> {
+    let _guard = control.operation.lock().map_err(|_| "Управление VPN недоступно")?;
     xray::connect_profile_inner(&state, &tray, &server_id, inbound_id, &email)
 }
 
@@ -117,10 +119,12 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             tray::install(app)?;
+            control::start(app.handle().clone()).map_err(std::io::Error::other)?;
             Ok(())
         })
         .manage(xray::XrayState::default())
         .manage(install::InstallState::default())
+        .manage(control::ControlState::default())
         .invoke_handler(tauri::generate_handler![
             tray::get_vpn_mode,
             build_info,
@@ -153,6 +157,7 @@ fn main() {
             list_pinned_profiles,
             set_profile_pinned,
             open_admin
+            ,control::select_mcp_profile
         ])
         .run(tauri::generate_context!())
         .expect("failed to start VPN Client");
