@@ -33,7 +33,7 @@
   let pinnedProfiles = JSON.parse(localStorage.getItem('vpn.dev.pinnedProfiles') || 'null');
   const readPins = () => { pinnedProfiles = JSON.parse(localStorage.getItem('vpn.dev.pinnedProfiles') || 'null'); return pinnedProfiles; };
   const savePins = () => localStorage.setItem('vpn.dev.pinnedProfiles', JSON.stringify(pinnedProfiles));
-  const usable = p => p.enabled && p.inbound_enabled && p.protocol === 'vless' && p.transport === 'xhttp' && p.has_local_config;
+  const usable = p => p.enabled && p.inbound_enabled && ['vless', 'hysteria'].includes(p.protocol) && p.has_local_config;
   const allKeys = () => servers.flatMap(s => profilesFor(s.id).filter(usable).map(p => ({server_id:s.id,inbound_id:p.inbound_id,email:p.email})));
   const sameKey = (a,b) => a.server_id===b.server_id && a.inbound_id===b.inbound_id && a.email===b.email;
   let mode = 'off';
@@ -51,6 +51,7 @@
     list_pinned_profiles: () => { readPins(); return pinnedProfiles === null ? null : pinnedProfiles.map(k=>({...k})); },
     set_profile_pinned: ({serverId,inboundId,email,pinned}) => { if(fail('set_profile_pinned')) throw 'Не удалось изменить отметку (mock)'; readPins(); const key={server_id:serverId,inbound_id:inboundId,email}, all=allKeys(); if(pinned && !all.some(k=>sameKey(k,key))) throw 'Клиент недоступен'; if(pinnedProfiles===null) pinnedProfiles=all; pinnedProfiles=pinnedProfiles.filter(k=>!sameKey(k,key)); if(pinned) pinnedProfiles.push(key); savePins(); return null; },
     select_mcp_profile: () => null,
+    get_mcp_profile: () => null,
     open_admin: () => null,
     panel_hostname: ({url}) => { try { return new URL(url).hostname; } catch { throw 'Некорректный адрес панели'; } },
     save_server: ({id, name, url, country, sshTarget, panelHost, token}) => {
@@ -66,7 +67,7 @@
     list_inbound_templates: () => [{id:'VLESS-XHTTP-443',name:'VLESS-XHTTP-443',description:'VLESS, XHTTP и TLS',remark:'VLESS-XHTTP-443',port:443,path:'/'},{id:'VLESS-VISION-8443',name:'VLESS-VISION-8443',description:'VLESS, TCP и TLS (Vision)',remark:'VLESS-VISION-8443',port:8443,path:'/'}],
     create_server_inbound: ({serverId,templateId,params:data}) => { if(fail('create_server_inbound')) throw 'Не удалось создать inbound (mock)'; const created={id:inboundSequence++,remark:data.remark,port:data.port,protocol:'vless',enable:true,transport:templateId==='VLESS-VISION-8443'?'tcp':'xhttp'}; savedInboundMap.set(serverId,[...inbounds(serverId),created]); return created.id; },
     new_wizard_id: () => { if (fail('new_wizard_id')) throw 'Не удалось подготовить мастер (mock)'; const id = String(wizardSequence++).padStart(32, '0'); wizardInboundMap.set(id, []); wizardProfileMap.set(id, []); return id; },
-    stage_wizard_token: ({wizardId, token}) => { if (fail('stage_wizard_token')) throw 'Не удалось сохранить токен в Keychain (mock)'; wizardTokens.set(wizardId, token); return null; },
+    stage_wizard_token: ({wizardId, token}) => { if (fail('stage_wizard_token')) throw 'Не удалось сохранить токен (mock)'; wizardTokens.set(wizardId, token); return null; },
     clear_wizard_token: ({wizardId}) => { if (fail('clear_wizard_token')) throw 'Не удалось удалить временный токен (mock)'; wizardTokens.delete(wizardId); return null; },
     list_wizard_inbounds: ({wizardId}) => {
       if (fail('list_wizard_inbounds')) throw 'Не удалось загрузить inbound-ы панели (mock)';

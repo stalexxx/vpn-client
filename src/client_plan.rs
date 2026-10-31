@@ -28,8 +28,8 @@ pub fn prepare(inbounds: &Value, inbound_id: u64, email: &str) -> Result<ClientP
         .iter()
         .find(|item| item.get("id").and_then(Value::as_u64) == Some(inbound_id))
         .ok_or("Inbound not found")?;
-    if inbound.get("protocol").and_then(Value::as_str) != Some("vless") {
-        return Err("Only VLESS is supported".into());
+    if !["vless", "hysteria"].contains(&inbound.get("protocol").and_then(Value::as_str).unwrap_or("")) {
+        return Err("Only VLESS and Hysteria 2 are supported".into());
     }
     if inbound.get("enable").and_then(Value::as_bool) != Some(true) {
         return Err("Inbound is disabled".into());
@@ -52,9 +52,10 @@ mod tests {
     use super::*;
     #[test]
     fn permits_only_enabled_vless_and_safe_names() {
-        let list = serde_json::json!([{"id": 2, "remark": "Main", "protocol": "vless", "enable": true},{"id": 3,"protocol":"trojan","enable":true},{"id":4,"protocol":"vless","enable":false}]);
+        let list = serde_json::json!([{"id": 2, "remark": "Main", "protocol": "vless", "enable": true},{"id": 3,"protocol":"hysteria","enable":true},{"id": 5,"protocol":"trojan","enable":true},{"id":4,"protocol":"vless","enable":false}]);
         assert!(prepare(&list, 2, "alice@example.com").is_ok());
-        assert!(prepare(&list, 3, "alice").is_err());
+        assert!(prepare(&list, 3, "alice").is_ok());
+        assert!(prepare(&list, 5, "alice").is_err());
         assert!(prepare(&list, 4, "alice").is_err());
         assert!(prepare(&list, 2, "bad\nname").is_err());
         assert!(prepare(&list, 99, "alice").is_err());

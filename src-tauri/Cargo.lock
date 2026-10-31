@@ -4089,6 +4089,7 @@ name = "vpn-core"
 version = "0.2.5"
 dependencies = [
  "libc",
+ "percent-encoding",
  "reqwest",
  "security-framework",
  "serde",

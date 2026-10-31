@@ -158,6 +158,7 @@ fn main() {
             set_profile_pinned,
             open_admin
             ,control::select_mcp_profile
+            ,control::get_mcp_profile
         ])
         .run(tauri::generate_context!())
         .expect("failed to start VPN Client");

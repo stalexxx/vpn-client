@@ -2,6 +2,7 @@
 # Build an installable VPNClient-<version>.pkg.
 #
 #   scripts/build-pkg.sh [output-dir]      # default: ./dist, host architecture
+#   TARGET=x86_64-apple-darwin XRAY_BIN=/path/to/xray scripts/build-pkg.sh
 #   UNIVERSAL=1 XRAY_X86_64=/path/to/xray-x86_64 scripts/build-pkg.sh
 #
 # The helper only trusts a root-owned bundle, so the app must be installed from
@@ -32,9 +33,12 @@ if [ "${UNIVERSAL:-0}" = 1 ]; then
   lipo -create -output "$STAGE/bin/xray" "$XRAY_BIN" "$XRAY_X86_64"
   APP_BIN="$STAGE/bin/app"; HELPER_BIN="$STAGE/bin/helper"; MCP_BIN="$STAGE/bin/mcp"; XRAY_OUT="$STAGE/bin/xray"
 else
-  (cd "$ROOT" && cargo build --release --bin vpn-tun-helper --bin vpn-core)
-  (cd "$ROOT/src-tauri" && cargo build --release --features tauri/custom-protocol)
-  APP_BIN="$ROOT/src-tauri/target/release/vpn-desktop"; HELPER_BIN="$ROOT/target/release/vpn-tun-helper"; MCP_BIN="$ROOT/target/release/vpn-core"; XRAY_OUT="$XRAY_BIN"
+  TARGET="${TARGET:-}"
+  TARGET_ARGS=(); [ -z "$TARGET" ] || TARGET_ARGS=(--target "$TARGET")
+  (cd "$ROOT" && cargo build --release "${TARGET_ARGS[@]}" --bin vpn-tun-helper --bin vpn-core)
+  (cd "$ROOT/src-tauri" && cargo build --release "${TARGET_ARGS[@]}" --features tauri/custom-protocol)
+  TARGET_DIR="${TARGET:+$TARGET/}"
+  APP_BIN="$ROOT/src-tauri/target/${TARGET_DIR}release/vpn-desktop"; HELPER_BIN="$ROOT/target/${TARGET_DIR}release/vpn-tun-helper"; MCP_BIN="$ROOT/target/${TARGET_DIR}release/vpn-core"; XRAY_OUT="$XRAY_BIN"
 fi
 
 APP="$STAGE/root/Applications/VPNClient.app"

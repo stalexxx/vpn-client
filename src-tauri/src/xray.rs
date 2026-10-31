@@ -20,7 +20,18 @@ pub fn connect_profile_inner(
         vpn_core::proxy::restore_proxy(&vpn_core::proxy::MacNetworkSetup, &proxy_journal)?;
     }
     let link = vpn_core::cached_client_share_link(server_id, inbound_id, email)?;
-    let result = crate::helper::start(&link)?;
+    let relay_link = if link.starts_with("hysteria2://") {
+        let candidates = vpn_core::all_connectable_profiles()?;
+        let relay = candidates.iter().find(|p| p["server_id"].as_str() != Some(server_id)
+            && p["protocol"] == "vless" && p["transport"] == "xhttp" && p["has_local_config"] == true)
+            .ok_or("Для Hysteria 2 в этой сети нужен доступный VLESS/XHTTP relay с другого сервера")?;
+        Some(vpn_core::cached_client_share_link(
+            relay["server_id"].as_str().ok_or("Relay server id is missing")?,
+            relay["inbound_id"].as_u64().ok_or("Relay inbound id is missing")?,
+            relay["email"].as_str().ok_or("Relay email is missing")?,
+        )?)
+    } else { None };
+    let result = crate::helper::start(&link, relay_link.as_deref())?;
     crate::tray::update(tray, true)?;
     Ok(result)
 }

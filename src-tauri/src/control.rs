@@ -15,6 +15,11 @@ pub fn select_mcp_profile(state: tauri::State<'_, ControlState>, profile: Option
     Ok(())
 }
 
+#[tauri::command]
+pub fn get_mcp_profile(state: tauri::State<'_, ControlState>) -> Result<Option<PinnedProfile>, String> {
+    state.selected.lock().map(|p| p.clone()).map_err(|_| "Выбор конфигурации недоступен".into())
+}
+
 pub fn start(app: tauri::AppHandle) -> Result<(), String> {
     let path = vpn_core::mcp_control_socket_path()?;
     let dir = path.parent().ok_or("Некорректный путь MCP")?;
@@ -46,8 +51,10 @@ fn handle(mut stream: UnixStream, app: tauri::AppHandle) {
         let tray = app.state::<crate::tray::TrayStatus>();
         match request.get("action").and_then(|v| v.as_str()) {
             Some("connect") => {
-                let profile = state.selected.lock().map_err(|_| "Выбор конфигурации недоступен")?.clone().ok_or("Выберите конфигурацию в приложении")?;
+                let requested = request.get("profile").map(|v| serde_json::from_value::<PinnedProfile>(v.clone()).map_err(|_| "Некорректная конфигурация".to_owned())).transpose()?;
+                let profile = requested.clone().or(state.selected.lock().map_err(|_| "Выбор конфигурации недоступен")?.clone()).ok_or("Выберите конфигурацию в приложении")?;
                 if !vpn_core::list_connectable_profiles()?.iter().any(|item| item["server_id"] == profile.server_id && item["inbound_id"] == profile.inbound_id && item["email"] == profile.email) { return Err("Выбранная конфигурация больше недоступна".into()); }
+                if requested.is_some() { *state.selected.lock().map_err(|_| "Выбор конфигурации недоступен")? = Some(profile.clone()); }
                 crate::xray::connect_profile_inner(&xray, &tray, &profile.server_id, profile.inbound_id, &profile.email)
             }
             Some("disconnect") => crate::xray::stop_vpn_inner(&xray, &tray).map(|_| "VPN отключён.".to_owned()),

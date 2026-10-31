@@ -2,7 +2,7 @@ const invoke = window.__TAURI_INTERNALS__.invoke;
 const $ = id => document.getElementById(id);
 const countryNames = new Intl.DisplayNames(['ru'], {type:'region'});
 function flag(code) { return code && /^[A-Z]{2}$/.test(code) ? String.fromCodePoint(...[...code].map(c => 127397 + c.charCodeAt(0))) : ''; }
-const canConnect = p => !!p && p.enabled && p.inbound_enabled && p.protocol === 'vless' && p.transport === 'xhttp' && p.has_local_config;
+const canConnect = p => !!p && p.enabled && p.inbound_enabled && ['vless', 'hysteria'].includes(p.protocol) && p.has_local_config;
 let profiles = [], selectedProfileKey = localStorage.getItem('vpn.selectedProfile') || null;
 let mode = 'off', busy = false;
 function key(p) { return `${p.server_id}:${p.inbound_id}:${p.email}`; }
@@ -53,4 +53,4 @@ loadProfiles();
 
 window.addEventListener('focus', loadProfiles);
 
-setInterval(async()=>{ if(busy)return; try { const current=await invoke('get_vpn_mode'); if(!busy && current!==mode) connectionState(current); } catch {} },2000);
+setInterval(async()=>{ if(busy)return; try { const [current,selected]=await Promise.all([invoke('get_vpn_mode'),invoke('get_mcp_profile')]); if(selected){const selectedKey=key(selected);if(selectedKey!==selectedProfileKey && profiles.some(p=>key(p)===selectedKey)){selectedProfileKey=selectedKey;localStorage.setItem('vpn.selectedProfile',selectedKey);renderProfiles();}} if(!busy && current!==mode) connectionState(current); } catch {} },2000);

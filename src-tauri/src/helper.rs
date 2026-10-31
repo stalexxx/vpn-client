@@ -34,6 +34,9 @@ fn helper_status(timeout: Duration) -> Option<Value> {
 fn helper_is_compatible(status: &Value) -> bool {
     status.get("version").and_then(Value::as_str) == Some(APP_VERSION)
         && status.get("connectivity_check").and_then(Value::as_bool) == Some(true)
+        && status.get("reality_support").and_then(Value::as_bool) == Some(true)
+        && status.get("hysteria2_support").and_then(Value::as_bool) == Some(true)
+        && status.get("hysteria_chain_support").and_then(Value::as_bool) == Some(true)
 }
 fn osascript_admin(command: &str) -> Result<(), String> {
     let script = format!("do shell script \"{}\" with administrator privileges", command.replace('\\', "\\\\").replace('"', "\\\""));
@@ -114,20 +117,27 @@ fn request_value(request: Value) -> Result<Value, String> {
     }
     Ok(response)
 }
-fn request(action: &str, link: Option<&str>) -> Result<Value, String> { request_value(json!({"action":action,"link":link})) }
-pub fn status() -> Result<bool, String> { Ok(request("status", None)?.get("connected").and_then(Value::as_bool).unwrap_or(false)) }
-pub fn start(link: &str) -> Result<String, String> {
+fn request(action: &str, link: Option<&str>, relay_link: Option<&str>) -> Result<Value, String> { request_value(json!({"action":action,"link":link,"relay_link":relay_link})) }
+pub fn status() -> Result<bool, String> { Ok(request("status", None, None)?.get("connected").and_then(Value::as_bool).unwrap_or(false)) }
+pub fn start(link: &str, relay_link: Option<&str>) -> Result<String, String> {
     ensure_installed()?;
-    Ok(request("start", Some(link))?.get("message").and_then(Value::as_str).unwrap_or("TUN подключён").to_owned())
+    Ok(request("start", Some(link), relay_link)?.get("message").and_then(Value::as_str).unwrap_or("TUN подключён").to_owned())
 }
 pub fn stop() -> Result<(), String> {
     if helper_status(Duration::from_secs(15)).is_none() { ensure_installed()?; }
-    request("stop", None).map(|_| ())
+    request("stop", None, None).map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_helper_without_reality_capability_requires_upgrade() {
+        assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true})));
+        assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true})));
+        assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true})));
+        assert!(helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true})));
+    }
     #[test]
     fn only_applications_may_be_admin_group_writable() {
         assert!(component_is_trusted(Path::new("/Library/VPNClient"), 0, 0, 0o755));

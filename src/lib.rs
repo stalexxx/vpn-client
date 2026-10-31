@@ -3,6 +3,51 @@ use std::{fs, os::unix::fs::OpenOptionsExt, path::PathBuf, time::Duration};
 
 const SERVICE: &str = "local.vpn-client.3x-ui";
 
+// Tokens are stored per user. Keychain is consulted only when migrating an
+// existing account for the first time; new and migrated tokens use this file.
+fn token_store<F, T>(f: F) -> Result<T, String>
+where F: FnOnce(&mut std::collections::BTreeMap<String, String>) -> Result<(T, bool), String> {
+    token_store_at(&config_path()?.with_file_name("panel-tokens.json"), f)
+}
+fn token_store_at<F, T>(path: &std::path::Path, f: F) -> Result<T, String>
+where F: FnOnce(&mut std::collections::BTreeMap<String, String>) -> Result<(T, bool), String> {
+    use std::os::fd::AsRawFd;
+    let dir = path.parent().ok_or("Некорректный путь хранилища токенов")?;
+    fs::create_dir_all(dir).map_err(|_| "Не удалось создать каталог токенов")?;
+    let lock = fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+        .open(dir.join("panel-tokens.lock")).map_err(|_| "Не удалось открыть хранилище токенов")?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 { return Err("Не удалось заблокировать хранилище токенов".into()); }
+    let mut tokens = match fs::read(path) {
+        Ok(data) => serde_json::from_slice(&data).map_err(|_| "Некорректное хранилище токенов")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::collections::BTreeMap::new(),
+        Err(_) => return Err("Не удалось прочитать хранилище токенов".into()),
+    };
+    let (result, changed) = f(&mut tokens)?;
+    if changed {
+        let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|_| "Не удалось сохранить токены")?;
+        serde_json::to_writer(&mut temp, &tokens).map_err(|_| "Не удалось сохранить токены")?;
+        temp.persist(path).map_err(|_| "Не удалось сохранить токены")?;
+    }
+    Ok(result)
+}
+
+fn token_set(account: &str, token: &str) -> Result<(), String> {
+    token_store(|tokens| { tokens.insert(account.to_owned(), token.to_owned()); Ok(((), true)) })
+}
+fn token_get(account: &str) -> Result<String, String> {
+    token_store(|tokens| {
+        if let Some(token) = tokens.get(account) { return Ok((token.clone(), false)); }
+        let bytes = security_framework::passwords::get_generic_password(SERVICE, account)
+            .map_err(|_| "Токен не найден; при необходимости укажите его в настройках сервера".to_owned())?;
+        let token = String::from_utf8(bytes).map_err(|_| "Некорректный сохранённый токен")?;
+        tokens.insert(account.to_owned(), token.clone());
+        Ok((token, true))
+    })
+}
+fn token_delete(account: &str) -> Result<(), String> {
+    token_store(|tokens| { let changed = tokens.remove(account).is_some(); Ok(((), changed)) })
+}
+
 pub fn mcp_control_socket_path() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or("HOME is unavailable")?;
     Ok(PathBuf::from(home).join("Library/Application Support/VpnClient/mcp/control.sock"))
@@ -72,7 +117,7 @@ pub fn valid_ssh_target(target: &str) -> bool {
         })
 }
 
-fn wizard_keychain_account(id: &str) -> Result<String, String> {
+fn wizard_token_account(id: &str) -> Result<String, String> {
     if !valid_server_id(id) { return Err("Некорректный идентификатор мастера".into()); }
     Ok(format!("wizard-{id}"))
 }
@@ -81,24 +126,18 @@ pub fn new_wizard_id() -> Result<String, String> { new_server_id() }
 
 pub fn stage_wizard_token(id: &str, token: &str) -> Result<(), String> {
     if token.trim().is_empty() { return Err("Укажите API-токен панели".into()); }
-    let account = wizard_keychain_account(id)?;
-    security_framework::passwords::set_generic_password(SERVICE, &account, token.as_bytes())
-        .map_err(|e| format!("Keychain: {e}"))
+    let account = wizard_token_account(id)?;
+    token_set(&account, token)
 }
 
 fn staged_wizard_token(id: &str) -> Result<String, String> {
-    let account = wizard_keychain_account(id)?;
-    let token = security_framework::passwords::get_generic_password(SERVICE, &account)
-        .map_err(|_| "Токен мастера отсутствует в Keychain. Вернитесь к шагу 1.".to_owned())?;
-    String::from_utf8(token).map_err(|_| "Некорректный токен в Keychain".into())
+    let account = wizard_token_account(id)?;
+    token_get(&account).map_err(|_| "Токен мастера отсутствует. Вернитесь к шагу 1.".to_owned())
 }
 
 pub fn clear_wizard_token(id: &str) -> Result<(), String> {
-    let account = wizard_keychain_account(id)?;
-    match security_framework::passwords::delete_generic_password(SERVICE, &account) {
-        Ok(()) => Ok(()),
-        Err(_) => Ok(()),
-    }
+    let account = wizard_token_account(id)?;
+    token_delete(&account)
 }
 
 struct Tunnel(std::process::Child);
@@ -117,8 +156,12 @@ fn ssh_tunnel(target: &str, port: u16) -> Result<(Tunnel, u16), String> {
     let local = listener.local_addr().map_err(|e| e.to_string())?.port();
     drop(listener);
     let forward = format!("127.0.0.1:{local}:127.0.0.1:{port}");
-    let child = Command::new("/usr/bin/ssh")
-        .args([
+    let mut ssh = Command::new("/usr/bin/ssh");
+    if let Some(home) = std::env::var_os("HOME") {
+        let key = PathBuf::from(home).join(".ssh/id_ed25519_vpn_client");
+        if key.is_file() { ssh.arg("-i").arg(key); }
+    }
+    let child = ssh.args([
             "-N",
             "-o",
             "BatchMode=yes",
@@ -159,8 +202,7 @@ pub fn save_panel(panel: &Panel, token: &str) -> Result<(), String> {
     let path = config_path()?;
     let dir = path.parent().ok_or("Invalid configuration path")?;
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    security_framework::passwords::set_generic_password(SERVICE, &panel.url, token.as_bytes())
-        .map_err(|e| format!("Keychain: {e}"))?;
+    token_set(&panel.url, token)?;
     fs::write(
         path,
         serde_json::to_vec_pretty(panel).map_err(|e| e.to_string())?,
@@ -240,8 +282,8 @@ where F: FnMut(&str, &str) -> Result<(), String> {
 }
 pub fn list_servers() -> Result<Vec<Server>, String> {
     migrate_panel(&config_path()?, &servers_path()?, |url, id| {
-        let token = security_framework::passwords::get_generic_password(SERVICE, url).map_err(|e| format!("Keychain: {e}"))?;
-        security_framework::passwords::set_generic_password(SERVICE, id, &token).map_err(|e| format!("Keychain: {e}"))
+        let token = token_get(url)?;
+        token_set(id, &token)
     })
 }
 pub fn save_server(id: Option<String>, panel: Panel, token: &str, country: Option<String>) -> Result<Server, String> {
@@ -252,7 +294,7 @@ pub fn save_server(id: Option<String>, panel: Panel, token: &str, country: Optio
     let id = match id { Some(id) if servers.iter().any(|s| s.id == id) => id, Some(_) => return Err("Сервер не найден".into()), None => new_server_id()? };
     let existing = servers.iter().position(|s| s.id == id);
     if existing.is_none() && token.trim().is_empty() { return Err("Укажите API-токен".into()); }
-    if !token.trim().is_empty() { security_framework::passwords::set_generic_password(SERVICE, &id, token.as_bytes()).map_err(|e| format!("Keychain: {e}"))?; }
+    if !token.trim().is_empty() { token_set(&id, token)?; }
     let server = Server { id, panel, country };
     if let Some(index) = existing { servers[index] = server.clone(); } else { servers.push(server.clone()); }
     write_servers(&servers_path()?, &servers)?;
@@ -262,7 +304,7 @@ pub fn delete_server(id: &str) -> Result<(), String> {
     let mut servers = list_servers()?;
     let server = servers.iter().find(|s| s.id == id).ok_or("Сервер не найден")?;
     clear_pending_for_server(&pending_path()?, &config_path()?, server)?;
-    security_framework::passwords::delete_generic_password(SERVICE, id).map_err(|e| format!("Keychain: {e}"))?;
+    token_delete(id)?;
     match fs::remove_file(profile_cache_path(id)?) { Ok(()) => (), Err(e) if e.kind() == std::io::ErrorKind::NotFound => (), Err(e) => return Err(e.to_string()) }
     let _guard = PIN_LOCK.lock().map_err(|_| "Не удалось заблокировать список избранного")?;
     remove_server_pins(&pins_path()?, id)?;
@@ -271,17 +313,14 @@ pub fn delete_server(id: &str) -> Result<(), String> {
 }
 fn server_for(id: &str) -> Result<Server, String> { list_servers()?.into_iter().find(|s| s.id == id).ok_or_else(|| "Сервер не найден".into()) }
 fn server_token(id: &str) -> Result<String, String> {
-    let token = security_framework::passwords::get_generic_password(SERVICE, id).map_err(|e| format!("Keychain: {e}"))?;
-    String::from_utf8(token).map_err(|_| "Некорректный токен в Keychain".into())
+    token_get(id)
 }
 pub fn server_inbounds(id: &str) -> Result<serde_json::Value, String> { let s = server_for(id)?; list_inbounds_for(&s.panel, &server_token(id)?) }
 
 pub fn list_inbounds() -> Result<serde_json::Value, String> {
     let panel = load_panel()?.ok_or("No panel configured")?;
-    let token = security_framework::passwords::get_generic_password(SERVICE, &panel.url)
-        .map_err(|e| format!("Keychain: {e}"))?;
-    let token = std::str::from_utf8(&token).map_err(|_| "Invalid token in Keychain")?;
-    list_inbounds_for(&panel, token)
+    let token = token_get(&panel.url)?;
+    list_inbounds_for(&panel, &token)
 }
 
 fn panel_request(
@@ -368,7 +407,7 @@ fn public_profiles(profiles: &[CachedClientProfile]) -> Result<serde_json::Value
         "inbound_id": p.inbound_id, "inbound_name": p.inbound_name, "port": p.port,
         "protocol": p.protocol, "transport": p.transport,
         "inbound_enabled": p.inbound_enabled, "email": p.email, "enabled": p.enabled,
-        "has_local_config": p.share_link.as_ref().is_some_and(|link| crate::profile::vless_xhttp_config(link, 10808).is_ok())
+        "has_local_config": p.share_link.as_ref().is_some_and(|link| crate::profile::vless_config(link, 10808).is_ok())
     })).collect::<Vec<_>>();
     Ok(serde_json::Value::Array(value))
 }
@@ -426,7 +465,7 @@ pub fn all_connectable_profiles() -> Result<Vec<serde_json::Value>, String> {
     for server in list_servers()? {
         let profiles = list_client_profiles(&server.id)?;
         if let Some(items) = profiles.as_array() { for profile in items {
-            if profile["enabled"] != true || profile["inbound_enabled"] != true || profile["protocol"] != "vless" || profile["transport"] != "xhttp" || profile["has_local_config"] != true { continue; }
+            if profile["enabled"] != true || profile["inbound_enabled"] != true || !["vless", "hysteria"].contains(&profile["protocol"].as_str().unwrap_or("")) || profile["has_local_config"] != true { continue; }
             let mut item = profile.clone();
             if let Some(object) = item.as_object_mut() {
                 object.insert("server_id".into(), serde_json::json!(server.id));
@@ -451,7 +490,7 @@ pub fn set_profile_pinned(server_id: &str, inbound_id: u64, email: &str, pinned:
     let _guard = PIN_LOCK.lock().map_err(|_| "Не удалось заблокировать список избранного")?;
     let all: Vec<PinnedProfile> = all_connectable_profiles()?.iter().filter_map(profile_key).collect();
     let key = PinnedProfile { server_id:server_id.into(), inbound_id, email:email.into() };
-    if pinned && !all.contains(&key) { return Err("У клиента нет доступной локальной конфигурации VLESS/TLS/XHTTP".into()); }
+    if pinned && !all.contains(&key) { return Err("У клиента нет доступной локальной конфигурации".into()); }
     change_pins(&pins_path()?, &all, key, pinned)
 }
 pub fn cached_server_inbounds(id: &str) -> Result<serde_json::Value, String> {
@@ -484,8 +523,8 @@ pub fn refresh_client_profiles(id: &str) -> Result<serde_json::Value, String> {
             let Some(email) = client.get("email").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) else { continue; };
             let enabled = client.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
             let inbound_enabled = inbound.get("enable").and_then(|v| v.as_bool()).unwrap_or(false);
-            let share_link = if protocol == "vless" && transport == "xhttp" && security == "tls" && inbound_enabled && enabled {
-                client_share_link_with_token(&panel, token, email, id).ok().filter(|link| crate::profile::vless_xhttp_config(link, 10808).is_ok())
+            let share_link = if ((protocol == "vless" && ((transport == "xhttp" && security == "tls") || (transport == "tcp" && security == "reality"))) || (protocol == "hysteria" && transport == "hysteria" && security == "tls")) && inbound_enabled && enabled {
+                client_share_link_with_token(&panel, token, email, id).ok().filter(|link| crate::profile::vless_config(link, 10808).is_ok())
             } else { None };
             profiles.push(CachedClientProfile {
                 inbound_id: id,
@@ -514,7 +553,7 @@ pub fn cached_client_share_link(id: &str, inbound_id: u64, email: &str) -> Resul
     let cache: ProfileCache = serde_json::from_slice(&data).map_err(|_| "Invalid local client profile cache")?;
     if cache.panel_url != panel.url { return Err("Local profiles belong to a different panel. Refresh the profile list.".into()); }
     cache.profiles.into_iter().find(|p| p.inbound_id == inbound_id && p.email == email)
-        .and_then(|p| p.share_link).filter(|link| crate::profile::vless_xhttp_config(link, 10808).is_ok()).ok_or_else(|| "У клиента нет локальной конфигурации VLESS/TLS/XHTTP. Обновите список клиентов.".into())
+        .and_then(|p| p.share_link).filter(|link| crate::profile::vless_config(link, 10808).is_ok()).ok_or_else(|| "У клиента нет подходящей локальной конфигурации VLESS. Обновите список клиентов.".into())
 }
 
 pub fn list_inbounds_for(panel: &Panel, token: &str) -> Result<serde_json::Value, String> {
@@ -592,8 +631,12 @@ mkdir -p "$CERT_DIR"
 chmod 600 "$CERT_DIR/privkey.pem"
 chmod 644 "$CERT_DIR/fullchain.pem"
 test -s "$CERT_DIR/privkey.pem" -a -s "$CERT_DIR/fullchain.pem""#);
-    let output = std::process::Command::new("/usr/bin/ssh")
-        .args(["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "--", target, &command])
+    let mut ssh = std::process::Command::new("/usr/bin/ssh");
+    if let Some(home) = std::env::var_os("HOME") {
+        let key = PathBuf::from(home).join(".ssh/id_ed25519_vpn_client");
+        if key.is_file() { ssh.arg("-i").arg(key); }
+    }
+    let output = ssh.args(["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "--", target, &command])
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .status().map_err(|_| "Не удалось запустить системный SSH для сертификата".to_owned())?;
     match status_code(output.code()) {
@@ -647,6 +690,73 @@ fn create_client_with_token(panel: &Panel, token: &str, inbound_id: u64, email: 
     Ok(())
 }
 
+fn reality_inbound_body(sni: &str, private: &str, public: &str, short_id: &str) -> serde_json::Value {
+    let stream = serde_json::json!({"network":"tcp","security":"reality","realitySettings":{"show":false,"xver":0,"target":format!("{sni}:443"),"serverNames":[sni],"privateKey":private,"shortIds":[short_id],"settings":{"publicKey":public,"fingerprint":"chrome","serverName":sni,"spiderX":"/"}},"tcpSettings":{"header":{"type":"none"}}});
+    serde_json::json!({"up":0,"down":0,"total":0,"remark":"VLESS-REALITY-443","enable":true,"expiryTime":0,"listen":"","port":443,"protocol":"vless","settings":serde_json::json!({"clients":[],"decryption":"none","encryption":"none","fallbacks":[]}).to_string(),"streamSettings":stream.to_string(),"sniffing":serde_json::json!({"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}).to_string()})
+}
+
+fn hysteria2_inbound_body(sni: &str) -> serde_json::Value {
+    let stream = serde_json::json!({"network":"hysteria","security":"tls","tlsSettings":{"serverName":sni,"alpn":["h3"],"certificates":[{"certificateFile":format!("/root/cert/{sni}/fullchain.pem"),"keyFile":format!("/root/cert/{sni}/privkey.pem"),"oneTimeLoading":false,"usage":"encipherment","buildChain":false}]},"hysteriaSettings":{"version":2,"udpIdleTimeout":60}});
+    serde_json::json!({"up":0,"down":0,"total":0,"remark":"HYSTERIA2-UDP-443","enable":true,"expiryTime":0,"listen":"","port":443,"protocol":"hysteria","settings":serde_json::json!({"version":2,"clients":[]}).to_string(),"streamSettings":stream.to_string(),"sniffing":serde_json::json!({"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}).to_string()})
+}
+
+pub fn create_hysteria2_client(host: &str, email: &str, sni: &str) -> Result<(String, u64), String> {
+    if !valid_http_host(host) || !valid_domain_name(sni) { return Err("Некорректный хост или SNI".into()); }
+    if email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Некорректное имя клиента".into()); }
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|s| s.rsplit('@').next()) == Some(host)).collect();
+    if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
+    let server = &servers[0]; let token = server_token(&server.id)?;
+    let target = server.panel.ssh_target.as_deref().ok_or("Для выпуска сертификата укажите SSH-цель в настройках сервера")?;
+    ensure_wizard_certificate(target, sni)?;
+    let list = panel_request(&server.panel, &token, "inbounds/list", None)?;
+    let items = list.get("obj").and_then(|v| v.as_array()).ok_or("Некорректный список inbound-ов")?;
+    let id = if let Some(existing) = items.iter().find(|v| v["remark"] == "HYSTERIA2-UDP-443" && v["port"] == 443 && v["protocol"] == "hysteria") {
+        existing["id"].as_u64().ok_or("Некорректный ID inbound-а")?
+    } else {
+        if items.iter().any(|v| v["port"] == 443 && v["protocol"] != "hysteria") { /* TCP and UDP listeners can share a port. */ }
+        let response = panel_request(&server.panel, &token, "inbounds/add", Some(hysteria2_inbound_body(sni)))?;
+        response.get("obj").and_then(serde_json::Value::as_u64).or_else(|| list_inbounds_for(&server.panel, &token).ok()?.as_array()?.iter().find(|v| v["remark"] == "HYSTERIA2-UDP-443" && v["port"] == 443)?.get("id")?.as_u64()).ok_or("Панель создала inbound, но не вернула его ID")?
+    };
+    create_client_with_token(&server.panel, &token, id, email)?;
+    refresh_client_profiles(&server.id)?;
+    set_profile_pinned(&server.id, id, email, true)?;
+    Ok((server.id.clone(), id))
+}
+
+pub fn create_reality_client(host: &str, email: &str, sni: &str) -> Result<(String, u64), String> {
+    if !valid_http_host(host) || !valid_domain_name(sni) { return Err("Некорректный хост или SNI".into()); }
+    if email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Некорректное имя клиента".into()); }
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|s| s.rsplit('@').next()) == Some(host)).collect();
+    if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
+    let server = &servers[0]; let token = server_token(&server.id)?;
+    let list = panel_request(&server.panel, &token, "inbounds/list", None)?;
+    let items = list.get("obj").and_then(|v| v.as_array()).ok_or("Некорректный список inbound-ов")?;
+    let inbound_id = if let Some(existing) = items.iter().find(|v| v["port"] == 443) {
+        let raw = existing.get("streamSettings").cloned().unwrap_or(serde_json::json!({}));
+        let stream = if let Some(s) = raw.as_str() { serde_json::from_str::<serde_json::Value>(s).unwrap_or_default() } else { raw };
+        if existing["remark"] != "VLESS-REALITY-443" || existing["protocol"] != "vless" || stream["security"] != "reality" || stream["network"] != "tcp" { return Err("Порт 443 уже занят другим inbound-ом".into()); }
+        if !stream["realitySettings"]["serverNames"].as_array().is_some_and(|names| names.iter().any(|name| name == sni)) { return Err("На порту 443 уже есть Reality inbound с другим SNI".into()); }
+        existing["id"].as_u64().ok_or("Некорректный ID inbound-а")?
+    } else {
+        let output = std::process::Command::new("/Applications/VPNClient.app/Contents/Helpers/xray").arg("x25519").output().map_err(|_| "Не удалось запустить генератор ключей Xray")?;
+        if !output.status.success() { return Err("Не удалось создать ключи Reality".into()); }
+        let text = String::from_utf8(output.stdout).map_err(|_| "Некорректный ответ генератора ключей")?;
+        let private = text.lines().find_map(|line| line.strip_prefix("PrivateKey:").map(str::trim)).filter(|v| !v.is_empty()).ok_or("Генератор не вернул закрытый ключ")?;
+        let public = text.lines().find_map(|line| line.strip_prefix("Password (PublicKey):").or_else(|| line.strip_prefix("PublicKey:")).map(str::trim)).filter(|v| !v.is_empty()).ok_or("Генератор не вернул открытый ключ")?;
+        use std::io::Read;
+        let mut bytes = [0u8; 8]; fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).map_err(|_| "Не удалось создать short ID")?;
+        let short_id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let response = panel_request(&server.panel, &token, "inbounds/add", Some(reality_inbound_body(sni, private, public, &short_id)))?;
+        response.get("obj").and_then(|v| v.as_u64()).or_else(|| list_inbounds_for(&server.panel, &token).ok()?.as_array()?.iter().find(|i| i["remark"] == "VLESS-REALITY-443" && i["port"] == 443)?.get("id")?.as_u64()).ok_or("Панель создала inbound, но не вернула его ID")?
+    };
+    let list = panel_request(&server.panel, &token, "inbounds/list", None)?;
+    let exists = list.get("obj").and_then(|v| v.as_array()).and_then(|a| a.iter().find(|i| i["id"] == inbound_id)).and_then(|i| i.get("settings")).map(|v| if let Some(s)=v.as_str() { serde_json::from_str::<serde_json::Value>(s).unwrap_or_default() } else { v.clone() }).and_then(|s| s.get("clients").and_then(|c| c.as_array()).map(|c| c.iter().any(|c| c["email"] == email))).unwrap_or(false);
+    if !exists { create_client_with_token(&server.panel, &token, inbound_id, email)?; }
+    refresh_client_profiles(&server.id)?;
+    set_profile_pinned(&server.id, inbound_id, email, true)?;
+    Ok((server.id.clone(), inbound_id))
+}
+
 pub fn create_wizard_client(id: &str, panel: &Panel, inbound_id: u64, email: &str) -> Result<(), String> {
     validate_panel(panel)?;
     create_client_with_token(panel, &staged_wizard_token(id)?, inbound_id, email)
@@ -664,11 +774,11 @@ pub fn save_wizard_server(id: &str, panel: Panel, country: Option<String>) -> Re
     let token = staged_wizard_token(id)?;
     let mut servers = list_servers()?;
     if servers.iter().any(|s| s.id == id) { return Err("Идентификатор сервера уже используется".into()); }
-    security_framework::passwords::set_generic_password(SERVICE, id, token.as_bytes()).map_err(|e| format!("Keychain: {e}"))?;
+    token_set(id, &token)?;
     let server = Server { id: id.to_owned(), country, panel };
     servers.push(server.clone());
     if let Err(error) = write_servers(&servers_path()?, &servers) {
-        let _ = security_framework::passwords::delete_generic_password(SERVICE, id);
+        let _ = token_delete(id);
         return Err(error);
     }
     clear_wizard_token(id)?;
@@ -743,32 +853,64 @@ pub fn cancel_pending_client() -> Result<(), String> {
 }
 pub fn client_share_link(email: &str, inbound_id: u64) -> Result<String, String> {
     let panel = load_panel()?.ok_or("No panel configured")?;
-    let token = security_framework::passwords::get_generic_password(SERVICE, &panel.url).map_err(|e| format!("Keychain: {e}"))?;
-    let token = std::str::from_utf8(&token).map_err(|_| "Invalid token in Keychain")?;
-    client_share_link_with_token(&panel, token, email, inbound_id)
+    let token = token_get(&panel.url)?;
+    client_share_link_with_token(&panel, &token, email, inbound_id)
 }
 fn client_share_link_with_token(panel: &Panel, token: &str, email: &str, inbound_id: u64) -> Result<String, String> {
     if inbound_id == 0 || email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Invalid client selection".into()); }
     let encoded_email: String = url::form_urlencoded::byte_serialize(email.as_bytes()).collect();
     let client = panel_request(panel, token, &format!("clients/get/{encoded_email}"), None)?;
     let client = client.get("obj").and_then(|v| v.get("client")).ok_or("Client not found")?;
-    let uuid = client.get("uuid").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("Client has no VLESS UUID")?;
     let attached = panel_request(panel, token, &format!("inbounds/get/{inbound_id}"), None)?;
     let inbound = attached.get("obj").ok_or("Inbound not found")?;
+    if inbound.get("protocol").and_then(|v| v.as_str()) == Some("hysteria") {
+        let auth = client.get("auth").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).ok_or("Hysteria 2 client has no authentication")?;
+        return build_hysteria2_share_link(panel, email, auth, inbound);
+    }
+    let uuid = client.get("uuid").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("Client has no VLESS UUID")?;
     build_client_share_link(panel, email, uuid, inbound)
+}
+fn build_hysteria2_share_link(panel: &Panel, email: &str, auth: &str, inbound: &serde_json::Value) -> Result<String, String> {
+    if inbound.get("enable").and_then(|v| v.as_bool()) != Some(true) || inbound.get("protocol").and_then(|v| v.as_str()) != Some("hysteria") { return Err("Selected inbound is not an enabled Hysteria service".into()); }
+    let stream = inbound.get("streamSettings").cloned().unwrap_or(serde_json::json!({}));
+    let stream = if let Some(raw) = stream.as_str() { serde_json::from_str(raw).map_err(|_| "Invalid Hysteria transport settings")? } else { stream };
+    let tls = stream.get("tlsSettings").ok_or("Hysteria TLS settings are missing")?;
+    let sni = tls.get("serverName").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).ok_or("Hysteria SNI is missing")?;
+    let host = inbound.get("shareAddr").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).or(panel.panel_host.as_deref()).or_else(|| panel.ssh_target.as_deref().map(|s| s.rsplit('@').next().unwrap_or(s))).ok_or("Public server address is missing")?;
+    if !valid_http_host(host) { return Err("Invalid public server address".into()); }
+    let port = inbound.get("port").and_then(|v| v.as_u64()).filter(|p| *p > 0 && *p <= 65535).ok_or("Invalid Hysteria port")?;
+    let user = url::form_urlencoded::byte_serialize(auth.as_bytes()).collect::<String>();
+    let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("sni", sni).finish();
+    Ok(format!("hysteria2://{user}@{host}:{port}/?{query}#{}", url::form_urlencoded::byte_serialize(email.as_bytes()).collect::<String>()))
 }
 fn build_client_share_link(panel: &Panel, email: &str, uuid: &str, inbound: &serde_json::Value) -> Result<String, String> {
     if inbound.get("enable").and_then(|v| v.as_bool()) != Some(true) || inbound.get("protocol").and_then(|v| v.as_str()) != Some("vless") { return Err("Selected inbound is not an enabled VLESS service".into()); }
     let settings = inbound.get("streamSettings").cloned().unwrap_or(serde_json::json!({}));
     let settings = if let Some(raw) = settings.as_str() { serde_json::from_str(raw).map_err(|_| "Invalid inbound transport settings")? } else { settings };
     let network = settings.get("network").and_then(|v| v.as_str()).unwrap_or("");
+    let host = inbound.get("shareAddr").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).or(panel.panel_host.as_deref()).or_else(|| panel.ssh_target.as_deref().map(|s| s.rsplit('@').next().unwrap_or(s))).ok_or("Public server address is missing")?;
+    if !valid_http_host(host) { return Err("Invalid public server address".into()); }
+    let port = inbound.get("port").and_then(|v| v.as_u64()).filter(|p| *p > 0 && *p <= 65535).ok_or("Invalid VLESS port")?;
+    if network == "tcp" && settings.get("security").and_then(|v| v.as_str()) == Some("reality") {
+        let reality = settings.get("realitySettings").ok_or("REALITY settings are missing")?;
+        let client = reality.get("settings").ok_or("REALITY client settings are missing")?;
+        let key = client.get("publicKey").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("REALITY public key is missing")?;
+        let sni = client.get("serverName").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).or_else(|| reality.get("serverNames").and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(|v| v.as_str())).filter(|s| !s.is_empty()).ok_or("REALITY server name is missing")?;
+        let sid = reality.get("shortIds").and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(|v| v.as_str()).ok_or("REALITY short ID is missing")?;
+        let fp = client.get("fingerprint").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("chrome");
+        let spx = client.get("spiderX").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("/");
+        let mut query = vec![("type", "tcp"), ("security", "reality"), ("sni", sni), ("pbk", key), ("sid", sid), ("fp", fp), ("spx", spx)];
+        let raw = inbound.get("settings").cloned().unwrap_or(serde_json::json!({}));
+        let client_settings = if let Some(text) = raw.as_str() { serde_json::from_str(text).unwrap_or(serde_json::json!({})) } else { raw };
+        let flow = client_settings.get("clients").and_then(|v| v.as_array()).and_then(|a| a.iter().find(|c| c["email"] == email)).and_then(|c| c.get("flow")).and_then(|v| v.as_str()).unwrap_or("");
+        if !flow.is_empty() { query.push(("flow", flow)); }
+        let query = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(query).finish();
+        return Ok(format!("vless://{uuid}@{host}:{port}?{query}#{}", url::form_urlencoded::byte_serialize(email.as_bytes()).collect::<String>()));
+    }
     if !["xhttp", "tcp"].contains(&network) || settings.get("security").and_then(|v| v.as_str()) != Some("tls") { return Err("Selected inbound is not VLESS/TLS/XHTTP or TCP".into()); }
     let tls = settings.get("tlsSettings").ok_or("TLS settings are missing")?;
     let empty = serde_json::json!({});
     let xhttp = settings.get("xhttpSettings").unwrap_or(&empty);
-    let host = inbound.get("shareAddr").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).or(panel.panel_host.as_deref()).or_else(|| panel.ssh_target.as_deref().map(|s| s.rsplit('@').next().unwrap_or(s))).ok_or("Public server address is missing")?;
-    if !valid_http_host(host) { return Err("Invalid public server address".into()); }
-    let port = inbound.get("port").and_then(|v| v.as_u64()).filter(|p| *p > 0 && *p <= 65535).ok_or("Invalid VLESS port")?;
     let sni = tls.get("serverName").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("TLS server name is missing")?;
     let path = xhttp.get("path").and_then(|v| v.as_str()).unwrap_or("/");
     let mut query = vec![("type", network.to_owned()), ("security", "tls".to_owned()), ("sni", sni.to_owned())];
@@ -796,13 +938,11 @@ pub fn approve_pending_client(inbound_id: u64, email: &str) -> Result<String, St
     if panel.name != pending.panel_name {
         return Err("Configured panel changed; review the request again".into());
     }
-    let token = security_framework::passwords::get_generic_password(SERVICE, &panel.url)
-        .map_err(|e| format!("Keychain: {e}"))?;
-    let token = std::str::from_utf8(&token).map_err(|_| "Invalid token in Keychain")?;
-    let inbounds = list_inbounds_for(&panel, token)?;
+    let token = token_get(&panel.url)?;
+    let inbounds = list_inbounds_for(&panel, &token)?;
     crate::client_plan::prepare(&inbounds, inbound_id, email)?;
     let body = serde_json::json!({"client":{"email":email,"enable":true,"totalGB":0,"expiryTime":0,"limitIp":0},"inboundIds":[inbound_id]});
-    let _result = panel_request(&panel, token, "clients/add", Some(body))?;
+    let _result = panel_request(&panel, &token, "clients/add", Some(body))?;
     cancel_pending_client()?;
     Ok(format!(
         "Client {email} created. Client secrets were not returned."
@@ -812,6 +952,40 @@ pub fn approve_pending_client(inbound_id: u64, email: &str) -> Result<String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn token_file_keeps_accounts_separate_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("panel-tokens.json");
+        token_store_at(&path, |t| { t.insert("one".into(), "first".into()); Ok(((), true)) }).unwrap();
+        token_store_at(&path, |t| { t.insert("two".into(), "second".into()); Ok(((), true)) }).unwrap();
+        token_store_at(&path, |t| { t.remove("one"); Ok(((), true)) }).unwrap();
+        token_store_at(&path, |t| { assert!(!t.contains_key("one")); assert_eq!(t.get("two").map(String::as_str), Some("second")); Ok(((), false)) }).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    #[test]
+    fn reality_share_link_round_trips_into_client_config() {
+        let panel = Panel { name:"test".into(), url:"http://127.0.0.1:2053/".into(), ssh_target:Some("root@198.51.100.2".into()), panel_host:None };
+        let stream = serde_json::json!({"network":"tcp","security":"reality","realitySettings":{"serverNames":["www.microsoft.com"],"shortIds":["01234567"],"settings":{"publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","fingerprint":"chrome","spiderX":"/"}}});
+        let inbound = serde_json::json!({"enable":true,"protocol":"vless","port":443,"streamSettings":stream,"settings":{"clients":[{"email":"client-1","flow":"xtls-rprx-vision"}]}});
+        let link = build_client_share_link(&panel,"client-1","12345678-1234-1234-1234-123456789abc",&inbound).unwrap();
+        let config = profile::vless_config(&link,10808).unwrap();
+        assert_eq!(config["outbounds"][0]["streamSettings"]["realitySettings"]["shortId"],"01234567");
+        assert_eq!(config["outbounds"][0]["settings"]["vnext"][0]["users"][0]["flow"],"xtls-rprx-vision");
+    }
+
+    #[test]
+    fn hysteria2_inbound_uses_udp_tls_and_certificate_paths() {
+        let body = hysteria2_inbound_body("203-0-113-8.sslip.io");
+        assert_eq!(body["protocol"], "hysteria");
+        assert_eq!(body["port"], 443);
+        let stream: serde_json::Value = serde_json::from_str(body["streamSettings"].as_str().unwrap()).unwrap();
+        assert_eq!(stream["network"], "hysteria");
+        assert_eq!(stream["security"], "tls");
+        assert_eq!(stream["tlsSettings"]["alpn"], serde_json::json!(["h3"]));
+        assert_eq!(stream["tlsSettings"]["certificates"][0]["certificateFile"], "/root/cert/203-0-113-8.sslip.io/fullchain.pem");
+        assert_eq!(stream["hysteriaSettings"]["version"], 2);
+    }
     #[test]
     fn pinned_profiles_default_toggle_and_server_cleanup() {
         use std::os::unix::fs::PermissionsExt;

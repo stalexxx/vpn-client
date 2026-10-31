@@ -164,7 +164,7 @@ pub fn start(state: &XrayState, executable: String, link: String) -> Result<Stri
     ensure_startable(&mut active)?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("Не удалось выбрать локальный порт: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let config = crate::profile::vless_xhttp_config(&link, port)?;
+    let config = crate::profile::vless_config(&link, port)?;
     let (dir, path) = config_file(&config)?;
     validate_xray(&executable, &path)?;
     drop(listener);

@@ -16,9 +16,9 @@ const HELPER_DIR: &str = "/Library/Application Support/VpnClientHelper";
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Deserialize)]
-struct Request { action: String, #[serde(default)] link: Option<String> }
+struct Request { action: String, #[serde(default)] link: Option<String>, #[serde(default)] relay_link: Option<String> }
 #[derive(Serialize)]
-struct Response { ok: bool, connected: bool, message: String, version: &'static str, connectivity_check: bool }
+struct Response { ok: bool, connected: bool, message: String, version: &'static str, connectivity_check: bool, reality_support: bool, hysteria2_support: bool, hysteria_chain_support: bool }
 #[derive(Clone, Serialize, Deserialize)]
 struct ProcessRecord { pid: u32, config_path: String, xray_path: String, tun_name: String, #[serde(default)] start_time: String }
 #[derive(Serialize, Deserialize)]
@@ -30,7 +30,7 @@ struct HelperState { uid: u32, xray: PathBuf, active: Option<Tunnel> }
 enum DnsRestoreAction { RestoreOriginal, AlreadyRestored, Conflict }
 
 fn root_path(name: &str) -> PathBuf { Path::new(HELPER_DIR).join(name) }
-fn response(ok: bool, connected: bool, message: impl Into<String>) -> Response { Response { ok, connected, message: message.into(), version: HELPER_VERSION, connectivity_check: true } }
+fn response(ok: bool, connected: bool, message: impl Into<String>) -> Response { Response { ok, connected, message: message.into(), version: HELPER_VERSION, connectivity_check: true, reality_support: true, hysteria2_support: true, hysteria_chain_support: true } }
 fn process_info(pid: u32) -> Result<Option<(String, String)>, String> {
     let command = Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "command="]).output().map_err(|e| e.to_string())?;
     if !command.status.success() { return Ok(None); }
@@ -244,7 +244,7 @@ fn verify_tunnel_connectivity(tun: &str) -> Result<(), String> {
         }
     }
 }
-fn start(state: &mut HelperState, link: &str) -> Result<String, String> {
+fn start(state: &mut HelperState, link: &str, relay_link: Option<&str>) -> Result<String, String> {
     if let Some(t) = state.active.as_ref() { if process_matches(&t.record) { return Ok("VPN уже подключён через TUN.".into()); } }
     if let Some(mut old) = state.active.take() { if let Some(child) = old.child.as_mut() { let _ = child.try_wait(); } }
     if let Some(record) = read_record()? {
@@ -254,7 +254,7 @@ fn start(state: &mut HelperState, link: &str) -> Result<String, String> {
     restore_dns()?;
     let _ = fs::remove_file(root_path("config.json"));
     let tun = choose_utun()?;
-    let config = vpn_core::profile::vless_xhttp_tun_config(link, &tun)?;
+    let config = vpn_core::profile::vless_tun_config_with_relay(link, &tun, relay_link)?;
     let config_path = root_path("config.json");
     write_secure(&config_path, config.to_string().as_bytes())?;
     let check = Command::new(&state.xray).args(["run", "-test", "-config"]).arg(&config_path).stdout(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| e.to_string())?;
@@ -349,7 +349,7 @@ fn connected(state: &HelperState) -> bool {
 fn handle(state: &mut HelperState, req: Request) -> Response {
     match req.action.as_str() {
         "status" => { let is_connected = connected(state); response(true, is_connected, if is_connected { "TUN подключён" } else { "TUN отключён" }) },
-        "start" => match req.link.as_deref() { Some(link) => match start(state, link) { Ok(m) => response(true, true, m), Err(e) => response(false, connected(state), e) }, None => response(false, connected(state), "Не передан профиль клиента") },
+        "start" => match req.link.as_deref() { Some(link) => match start(state, link, req.relay_link.as_deref()) { Ok(m) => response(true, true, m), Err(e) => response(false, connected(state), e) }, None => response(false, connected(state), "Не передан профиль клиента") },
         "stop" => match stop(state) { Ok(()) => response(true, false, "VPN отключён; DNS восстановлен"), Err(e) => response(false, connected(state), e) },
         _ => response(false, connected(state), "Неизвестная команда помощника"),
     }
