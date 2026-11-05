@@ -14,10 +14,33 @@ fn control_request_at(path: &std::path::Path, request: &Value) -> Result<String,
     stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
     writeln!(stream, "{request}").map_err(|_| "Не удалось отправить команду приложению".to_owned())?;
     let mut line = String::new();
-    BufReader::new(stream).take(16 * 1024).read_line(&mut line).map_err(|_| "Не удалось получить ответ приложения".to_owned())?;
+    BufReader::new(stream).take(64 * 1024).read_line(&mut line).map_err(|_| "Не удалось получить ответ приложения".to_owned())?;
     let response: Value = serde_json::from_str(&line).map_err(|_| "Некорректный ответ приложения".to_owned())?;
     let message = response.get("message").and_then(Value::as_str).unwrap_or("Нет ответа от приложения").to_owned();
     if response.get("ok").and_then(Value::as_bool) == Some(true) { Ok(message) } else { Err(message) }
+}
+
+fn human_rate(bytes: f64) -> String {
+    if bytes >= 1048576.0 { format!("{:.1} МБ/с", bytes / 1048576.0) } else if bytes >= 1024.0 { format!("{:.0} КБ/с", bytes / 1024.0) } else { format!("{bytes:.0} Б/с") }
+}
+fn human_total(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1073741824.0 { format!("{:.2} ГБ", b / 1073741824.0) } else if b >= 1048576.0 { format!("{:.1} МБ", b / 1048576.0) } else { format!("{:.0} КБ", b / 1024.0) }
+}
+/// Two counter samples `secs` apart give the current speed; totals are since the tunnel started.
+fn sample_stats(path: &std::path::Path, secs: u64) -> Result<String, String> {
+    let read = || -> Result<Value, String> { serde_json::from_str(&control_request_at(path, &json!({"action":"stats"}))?).map_err(|_| "Некорректный ответ статистики".to_owned()) };
+    let first = read()?;
+    std::thread::sleep(Duration::from_secs(secs));
+    let second = read()?;
+    let dt = (second["ts_ms"].as_f64().unwrap_or(0.0) - first["ts_ms"].as_f64().unwrap_or(0.0)) / 1000.0;
+    if dt <= 0.0 { return Err("Не удалось измерить скорость".into()); }
+    let num = |v: &Value, route: &str, dir: &str| v[route][dir].as_u64().unwrap_or(0);
+    let line = |route: &str, label: &str| {
+        let rate = |dir: &str| num(&second, route, dir).saturating_sub(num(&first, route, dir)) as f64 / dt;
+        format!("{label}: ↓ {} ↑ {} (всего ↓ {} ↑ {})", human_rate(rate("down")), human_rate(rate("up")), human_total(num(&second, route, "down")), human_total(num(&second, route, "up")))
+    };
+    Ok(format!("{}\n{}", line("vpn", "Через VPN"), line("direct", "Напрямую")))
 }
 
 fn valid_install_target(host: &str, username: &str) -> bool {
@@ -128,7 +151,14 @@ fn reply<F: Fn(&str) -> Result<String, String>>(request: Value, call: F) -> Opti
             {"name":"vpn_disconnect","description":"Отключить VPN","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
             {"name":"install_3x_ui","description":"Установить 3x-ui и добавить панель в приложение через SSH-ключ ~/.ssh/id_ed25519_vpn_client.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"username":{"type":"string","default":"root"}},"required":["host"],"additionalProperties":false}},
             {"name":"uninstall_3x_ui","description":"Удалить 3x-ui и все её данные с указанного сервера, а также связанные записи приложения.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"username":{"type":"string","default":"root"}},"required":["host"],"additionalProperties":false}},
-            {"name":"create_reality_client","description":"Создать VLESS TCP Reality inbound на порту 443 и клиента в сохранённой панели.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"email":{"type":"string","default":"client-1"},"sni":{"type":"string","default":"www.microsoft.com"}},"required":["host"],"additionalProperties":false}},
+            {"name":"create_reality_client","description":"Создать VLESS TCP Reality inbound и клиента в сохранённой панели.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"email":{"type":"string","default":"client-1"},"sni":{"type":"string","default":"www.microsoft.com"},"port":{"type":"integer","minimum":1,"maximum":65535,"default":443}},"required":["host"],"additionalProperties":false}},
+            {"name":"create_xhttp_relay_client","description":"Создать отдельный XHTTP relay без подмены адреса назначения; использует существующий сертификат.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"email":{"type":"string"},"sni":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535}},"required":["host","email","sni","port"],"additionalProperties":false}},
+            {"name":"list_server_inbounds","description":"Показать inbound-ы сохранённой панели по адресу сервера.","inputSchema":{"type":"object","properties":{"host":{"type":"string"}},"required":["host"],"additionalProperties":false}},
+            {"name":"delete_server_inbound","description":"Удалить указанный inbound по ID на сохранённой панели.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"inbound_id":{"type":"integer","minimum":1}},"required":["host","inbound_id"],"additionalProperties":false}},
+            {"name":"delete_reality_inbound","description":"Удалить только VLESS TCP Reality inbound с портом 443 и именем VLESS-REALITY-443 на сохранённой панели.","inputSchema":{"type":"object","properties":{"host":{"type":"string"}},"required":["host"],"additionalProperties":false}},
+            {"name":"vpn_get_stats","description":"Трафик и текущая скорость по маршрутам: direct (мимо VPN, например BitTorrent) и vpn (через туннель). Скорость измеряется за интервал interval_secs.","inputSchema":{"type":"object","properties":{"interval_secs":{"type":"integer","minimum":1,"maximum":10,"default":2}},"additionalProperties":false}},
+            {"name":"vpn_get_log","description":"Показать последние строки журнала Xray (маршрутизация direct / vpn-out видна при уровне info); можно отфильтровать по подстроке, например bittorrent.","inputSchema":{"type":"object","properties":{"lines":{"type":"integer","minimum":1,"maximum":300,"default":50},"filter":{"type":"string","maxLength":64}},"additionalProperties":false}},
+            {"name":"vpn_set_log_level","description":"Уровень журнала Xray: info (с адресами назначения, только для диагностики) или warning. Применяется при следующем подключении.","inputSchema":{"type":"object","properties":{"level":{"type":"string","enum":["info","warning"]}},"required":["level"],"additionalProperties":false}},
             {"name":"create_hysteria2_client","description":"Создать Hysteria 2 inbound UDP 443 и клиента в сохранённой панели.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"email":{"type":"string","default":"client-1"},"sni":{"type":"string"}},"required":["host","sni"],"additionalProperties":false}}
         ]}),
         "tools/call" => {
@@ -149,18 +179,50 @@ fn reply<F: Fn(&str) -> Result<String, String>>(request: Value, call: F) -> Opti
                     else if name == "install_3x_ui" { install_3x_ui(host, username) } else { uninstall_3x_ui(host, username) }
                 }
                 "create_reality_client" => {
-                    if !args.as_object().is_some_and(|o| o.keys().all(|k| ["host","email","sni"].contains(&k.as_str())) && o.values().all(Value::is_string)) { Err("Разрешены строковые параметры host, email и sni".into()) }
+                    if !args.as_object().is_some_and(|o| o.iter().all(|(k,v)| match k.as_str() { "host" | "email" | "sni" => v.is_string(), "port" => v.as_u64().is_some_and(|n| (1..=65535).contains(&n)), _ => false })) { Err("Некорректные параметры Reality".into()) }
                     else {
                         let host = args.get("host").and_then(Value::as_str).unwrap_or("");
                         let email = args.get("email").and_then(Value::as_str).unwrap_or("client-1");
                         let sni = args.get("sni").and_then(Value::as_str).unwrap_or("www.microsoft.com");
-                        vpn_core::create_reality_client(host, email, sni).map(|(server,id)| format!("Inbound TCP Reality создан: сервер {server}, inbound {id}, клиент {email}.")).map_err(|e| {
+                        let port = args.get("port").and_then(Value::as_u64).unwrap_or(443) as u16;
+                        vpn_core::create_reality_client_on_port(host, email, sni, port).map(|(server,id)| format!("Inbound TCP Reality создан: сервер {server}, inbound {id}, клиент {email}.")).map_err(|e| {
                             if e.contains("Panel request failed") { "Не удалось обратиться к панели через SSH-туннель".to_owned() }
                             else if e.contains("Panel returned HTTP") { "Панель отклонила запрос".to_owned() }
                             else { e }
                         })
                     }
                 }
+                "create_xhttp_relay_client" => {
+                    if !args.as_object().is_some_and(|o| o.len() == 4 && ["host","email","sni"].iter().all(|k| o.get(*k).is_some_and(Value::is_string)) && o.get("port").and_then(Value::as_u64).is_some_and(|n| (1..=65535).contains(&n))) { Err("Требуются host, email, sni и port".into()) }
+                    else { vpn_core::create_xhttp_relay_client(args["host"].as_str().unwrap_or_default(), args["email"].as_str().unwrap_or_default(), args["sni"].as_str().unwrap_or_default(), args["port"].as_u64().unwrap_or_default() as u16).map(|(server,id)| format!("XHTTP relay создан: сервер {server}, inbound {id}.")) }
+                }
+                "delete_reality_inbound" => {
+                    if !args.as_object().is_some_and(|o| o.len() == 1 && o.get("host").is_some_and(Value::is_string)) { Err("Требуется строковый параметр host".into()) }
+                    else { vpn_core::delete_reality_inbound(args["host"].as_str().unwrap_or_default()).map_err(|e| if e.contains("Panel request failed") { "Не удалось обратиться к панели через SSH-туннель".to_owned() } else { e }) }
+                }
+                "list_server_inbounds" => {
+                    if !args.as_object().is_some_and(|o| o.len() == 1 && o.get("host").is_some_and(Value::is_string)) { Err("Требуется строковый параметр host".into()) }
+                    else { vpn_core::list_inbounds_for_host(args["host"].as_str().unwrap_or_default()).map(|v| serde_json::to_string(&v).unwrap_or_default()).map_err(|e| if e.contains("Panel request failed") { "Не удалось обратиться к панели через SSH-туннель".to_owned() } else { e }) }
+                }
+                "delete_server_inbound" => {
+                    if !args.as_object().is_some_and(|o| o.len() == 2 && o.get("host").is_some_and(Value::is_string) && o.get("inbound_id").and_then(Value::as_u64).is_some_and(|n| n > 0)) { Err("Требуются host и положительный inbound_id".into()) }
+                    else { vpn_core::delete_inbound_for_host(args["host"].as_str().unwrap_or_default(), args["inbound_id"].as_u64().unwrap_or_default()).map_err(|e| if e.contains("Panel request failed") { "Не удалось обратиться к панели через SSH-туннель".to_owned() } else { e }) }
+                }
+                "vpn_get_stats" => {
+                    let secs = args.get("interval_secs").and_then(Value::as_u64).unwrap_or(2);
+                    if !args.as_object().is_some_and(|o| o.keys().all(|k| k == "interval_secs")) || !(1..=10).contains(&secs) { Err("Некорректный интервал".into()) }
+                    else { vpn_core::mcp_control_socket_path().and_then(|path| sample_stats(&path, secs)) }
+                }
+                "vpn_get_log" => {
+                    let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(50);
+                    let filter = args.get("filter").and_then(Value::as_str);
+                    if !args.as_object().is_some_and(|o| o.keys().all(|k| k == "lines" || k == "filter")) || !(1..=300).contains(&lines) || filter.is_some_and(|f| f.len() > 64) { Err("Некорректные параметры журнала".into()) }
+                    else { vpn_core::mcp_control_socket_path().and_then(|path| control_request_at(&path, &json!({"action":"log","lines":lines,"filter":filter}))) }
+                }
+                "vpn_set_log_level" => match (args.as_object().map(|o| o.len()), args.get("level").and_then(Value::as_str)) {
+                    (Some(1), Some(level @ ("info" | "warning"))) => vpn_core::mcp_control_socket_path().and_then(|path| control_request_at(&path, &json!({"action":"set_log_level","level":level}))),
+                    _ => Err("Укажите level: info или warning".into()),
+                },
                 "create_hysteria2_client" => {
                     if !args.as_object().is_some_and(|o| o.keys().all(|k| ["host","email","sni"].contains(&k.as_str())) && o.values().all(Value::is_string)) { Err("Разрешены строковые параметры host, email и sni".into()) }
                     else if let (Some(host), Some(sni)) = (args.get("host").and_then(Value::as_str), args.get("sni").and_then(Value::as_str)) {
@@ -194,7 +256,11 @@ mod tests {
     fn exposes_vpn_controls_and_panel_installer() {
         let list=reply(json!({"id":1,"method":"tools/list"}), |_| panic!()).unwrap();
         let tools=list["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(),6); assert_eq!(tools[0]["name"],"vpn_connect"); assert_eq!(tools[1]["name"],"vpn_disconnect"); assert_eq!(tools[2]["name"],"install_3x_ui"); assert_eq!(tools[3]["name"],"uninstall_3x_ui"); assert_eq!(tools[4]["name"],"create_reality_client"); assert_eq!(tools[5]["name"],"create_hysteria2_client");
+        assert_eq!(tools.len(),13); assert_eq!(tools[0]["name"],"vpn_connect"); assert_eq!(tools[1]["name"],"vpn_disconnect"); assert_eq!(tools[2]["name"],"install_3x_ui"); assert_eq!(tools[3]["name"],"uninstall_3x_ui"); assert_eq!(tools[4]["name"],"create_reality_client"); assert_eq!(tools[5]["name"],"create_xhttp_relay_client"); assert_eq!(tools[6]["name"],"list_server_inbounds"); assert_eq!(tools[7]["name"],"delete_server_inbound"); assert_eq!(tools[8]["name"],"delete_reality_inbound"); assert_eq!(tools[9]["name"],"vpn_get_stats"); assert_eq!(tools[10]["name"],"vpn_get_log"); assert_eq!(tools[11]["name"],"vpn_set_log_level"); assert_eq!(tools[12]["name"],"create_hysteria2_client");
+        let bad=reply(json!({"id":9,"method":"tools/call","params":{"name":"vpn_set_log_level","arguments":{"level":"debug"}}}), |_| panic!()).unwrap();
+        assert_eq!(bad["result"]["isError"],true);
+        let bad=reply(json!({"id":9,"method":"tools/call","params":{"name":"vpn_get_log","arguments":{"lines":0}}}), |_| panic!()).unwrap();
+        assert_eq!(bad["result"]["isError"],true);
         let result=reply(json!({"id":2,"method":"tools/call","params":{"name":"vpn_connect","arguments":{}}}), |action| { assert_eq!(action,"connect"); Ok("connected".into()) }).unwrap();
         assert_eq!(result["result"]["content"][0]["text"],"connected");
         let failure=reply(json!({"id":3,"method":"tools/call","params":{"name":"vpn_disconnect"}}), |action| { assert_eq!(action,"disconnect"); Err("error".into()) }).unwrap();

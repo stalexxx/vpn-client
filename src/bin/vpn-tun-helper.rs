@@ -16,7 +16,7 @@ const HELPER_DIR: &str = "/Library/Application Support/VpnClientHelper";
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Deserialize)]
-struct Request { action: String, #[serde(default)] link: Option<String>, #[serde(default)] relay_link: Option<String> }
+struct Request { action: String, #[serde(default)] link: Option<String>, #[serde(default)] relay_link: Option<String>, #[serde(default)] lines: Option<usize>, #[serde(default)] filter: Option<String>, #[serde(default)] level: Option<String>, #[serde(default)] bypass: Option<vpn_core::profile::Bypass> }
 #[derive(Serialize)]
 struct Response { ok: bool, connected: bool, message: String, version: &'static str, connectivity_check: bool, reality_support: bool, hysteria2_support: bool, hysteria_chain_support: bool }
 #[derive(Clone, Serialize, Deserialize)]
@@ -142,6 +142,34 @@ fn choose_utun() -> Result<String, String> {
     Err("Не найден свободный интерфейс utun".into())
 }
 fn xray_log() -> PathBuf { root_path("xray.log") }
+/// Diagnostic log level, chosen over MCP/UI and applied at the next connection.
+fn verbose_log() -> bool { fs::read_to_string(root_path("log-level")).map(|v| v.trim() == "info").unwrap_or(false) }
+/// Sum the per-outbound counters from `xray api statsquery` into {direct, vpn} totals.
+fn parse_stats(json_text: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(json_text).map_err(|_| "Некорректный ответ статистики Xray".to_owned())?;
+    let mut totals = [[0u64; 2]; 2]; // [direct, vpn] x [up, down]
+    for item in value["stat"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let (Some(name), amount) = (item["name"].as_str(), item["value"].as_u64().unwrap_or(0)) else { continue };
+        let parts: Vec<&str> = name.split(">>>").collect();
+        if parts.len() != 4 || parts[0] != "outbound" || parts[2] != "traffic" { continue }
+        let row = match parts[1] { "direct" => 0, "vpn-out" => 1, _ => continue };
+        let col = match parts[3] { "uplink" => 0, "downlink" => 1, _ => continue };
+        totals[row][col] += amount;
+    }
+    let ts_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    Ok(serde_json::json!({"direct":{"up":totals[0][0],"down":totals[0][1]},"vpn":{"up":totals[1][0],"down":totals[1][1]},"ts_ms":ts_ms}))
+}
+fn tail_log(text: &str, lines: usize, filter: Option<&str>) -> String {
+    let mut picked: Vec<&str> = text.lines().filter(|l| filter.map_or(true, |f| l.contains(f))).collect();
+    if picked.len() > lines { picked.drain(..picked.len() - lines); }
+    let mut out = picked.join("\n");
+    if out.len() > 8000 {
+        let mut cut = out.len() - 8000;
+        while !out.is_char_boundary(cut) { cut += 1; }
+        out = out[cut..].to_owned();
+    }
+    out
+}
 fn terminate_child(child: &mut Child) -> Result<(), String> {
     if child.try_wait().ok().flatten().is_some() { return Ok(()); }
     if unsafe { libc::kill(child.id() as i32, libc::SIGTERM) } != 0 {
@@ -244,7 +272,7 @@ fn verify_tunnel_connectivity(tun: &str) -> Result<(), String> {
         }
     }
 }
-fn start(state: &mut HelperState, link: &str, relay_link: Option<&str>) -> Result<String, String> {
+fn start(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: &vpn_core::profile::Bypass) -> Result<String, String> {
     if let Some(t) = state.active.as_ref() { if process_matches(&t.record) { return Ok("VPN уже подключён через TUN.".into()); } }
     if let Some(mut old) = state.active.take() { if let Some(child) = old.child.as_mut() { let _ = child.try_wait(); } }
     if let Some(record) = read_record()? {
@@ -254,7 +282,9 @@ fn start(state: &mut HelperState, link: &str, relay_link: Option<&str>) -> Resul
     restore_dns()?;
     let _ = fs::remove_file(root_path("config.json"));
     let tun = choose_utun()?;
-    let config = vpn_core::profile::vless_tun_config_with_relay(link, &tun, relay_link)?;
+    let api_port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).map_err(|e| e.to_string())?;
+    write_secure(&root_path("api-port"), api_port.to_string().as_bytes())?;
+    let config = vpn_core::profile::vless_tun_config_with_options(link, &tun, relay_link, verbose_log(), Some(api_port), bypass)?;
     let config_path = root_path("config.json");
     write_secure(&config_path, config.to_string().as_bytes())?;
     let check = Command::new(&state.xray).args(["run", "-test", "-config"]).arg(&config_path).stdout(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| e.to_string())?;
@@ -349,8 +379,32 @@ fn connected(state: &HelperState) -> bool {
 fn handle(state: &mut HelperState, req: Request) -> Response {
     match req.action.as_str() {
         "status" => { let is_connected = connected(state); response(true, is_connected, if is_connected { "TUN подключён" } else { "TUN отключён" }) },
-        "start" => match req.link.as_deref() { Some(link) => match start(state, link, req.relay_link.as_deref()) { Ok(m) => response(true, true, m), Err(e) => response(false, connected(state), e) }, None => response(false, connected(state), "Не передан профиль клиента") },
+        "start" => match req.link.as_deref() { Some(link) => match start(state, link, req.relay_link.as_deref(), &req.bypass.clone().unwrap_or_default()) { Ok(m) => response(true, true, m), Err(e) => response(false, connected(state), e) }, None => response(false, connected(state), "Не передан профиль клиента") },
         "stop" => match stop(state) { Ok(()) => response(true, false, "VPN отключён; DNS восстановлен"), Err(e) => response(false, connected(state), e) },
+        "log" => {
+            let lines = req.lines.unwrap_or(50).clamp(1, 300);
+            let filter = req.filter.as_deref().filter(|f| !f.is_empty() && f.len() <= 64);
+            match fs::read_to_string(xray_log()) {
+                Ok(text) => { let out = tail_log(&text, lines, filter); response(true, connected(state), if out.is_empty() { "Нет строк журнала".to_owned() } else { out }) }
+                Err(_) => response(true, connected(state), "Журнал Xray пуст или ещё не создан"),
+            }
+        }
+        "stats" => {
+            if !connected(state) { return response(false, false, "VPN не подключён"); }
+            let port = match fs::read_to_string(root_path("api-port")).ok().and_then(|v| v.trim().parse::<u16>().ok()) { Some(p) => p, None => return response(false, true, "Статистика недоступна: порт API не записан") };
+            match Command::new(&state.xray).args(["api", "statsquery", "-t", "2"]).arg(format!("--server=127.0.0.1:{port}")).stdin(Stdio::null()).stderr(Stdio::null()).output() {
+                Ok(out) if out.status.success() => match parse_stats(&String::from_utf8_lossy(&out.stdout)) { Ok(v) => response(true, true, v.to_string()), Err(e) => response(false, true, e) },
+                _ => response(false, true, "Статистика Xray недоступна"),
+            }
+        }
+        "get_log_level" => response(true, connected(state), if verbose_log() { "info" } else { "warning" }),
+        "set_log_level" => match req.level.as_deref() {
+            Some(level @ ("info" | "warning")) => match write_secure(&root_path("log-level"), level.as_bytes()) {
+                Ok(()) => response(true, connected(state), format!("Уровень журнала: {level}; применится при следующем подключении")),
+                Err(e) => response(false, connected(state), e),
+            },
+            _ => response(false, connected(state), "Допустимые уровни: info, warning"),
+        },
         _ => response(false, connected(state), "Неизвестная команда помощника"),
     }
 }
@@ -438,6 +492,25 @@ fn reap_exited_process(state: &mut HelperState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_sum_direct_and_vpn_outbounds_only() {
+        let text = r#"{"stat":[{"name":"outbound>>>vpn-out>>>traffic>>>uplink","value":5},{"name":"outbound>>>vpn-out>>>traffic>>>downlink","value":70},{"name":"outbound>>>direct>>>traffic>>>downlink","value":900},{"name":"outbound>>>direct>>>traffic>>>uplink"},{"name":"outbound>>>vpn-relay>>>traffic>>>downlink","value":99},{"name":"user>>>x>>>traffic>>>uplink","value":1}]}"#;
+        let v = parse_stats(text).unwrap();
+        assert_eq!(v["direct"], serde_json::json!({"up":0,"down":900}));
+        assert_eq!(v["vpn"], serde_json::json!({"up":5,"down":70}));
+        assert!(parse_stats("nope").is_err());
+    }
+
+    #[test]
+    fn log_tail_filters_limits_and_caps_size() {
+        let text = "a direct bittorrent\nb vpn-out\nc direct bittorrent\nd direct bittorrent";
+        assert_eq!(tail_log(text, 2, Some("bittorrent")), "c direct bittorrent\nd direct bittorrent");
+        assert_eq!(tail_log(text, 10, Some("nothing")), "");
+        let big = "я".repeat(20_000);
+        let out = tail_log(&big, 1, None);
+        assert!(out.len() <= 8000 && out.chars().all(|c| c == 'я'));
+    }
 
     #[test]
     fn connectivity_requires_at_least_one_successful_probe() {

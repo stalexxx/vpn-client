@@ -58,6 +58,12 @@ fn handle(mut stream: UnixStream, app: tauri::AppHandle) {
                 crate::xray::connect_profile_inner(&xray, &tray, &profile.server_id, profile.inbound_id, &profile.email)
             }
             Some("disconnect") => crate::xray::stop_vpn_inner(&xray, &tray).map(|_| "VPN отключён.".to_owned()),
+            Some("stats") => crate::helper::stats().map(|v| v.to_string()),
+            Some("log") => crate::helper::log_tail(request.get("lines").and_then(|v| v.as_u64()).unwrap_or(50), request.get("filter").and_then(|v| v.as_str())),
+            Some("set_log_level") => match request.get("level").and_then(|v| v.as_str()) {
+                Some(level @ ("info" | "warning")) => crate::helper::set_log_level(level),
+                _ => Err("Допустимые уровни: info, warning".into()),
+            },
             _ => Err("Неизвестная команда".into()),
         }
     });

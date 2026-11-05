@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use url::Url;
 
@@ -43,7 +44,14 @@ fn vless_reality_config(link: &str, socks_port: u16) -> Result<Value, String> {
     if url.scheme() != "vless" || url.password().is_some() || id.len() != 36 || !id.chars().enumerate().all(|(i,c)| if [8,13,18,23].contains(&i) { c == '-' } else { c.is_ascii_hexdigit() }) { return Err("Invalid VLESS client UUID".into()); }
     let mut fields = std::collections::HashMap::new();
     for (key,value) in url.query_pairs() {
-        if !["type","security","sni","pbk","sid","fp","spx","flow","encryption"].contains(&key.as_ref()) { return Err("Unsupported REALITY parameter".into()); }
+        match key.as_ref() {
+            "type" | "security" | "sni" | "pbk" | "sid" | "fp" | "spx" | "flow" | "encryption" => {}
+            // Harmless defaults that share-link generators add: accepted only with their no-op values.
+            "headerType" if matches!(value.as_ref(), "" | "none") => continue,
+            "allowInsecure" | "insecure" if matches!(value.as_ref(), "" | "0" | "false") => continue,
+            "packetEncoding" if matches!(value.as_ref(), "" | "none" | "xudp") => continue,
+            other => return Err(format!("Unsupported REALITY parameter: {}", other.chars().take(32).collect::<String>())),
+        }
         if fields.insert(key.into_owned(), value.into_owned()).is_some() { return Err("Duplicate REALITY parameter".into()); }
     }
     if fields.get("type").map(String::as_str) != Some("tcp") || fields.get("security").map(String::as_str) != Some("reality") || fields.get("encryption").is_some_and(|v| v != "none") || socks_port == 0 { return Err("Invalid VLESS TCP REALITY configuration".into()); }
@@ -142,26 +150,141 @@ pub fn vless_xhttp_config(link: &str, socks_port: u16) -> Result<Value, String> 
     }))
 }
 
+// Public routes keep local networks and Tailscale reachable outside the tunnel.
+const PUBLIC_TUN_ROUTES: &[&str] = &[
+    "208.0.0.0/4", "200.0.0.0/5", "196.0.0.0/6", "194.0.0.0/7",
+    "193.0.0.0/8", "192.0.0.0/9", "192.192.0.0/10", "192.128.0.0/11",
+    "192.176.0.0/12", "192.160.0.0/13", "192.172.0.0/14", "192.170.0.0/15",
+    "192.169.0.0/16", "128.0.0.0/3", "176.0.0.0/4", "160.0.0.0/5",
+    "174.0.0.0/7", "173.0.0.0/8", "172.128.0.0/9", "172.64.0.0/10",
+    "172.32.0.0/11", "172.0.0.0/12", "170.0.0.0/7", "168.0.0.0/8",
+    "169.0.0.0/9", "169.128.0.0/10", "169.192.0.0/11", "169.224.0.0/12",
+    "169.240.0.0/13", "169.248.0.0/14", "169.252.0.0/15", "169.255.0.0/16",
+    "64.0.0.0/3", "112.0.0.0/5", "120.0.0.0/6", "124.0.0.0/7",
+    "126.0.0.0/8", "104.0.0.0/5", "96.0.0.0/6", "102.0.0.0/7",
+    "101.0.0.0/8", "100.128.0.0/9", "100.0.0.0/10", "32.0.0.0/3",
+    "16.0.0.0/4", "12.0.0.0/6", "8.0.0.0/7", "11.0.0.0/8",
+    "4.0.0.0/6", "2.0.0.0/7", "1.0.0.0/8", "8000::/2",
+    "c000::/3", "e000::/4", "f000::/5", "f800::/6",
+    "fe00::/9", "fec0::/10", "4000::/2", "2000::/3",
+    "1000::/4", "800::/5", "400::/6", "200::/7",
+    "100::/8", "80::/9", "40::/10", "20::/11",
+    "10::/12", "8::/13", "4::/14", "2::/15",
+    "1::/16", "0:8000::/17", "0:4000::/18", "0:2000::/19",
+    "0:1000::/20", "0:800::/21", "0:400::/22", "0:200::/23",
+    "0:100::/24", "0:80::/25", "0:40::/26", "0:20::/27",
+    "0:10::/28", "0:8::/29", "0:4::/30", "0:2::/31",
+    "0:1::/32", "0:0:8000::/33", "0:0:4000::/34", "0:0:2000::/35",
+    "0:0:1000::/36", "0:0:800::/37", "0:0:400::/38", "0:0:200::/39",
+    "0:0:100::/40", "0:0:80::/41", "0:0:40::/42", "0:0:20::/43",
+    "0:0:10::/44", "0:0:8::/45", "0:0:4::/46", "0:0:2::/47",
+    "0:0:1::/48", "0:0:0:8000::/49", "0:0:0:4000::/50", "0:0:0:2000::/51",
+    "0:0:0:1000::/52", "0:0:0:800::/53", "0:0:0:400::/54", "0:0:0:200::/55",
+    "0:0:0:100::/56", "0:0:0:80::/57", "0:0:0:40::/58", "0:0:0:20::/59",
+    "0:0:0:10::/60", "0:0:0:8::/61", "0:0:0:4::/62", "0:0:0:2::/63",
+    "0:0:0:1::/64", "::8000:0:0:0/65", "::4000:0:0:0/66", "::2000:0:0:0/67",
+    "::1000:0:0:0/68", "::800:0:0:0/69", "::400:0:0:0/70", "::200:0:0:0/71",
+    "::100:0:0:0/72", "::80:0:0:0/73", "::40:0:0:0/74", "::20:0:0:0/75",
+    "::10:0:0:0/76", "::8:0:0:0/77", "::4:0:0:0/78", "::2:0:0:0/79",
+    "::1:0:0:0/80", "::8000:0:0/81", "::4000:0:0/82", "::2000:0:0/83",
+    "::1000:0:0/84", "::800:0:0/85", "::400:0:0/86", "::200:0:0/87",
+    "::100:0:0/88", "::80:0:0/89", "::40:0:0/90", "::20:0:0/91",
+    "::10:0:0/92", "::8:0:0/93", "::4:0:0/94", "::2:0:0/95",
+    "::1:0:0/96", "::8000:0/97", "::4000:0/98", "::2000:0/99",
+    "::1000:0/100", "::800:0/101", "::400:0/102", "::200:0/103",
+    "::100:0/104", "::80:0/105", "::40:0/106", "::20:0/107",
+    "::10:0/108", "::8:0/109", "::4:0/110", "::2:0/111",
+    "::1:0/112", "::8000/113", "::4000/114", "::2000/115",
+    "::1000/116", "::800/117", "::400/118", "::200/119",
+    "::100/120", "::80/121", "::40/122", "::20/123",
+    "::10/124", "::8/125", "::4/126", "::2/127",
+    "::/128",
+];
+
 /// Convert a VLESS/TLS/XHTTP link into a full-system Xray TUN configuration.
 pub fn vless_xhttp_tun_config(link: &str, interface: &str) -> Result<Value, String> {
     vless_tun_config_with_relay(link, interface, None)
 }
 
+/// What the tunnel must NOT carry: BitTorrent and user-listed domains / IPs / CIDRs go out directly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bypass {
+    #[serde(default = "default_true")]
+    pub bittorrent: bool,
+    #[serde(default)]
+    pub entries: Vec<String>,
+}
+fn default_true() -> bool { true }
+impl Default for Bypass { fn default() -> Self { Bypass { bittorrent: true, entries: Vec::new() } } }
+
+fn valid_domain(name: &str) -> bool {
+    name.len() <= 253 && name.contains('.') && name.split('.').all(|l| {
+        !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+/// A pattern with `*` standing for any characters, e.g. `video*.example.com` or `*.google.*`.
+fn valid_wildcard(entry: &str) -> bool {
+    entry.contains('*') && entry.chars().any(|c| c.is_ascii_alphanumeric()) && !entry.contains("**") && entry.len() <= 253 && valid_domain(&entry.replace('*', "x"))
+}
+fn is_wildcard(entry: &str) -> bool { entry.contains('*') }
+fn valid_ip_or_cidr(entry: &str) -> bool {
+    match entry.split_once('/') {
+        None => entry.parse::<std::net::IpAddr>().is_ok(),
+        Some((ip, bits)) => match (ip.parse::<std::net::IpAddr>(), bits.parse::<u8>()) {
+            (Ok(std::net::IpAddr::V4(_)), Ok(n)) => n <= 32,
+            (Ok(std::net::IpAddr::V6(_)), Ok(n)) => n <= 128,
+            _ => false,
+        },
+    }
+}
+impl Bypass {
+    /// Lowercase, de-duplicate and strictly validate every entry (a domain, an IP or a CIDR).
+    pub fn validated(self) -> Result<Bypass, String> {
+        let mut entries: Vec<String> = Vec::new();
+        for raw in &self.entries {
+            let entry = raw.trim().to_ascii_lowercase();
+            // `*.example.com` is just the domain rule (it already covers subdomains); other `*` stay as patterns.
+            let entry = match entry.strip_prefix("*.") { Some(rest) if !rest.contains('*') && rest.contains('.') => rest.to_owned(), _ => entry };
+            if entry.is_empty() { continue; }
+            if !(valid_ip_or_cidr(&entry) || valid_domain(&entry) || valid_wildcard(&entry)) {
+                return Err(format!("Не похоже на домен, IP или подсеть: {}", raw.chars().take(40).collect::<String>()));
+            }
+            if !entries.contains(&entry) { entries.push(entry); }
+        }
+        if entries.len() > 200 { return Err("Слишком много исключений (максимум 200)".into()); }
+        Ok(Bypass { bittorrent: self.bittorrent, entries })
+    }
+}
+
 /// Build a full-system TUN config, optionally dialing a Hysteria 2 outbound
 /// through an established VLESS/XHTTP relay for networks that block UDP.
 pub fn vless_tun_config_with_relay(link: &str, interface: &str, relay_link: Option<&str>) -> Result<Value, String> {
+    vless_tun_config_with_options(link, interface, relay_link, false, None, &Bypass::default())
+}
+
+/// Same as `vless_tun_config_with_relay`; `verbose` turns on the info level and the
+/// access log (it records destination addresses, so it is opt-in and diagnostic only).
+pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Option<&str>, verbose: bool, api_port: Option<u16>, bypass: &Bypass) -> Result<Value, String> {
     if !interface.starts_with("utun") || !interface[4..].chars().all(|c| c.is_ascii_digit()) {
         return Err("Invalid macOS TUN interface name".into());
     }
     let mut config = vless_config(link, 10808)?;
+    // Helper keeps Xray's stdout in a root-only xray.log; an empty access path sends the access log there.
+    // Per-outbound traffic counters, readable only through a loopback StatsService (no handler/control services).
+    if let Some(port) = api_port {
+        config["stats"] = json!({});
+        config["policy"] = json!({"system": {"statsOutboundUplink": true, "statsOutboundDownlink": true}});
+        config["api"] = json!({"tag": "api", "listen": format!("127.0.0.1:{port}"), "services": ["StatsService"]});
+    }
+    if verbose { config["log"] = json!({"loglevel": "info", "access": ""}); }
     if let Some(relay_link) = relay_link {
-        if !link.starts_with("hysteria2://") { return Err("A relay is supported only for Hysteria 2".into()); }
+        if !link.starts_with("hysteria2://") && config["outbounds"][0]["streamSettings"]["security"] != "reality" { return Err("A relay is supported only for Hysteria 2 or REALITY".into()); }
         let mut relay = vless_config(relay_link, 10808)?["outbounds"][0].clone();
         if relay["protocol"] != "vless" || relay["streamSettings"]["network"] != "xhttp" || relay["streamSettings"]["security"] != "tls" {
             return Err("The Hysteria relay must be VLESS over TLS/XHTTP".into());
         }
-        relay["tag"] = json!("hysteria-relay");
-        config["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"] = json!("hysteria-relay");
+        relay["tag"] = json!("vpn-relay");
+        config["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"] = json!("vpn-relay");
         config["outbounds"].as_array_mut().ok_or("Invalid outbound config")?.push(relay);
     }
     config["inbounds"] = json!([{
@@ -172,11 +295,38 @@ pub fn vless_tun_config_with_relay(link: &str, interface: &str, relay_link: Opti
             "name": interface,
             "mtu": 1400,
             "gateway": ["169.254.10.1/30"],
-            "autoSystemRoutingTable": ["0.0.0.0/0", "::/0"],
+            "autoSystemRoutingTable": PUBLIC_TUN_ROUTES,
             "autoOutboundsInterface": "auto"
-        }
+        },
+        "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
     }]);
     config["outbounds"][0]["tag"] = json!("vpn-out");
+    // BitTorrent goes straight out of the physical interface, not through the VPN.
+    config["outbounds"].as_array_mut().ok_or("Invalid outbound config")?
+        .push(json!({"tag": "direct", "protocol": "freedom"}));
+    let bypass = bypass.clone().validated()?;
+    let mut rules: Vec<Value> = Vec::new();
+    if bypass.bittorrent { rules.push(json!({"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"})); }
+    let domains: Vec<String> = bypass.entries.iter().filter(|e| !valid_ip_or_cidr(e)).map(|e| {
+        if is_wildcard(e) { format!("regexp:^{}$", e.replace('.', "\\.").replace('*', ".*")) } else { format!("domain:{e}") }
+    }).collect();
+    if !domains.is_empty() {
+        // Excluded domains must be dialed by name over IPv4: many networks have no IPv6, and the TUN accepts the
+        // handshake locally, so a direct IPv6 dial that fails would never fall back to IPv4 in the browser.
+        config["inbounds"][0]["sniffing"]["routeOnly"] = json!(false);
+        let direct = config["outbounds"].as_array_mut().and_then(|o| o.last_mut()).ok_or("Invalid outbound config")?;
+        direct["settings"] = json!({"domainStrategy": "UseIPv4"});
+        // Resolve those names with our own DNS, sent out of the physical interface. Without it Xray falls back to the
+        // system resolver, whose first server can be unreachable (e.g. Tailscale's IPv6 MagicDNS) and stalls ~30 s.
+        // TCP, not UDP: a direct UDP socket cannot be bound to the physical interface by Xray's TUN on macOS
+        // ("failed to set interface: invalid argument"), so UDP queries (and QUIC) from the direct outbound time out.
+        config["dns"] = json!({"servers": ["tcp://1.1.1.1", "tcp://1.0.0.1"], "queryStrategy": "UseIPv4"});
+        rules.insert(0, json!({"type": "field", "ip": ["1.1.1.1", "1.0.0.1"], "port": "53", "network": "tcp", "outboundTag": "direct"}));
+    }
+    let ips: Vec<&String> = bypass.entries.iter().filter(|e| valid_ip_or_cidr(e)).collect();
+    if !domains.is_empty() { rules.push(json!({"type": "field", "domain": domains, "outboundTag": "direct"})); }
+    if !ips.is_empty() { rules.push(json!({"type": "field", "ip": ips, "outboundTag": "direct"})); }
+    config["routing"] = json!({"domainStrategy": "AsIs", "rules": rules});
     Ok(config)
 }
 
@@ -187,6 +337,7 @@ mod tests {
     fn builds_xhttp_client_and_keeps_local_proxy_private() {
         let link = "vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=xhttp&security=tls&sni=example.org&path=%2Fvpn&mode=auto";
         let config = vless_xhttp_config(link, 10808).unwrap();
+        assert_eq!(config["log"]["loglevel"], "warning");
         assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
         assert_eq!(
             config["outbounds"][0]["streamSettings"]["xhttpSettings"]["path"],
@@ -220,10 +371,70 @@ mod tests {
     fn builds_reality_tun_and_rejects_invalid_keys() {
         let link="vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=tcp&security=reality&sni=www.microsoft.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=01234567&fp=chrome&spx=%2F&flow=xtls-rprx-vision";
         let config=vless_xhttp_tun_config(link,"utun10").unwrap();
+        assert_eq!(config["log"]["loglevel"], "warning");
+        assert!(config["log"].get("access").is_none());
+        let verbose=vless_tun_config_with_options(link,"utun10",None,true,Some(18085),&Bypass::default()).unwrap();
+        assert_eq!(verbose["log"]["loglevel"], "info");
+        assert_eq!(verbose["log"]["access"], "");
+        assert_eq!(verbose["api"]["listen"], "127.0.0.1:18085");
+        assert_eq!(verbose["api"]["services"], json!(["StatsService"]));
+        assert_eq!(verbose["policy"]["system"]["statsOutboundDownlink"], true);
+        assert!(config.get("api").is_none());
+        let custom=Bypass{bittorrent:false,entries:vec!["*.Example.org".into()," 10.1.0.0/16 ".into(),"2001:db8::/32".into(),"example.org".into()]};
+        let routed=vless_tun_config_with_options(link,"utun10",None,false,None,&custom).unwrap();
+        let rules=routed["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(),3);
+        assert_eq!(rules[0]["ip"],json!(["1.1.1.1","1.0.0.1"]));
+        assert_eq!(rules[1]["domain"],json!(["domain:example.org"]));
+        assert_eq!(rules[2]["ip"],json!(["10.1.0.0/16","2001:db8::/32"]));
+        assert!(config["routing"]["rules"][0]["protocol"]==json!(["bittorrent"]));
+        // Domain exclusions switch sniffing to destination override and the direct outbound to IPv4.
+        assert_eq!(routed["inbounds"][0]["sniffing"]["routeOnly"], false);
+        assert_eq!(routed["outbounds"].as_array().unwrap().last().unwrap()["settings"]["domainStrategy"], "UseIPv4");
+        assert_eq!(config["inbounds"][0]["sniffing"]["routeOnly"], true);
+        assert_eq!(routed["dns"]["servers"], json!(["tcp://1.1.1.1","tcp://1.0.0.1"]));
+        assert_eq!(routed["routing"]["rules"][0]["network"], "tcp");
+        assert_eq!(routed["routing"]["rules"][0]["port"], "53");
+        assert_eq!(routed["routing"]["rules"][0]["outboundTag"], "direct");
+        assert!(config.get("dns").is_none());
+        let ip_only=vless_tun_config_with_options(link,"utun10",None,false,None,&Bypass{bittorrent:true,entries:vec!["10.0.0.0/8".into()]}).unwrap();
+        assert_eq!(ip_only["inbounds"][0]["sniffing"]["routeOnly"], true);
+        // Wildcards become regexp rules; `*.domain` stays a plain domain rule.
+        let wild=Bypass{bittorrent:false,entries:vec!["*.Example.com".into(),"video*.cdn.example.org".into(),"*.google.*".into()]}.validated().unwrap();
+        assert_eq!(wild.entries,vec!["example.com","video*.cdn.example.org","*.google.*"]);
+        let wr=vless_tun_config_with_options(link,"utun10",None,false,None,&wild).unwrap();
+        assert_eq!(wr["routing"]["rules"][1]["domain"],json!(["domain:example.com","regexp:^video.*\\.cdn\\.example\\.org$","regexp:^.*\\.google\\..*$"]));
+        // A whole zone: `*.ru` matches every .ru name (a bare `ru` is still rejected).
+        let zone=Bypass{bittorrent:false,entries:vec!["*.RU".into()]}.validated().unwrap();
+        assert_eq!(zone.entries,vec!["*.ru"]);
+        let zr=vless_tun_config_with_options(link,"utun10",None,false,None,&zone).unwrap();
+        assert_eq!(zr["routing"]["rules"][1]["domain"],json!(["regexp:^.*\\.ru$"]));
+        assert!(Bypass{bittorrent:true,entries:vec!["ru".into()]}.validated().is_err());
+        for bad in ["*","**.com","a**b.com","*.*","exa mple.*"] { assert!(Bypass{bittorrent:true,entries:vec![bad.into()]}.validated().is_err(),"{bad}"); }
+        for bad in ["bad entry","a..b","-x.com","10.0.0.0/33","localhost","1.2.3.4/x"] {
+            assert!(Bypass{bittorrent:true,entries:vec![bad.into()]}.validated().is_err(),"{bad}");
+        }
         assert_eq!(config["outbounds"][0]["streamSettings"]["security"],"reality");
         assert_eq!(config["outbounds"][0]["settings"]["vnext"][0]["users"][0]["flow"],"xtls-rprx-vision");
         assert!(vless_config(&link.replace("sid=01234567","sid=xyz"),10808).is_err());
         assert!(vless_config(&link.replace("pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","pbk=bad"),10808).is_err());
+    }
+    #[test]
+    fn chains_reality_through_xhttp_relay() {
+        let reality = "vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=tcp&security=reality&sni=www.apple.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=01234567&fp=chrome";
+        let relay = "vless://12345678-1234-1234-1234-123456789abc@relay.example:8443?type=xhttp&security=tls&sni=relay.example&path=%2F";
+        let config = vless_tun_config_with_relay(reality, "utun10", Some(relay)).unwrap();
+        assert_eq!(config["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"], "vpn-relay");
+        assert_eq!(config["outbounds"][1]["tag"], "vpn-relay");
+        assert_eq!(config["outbounds"][1]["streamSettings"]["network"], "xhttp");
+    }
+    #[test]
+    fn reality_accepts_noop_defaults_and_names_unsupported_parameters() {
+        let link="vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=tcp&security=reality&sni=www.microsoft.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=01234567&fp=chrome&spx=%2F&flow=xtls-rprx-vision";
+        assert!(vless_config(&format!("{link}&headerType=none&packetEncoding=xudp&allowInsecure=0"),10808).is_ok());
+        assert!(vless_config(&format!("{link}&headerType=http"),10808).is_err());
+        let err=vless_config(&format!("{link}&pqv=secret"),10808).unwrap_err();
+        assert!(err.contains("pqv") && !err.contains("secret"));
     }
     #[test]
     fn builds_hysteria2_tun_and_rejects_bad_links() {
@@ -242,7 +453,7 @@ mod tests {
         let h = "hysteria2://secret@example.org:443/?sni=example.org";
         let relay = "vless://12345678-1234-1234-1234-123456789abc@relay.example:443?type=xhttp&security=tls&sni=relay.example&path=%2Fvpn";
         let config = vless_tun_config_with_relay(h, "utun10", Some(relay)).unwrap();
-        assert_eq!(config["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"], "hysteria-relay");
+        assert_eq!(config["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"], "vpn-relay");
         assert_eq!(config["outbounds"][1]["protocol"], "vless");
         assert_eq!(config["outbounds"][1]["streamSettings"]["network"], "xhttp");
         assert!(vless_tun_config_with_relay(h, "utun10", Some("hysteria2://bad@relay:443")).is_err());

@@ -36,7 +36,11 @@
   const usable = p => p.enabled && p.inbound_enabled && ['vless', 'hysteria'].includes(p.protocol) && p.has_local_config;
   const allKeys = () => servers.flatMap(s => profilesFor(s.id).filter(usable).map(p => ({server_id:s.id,inbound_id:p.inbound_id,email:p.email})));
   const sameKey = (a,b) => a.server_id===b.server_id && a.inbound_id===b.inbound_id && a.email===b.email;
-  let mode = 'off';
+  const imported = []; let importedSeq = 1;
+  let statsTick = 0;
+  let logLevel = 'warning';
+  let bypassState = { bittorrent: true, entries: [] };
+let mode = 'off';
   let install = {running: false, finished: false, success: false, log: [], url: null, username: null, password: null, token: null};
   const installScript = [
     'Подключаюсь по SSH…', 'Скачиваю установщик 3x-ui…', 'Устанавливаю зависимости…',
@@ -45,6 +49,11 @@
 
   const handlers = {
     build_info: () => 'v0.0.0-dev · mock',
+    vpn_stats: () => { statsTick += 1; const t = Date.now(); return { ts_ms: t, vpn: { up: statsTick * 40000, down: statsTick * 900000 }, direct: { up: statsTick * 300000, down: statsTick * 2500000 } }; },
+    get_log_level: () => logLevel,
+    set_log_level: ({ verbose }) => { logLevel = verbose ? 'info' : 'warning'; return 'ok'; },
+    get_bypass_settings: () => bypassState,
+    set_bypass_settings: ({ bittorrent, entries }) => { if (entries.some(e => /\s/.test(e))) throw 'Не похоже на домен, IP или подсеть: ' + entries[0]; bypassState = { bittorrent, entries }; return bypassState; },
     get_vpn_mode: () => mode,
     list_servers: () => servers,
     list_connectable_profiles: () => (readPins(), servers.flatMap(server => profilesFor(server.id).filter(p => usable(p) && (pinnedProfiles === null || pinnedProfiles.some(k=>sameKey(k,{server_id:server.id,inbound_id:p.inbound_id,email:p.email})))).map(p => ({...p, server_id:server.id, server_name:server.name, country:server.country})))),
@@ -52,6 +61,25 @@
     set_profile_pinned: ({serverId,inboundId,email,pinned}) => { if(fail('set_profile_pinned')) throw 'Не удалось изменить отметку (mock)'; readPins(); const key={server_id:serverId,inbound_id:inboundId,email}, all=allKeys(); if(pinned && !all.some(k=>sameKey(k,key))) throw 'Клиент недоступен'; if(pinnedProfiles===null) pinnedProfiles=all; pinnedProfiles=pinnedProfiles.filter(k=>!sameKey(k,key)); if(pinned) pinnedProfiles.push(key); savePins(); return null; },
     select_mcp_profile: () => null,
     get_mcp_profile: () => null,
+    import_profiles: ({text, name}) => {
+      if (fail('import_profiles')) throw 'Не удалось импортировать (mock)';
+      const links = (text.match(/(?:vless|hysteria2|hy2):\/\/\S+/g) || []).map(l => l.replace(/^hy2:/, 'hysteria2:'));
+      if (!links.length) throw 'В тексте нет ссылки vless://';
+      const added = [];
+      for (const link of links) {
+        if (!/^vless:\/\/[0-9a-f-]{36}@[^:/]+:\d+/.test(link) && !/^hysteria2:\/\/[^@]+@[^:/]+:\d+/.test(link)) continue;
+        if (imported.some(i => i.link === link)) continue;
+        const u = new URL(link.replace('vless://', 'http://'));
+        const item = {id: String(importedSeq++).padStart(32, '0'), link, name: (name || decodeURIComponent(u.hash.slice(1)) || u.hostname), host: u.hostname, port: Number(u.port) || 443, transport: link.startsWith('hysteria2:') ? 'hysteria2' : (u.searchParams.get('type') || 'tcp'), security: u.searchParams.get('security') || ''};
+        imported.push(item); added.push({id: item.id, name: item.name, host: item.host, port: item.port, transport: item.transport, security: item.security});
+      }
+      if (!added.length) throw 'Некорректная ссылка или конфигурация уже импортирована';
+      return added;
+    },
+    list_imported_profiles: () => imported.map(({link, ...rest}) => rest),
+    rename_imported_profile: ({id, name}) => { const i = imported.find(i => i.id === id); if (!i) throw 'Конфигурация не найдена'; i.name = name; return null; },
+    delete_imported_profile: ({id}) => { const k = imported.findIndex(i => i.id === id); if (k < 0) throw 'Конфигурация не найдена'; imported.splice(k, 1); return null; },
+    connect_imported_profile: async ({id}) => { if (!imported.some(i => i.id === id)) throw 'Конфигурация не найдена'; if (fail('connect_profile')) throw 'VPN запущен, но трафик через сервер не проходит: DNS и TCP недоступны.'; await delay(800); mode = 'tun'; return 'VPN подключён (mock, импорт)'; },
     open_admin: () => null,
     panel_hostname: ({url}) => { try { return new URL(url).hostname; } catch { throw 'Некорректный адрес панели'; } },
     save_server: ({id, name, url, country, sshTarget, panelHost, token}) => {
@@ -100,9 +128,13 @@
     connect_profile: async () => { if (fail('connect_profile')) throw 'VPN запущен, но трафик через сервер не проходит: DNS и TCP недоступны.'; await delay(1200); mode = 'tun'; return 'VPN подключён через utun10 (mock)'; },
     xray_stop: () => { mode = 'off'; return null; },
     // Like the real command, resolves only when the installation has finished; the page polls install_progress meanwhile.
-    install_panel: async ({target}) => {
+    install_panel: async ({target, password, installKey}) => {
+      if (password !== undefined && password !== null && !password) throw 'Пароль не должен быть пустым';
+      window.__lastInstallArgs = {target, hasPassword: !!password, installKey};
       install = {running: true, finished: false, success: false, log: [], url: null, username: null, password: null, token: null};
       for (const line of installScript) { await delay(600); install.log.push(line); }
+      if (password && installKey) install.log.push('Ваш публичный SSH-ключ добавлен на сервер.');
+      if (password && fail('wrong_password')) { Object.assign(install, {running: false, finished: true, success: false}); install.log.push('SSH: доступ отклонён; проверьте пароль или ключ и права.'); throw 'Установка завершилась с ошибкой'; }
       const ok = !fail('install_panel');
       Object.assign(install, {running: false, finished: true, success: ok, url: ok ? 'http://203.0.113.9:2053/mock/' : null,
         username: ok ? 'mockadmin' : null, password: ok ? 'mockpass' : null, token: ok && params.get('no_token') !== '1' ? 'mock-token' : null});

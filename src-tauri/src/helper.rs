@@ -118,10 +118,26 @@ fn request_value(request: Value) -> Result<Value, String> {
     Ok(response)
 }
 fn request(action: &str, link: Option<&str>, relay_link: Option<&str>) -> Result<Value, String> { request_value(json!({"action":action,"link":link,"relay_link":relay_link})) }
+pub fn log_tail(lines: u64, filter: Option<&str>) -> Result<String, String> {
+    Ok(request_value(json!({"action":"log","lines":lines,"filter":filter}))?.get("message").and_then(Value::as_str).unwrap_or("").to_owned())
+}
+pub fn log_level() -> Result<String, String> {
+    Ok(request_value(json!({"action":"get_log_level"}))?.get("message").and_then(Value::as_str).unwrap_or("warning").to_owned())
+}
+pub fn set_log_level(level: &str) -> Result<String, String> {
+    Ok(request_value(json!({"action":"set_log_level","level":level}))?.get("message").and_then(Value::as_str).unwrap_or("").to_owned())
+}
+/// Cumulative per-outbound byte counters: {direct:{up,down}, vpn:{up,down}, ts_ms}.
+pub fn stats() -> Result<Value, String> {
+    let response = request_value(json!({"action":"stats"}))?;
+    let text = response.get("message").and_then(Value::as_str).unwrap_or("");
+    serde_json::from_str(text).map_err(|_| "Некорректный ответ статистики".to_owned())
+}
 pub fn status() -> Result<bool, String> { Ok(request("status", None, None)?.get("connected").and_then(Value::as_bool).unwrap_or(false)) }
 pub fn start(link: &str, relay_link: Option<&str>) -> Result<String, String> {
     ensure_installed()?;
-    Ok(request("start", Some(link), relay_link)?.get("message").and_then(Value::as_str).unwrap_or("TUN подключён").to_owned())
+    let bypass = vpn_core::read_bypass()?;
+    Ok(request_value(json!({"action":"start","link":link,"relay_link":relay_link,"bypass":bypass}))?.get("message").and_then(Value::as_str).unwrap_or("TUN подключён").to_owned())
 }
 pub fn stop() -> Result<(), String> {
     if helper_status(Duration::from_secs(15)).is_none() { ensure_installed()?; }

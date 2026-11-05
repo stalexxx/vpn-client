@@ -184,7 +184,7 @@ fn ssh_tunnel(target: &str, port: u16) -> Result<(Tunnel, u16), String> {
     let mut tunnel = Tunnel(child);
     for _ in 0..100 {
         if tunnel.0.try_wait().map_err(|e| e.to_string())?.is_some() {
-            return Err("SSH tunnel failed; check SSH key, host key and server access".into());
+            return Err("SSH-туннель к панели не поднялся: проверьте, что ваш публичный SSH-ключ добавлен на сервер (вход по паролю туннель не поддерживает) и что ключ сервера в ~/.ssh/known_hosts не изменился.".into());
         }
         if TcpStream::connect(("127.0.0.1", local)).is_ok() {
             return Ok((tunnel, local));
@@ -317,6 +317,45 @@ fn server_token(id: &str) -> Result<String, String> {
 }
 pub fn server_inbounds(id: &str) -> Result<serde_json::Value, String> { let s = server_for(id)?; list_inbounds_for(&s.panel, &server_token(id)?) }
 
+pub fn list_inbounds_for_host(host: &str) -> Result<serde_json::Value, String> {
+    if !valid_http_host(host) { return Err("Некорректный хост".into()); }
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|v| v.rsplit('@').next()) == Some(host)).collect();
+    if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
+    let server = &servers[0];
+    list_inbounds_for(&server.panel, &server_token(&server.id)?)
+}
+
+pub fn delete_inbound_for_host(host: &str, inbound_id: u64) -> Result<String, String> {
+    if !valid_http_host(host) || inbound_id == 0 { return Err("Некорректный хост или ID inbound-а".into()); }
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|v| v.rsplit('@').next()) == Some(host)).collect();
+    if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
+    let server = &servers[0]; let token = server_token(&server.id)?;
+    let list = list_inbounds_for(&server.panel, &token)?;
+    let inbound = list.as_array().and_then(|a| a.iter().find(|v| v["id"].as_u64() == Some(inbound_id))).ok_or("Inbound с таким ID не найден на этом сервере")?;
+    let remark = inbound["remark"].as_str().unwrap_or("(без имени)");
+    panel_request(&server.panel, &token, &format!("inbounds/del/{inbound_id}"), Some(serde_json::json!({})))?;
+    Ok(format!("Удалён inbound {inbound_id} ({remark}) с сервера {}", server.panel.name))
+}
+
+pub fn delete_reality_inbound(host: &str) -> Result<String, String> {
+    if !valid_http_host(host) { return Err("Некорректный хост".into()); }
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|v| v.rsplit('@').next()) == Some(host)).collect();
+    if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
+    let server = &servers[0];
+    let token = server_token(&server.id)?;
+    let list = panel_request(&server.panel, &token, "inbounds/list", None)?;
+    let items = list.get("obj").and_then(|v| v.as_array()).ok_or("Некорректный список inbound-ов")?;
+    let candidates: Vec<_> = items.iter().filter(|v| v["port"] == 443 && v["remark"] == "VLESS-REALITY-443" && v["protocol"] == "vless").collect();
+    if candidates.len() != 1 { return Err("Найдено не ровно одно целевое Reality подключение; ничего не удалено".into()); }
+    let target = candidates[0];
+    let stream_raw = target.get("streamSettings").cloned().unwrap_or(serde_json::json!({}));
+    let stream = if let Some(s) = stream_raw.as_str() { serde_json::from_str::<serde_json::Value>(s).map_err(|_| "Повреждены настройки inbound-а")? } else { stream_raw };
+    if stream["network"] != "tcp" || stream["security"] != "reality" { return Err("Целевой inbound не является TCP Reality; ничего не удалено".into()); }
+    let id = target["id"].as_u64().ok_or("Некорректный ID inbound-а")?;
+    panel_request(&server.panel, &token, &format!("inbounds/del/{id}"), Some(serde_json::json!({})))?;
+    Ok(format!("Удалён VLESS TCP Reality inbound {id} на сервере {}", server.panel.name))
+}
+
 pub fn list_inbounds() -> Result<serde_json::Value, String> {
     let panel = load_panel()?.ok_or("No panel configured")?;
     let token = token_get(&panel.url)?;
@@ -373,7 +412,8 @@ fn panel_request(
     }
     let value: serde_json::Value = response.json().map_err(|_| "Panel returned invalid JSON")?;
     if value.get("success").and_then(|v| v.as_bool()) != Some(true) {
-        return Err("Panel did not report success".into());
+        let reason = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown panel error");
+        return Err(format!("Panel did not report success: {}", reason.chars().take(160).collect::<String>()));
     }
     Ok(value)
 }
@@ -427,6 +467,30 @@ pub fn list_client_profiles(id: &str) -> Result<serde_json::Value, String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedProfile { pub server_id: String, pub inbound_id: u64, pub email: String }
 static PIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static BYPASS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn bypass_path() -> Result<PathBuf, String> { Ok(config_path()?.with_file_name("bypass.json")) }
+/// Traffic that must not go through the tunnel (defaults: BitTorrent direct, no extra entries).
+pub fn read_bypass() -> Result<profile::Bypass, String> {
+    match fs::read(bypass_path()?) {
+        Ok(data) => serde_json::from_slice::<profile::Bypass>(&data).map_err(|_| "Некорректный файл исключений".to_owned())?.validated(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(profile::Bypass::default()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+pub fn write_bypass(bypass: profile::Bypass) -> Result<profile::Bypass, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let bypass = bypass.validated()?;
+    let _guard = BYPASS_LOCK.lock().map_err(|_| "Не удалось заблокировать настройки")?;
+    let path = bypass_path()?;
+    let dir = path.parent().ok_or("Некорректный путь настроек")?;
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
+    file.as_file().set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut file, &bypass).map_err(|e| e.to_string())?;
+    file.as_file().sync_all().map_err(|e| e.to_string())?;
+    file.persist(&path).map_err(|e| e.to_string())?;
+    Ok(bypass)
+}
 fn pins_path() -> Result<PathBuf, String> { Ok(config_path()?.with_file_name("pinned-profiles.json")) }
 fn read_pins(path: &std::path::Path) -> Result<Option<Vec<PinnedProfile>>, String> {
     match fs::read(path) {
@@ -690,9 +754,33 @@ fn create_client_with_token(panel: &Panel, token: &str, inbound_id: u64, email: 
     Ok(())
 }
 
-fn reality_inbound_body(sni: &str, private: &str, public: &str, short_id: &str) -> serde_json::Value {
+pub fn create_xhttp_relay_client(host: &str, email: &str, sni: &str, port: u16) -> Result<(String, u64), String> {
+    if !valid_http_host(host) || !valid_domain_name(sni) || port == 0 { return Err("Некорректный хост, SNI или порт".into()); }
+    if email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Некорректное имя клиента".into()); }
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|s| s.rsplit('@').next()) == Some(host)).collect();
+    if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
+    let server = &servers[0]; let token = server_token(&server.id)?;
+    let remark = format!("VLESS-XHTTP-RELAY-{port}");
+    let items = panel_request(&server.panel, &token, "inbounds/list", None)?;
+    let items = items.get("obj").and_then(|v| v.as_array()).ok_or("Некорректный список inbound-ов")?;
+    let id = if let Some(existing) = items.iter().find(|v| v["port"] == port) {
+        if existing["remark"] != remark || existing["protocol"] != "vless" { return Err(format!("Порт {port} уже занят другим inbound-ом")); }
+        existing["id"].as_u64().ok_or("Некорректный ID inbound-а")?
+    } else {
+        let params = InboundParams { remark: remark.clone(), port: port.into(), server_name: sni.into(), path: "/".into() };
+        let mut body = build_inbound_request("VLESS-XHTTP-443", &params)?;
+        body["sniffing"] = serde_json::json!({"enabled":false,"destOverride":[],"metadataOnly":false,"routeOnly":false}).to_string().into();
+        let response = panel_request(&server.panel, &token, "inbounds/add", Some(body))?;
+        response.get("obj").and_then(|v| v.as_u64()).or_else(|| list_inbounds_for(&server.panel, &token).ok()?.as_array()?.iter().find(|i| i["remark"] == remark && i["port"] == port)?.get("id")?.as_u64()).ok_or("Панель создала inbound, но не вернула его ID")?
+    };
+    create_client_with_token(&server.panel, &token, id, email)?;
+    refresh_client_profiles(&server.id)?;
+    Ok((server.id.clone(), id))
+}
+
+fn reality_inbound_body(sni: &str, private: &str, public: &str, short_id: &str, port: u16) -> serde_json::Value {
     let stream = serde_json::json!({"network":"tcp","security":"reality","realitySettings":{"show":false,"xver":0,"target":format!("{sni}:443"),"serverNames":[sni],"privateKey":private,"shortIds":[short_id],"settings":{"publicKey":public,"fingerprint":"chrome","serverName":sni,"spiderX":"/"}},"tcpSettings":{"header":{"type":"none"}}});
-    serde_json::json!({"up":0,"down":0,"total":0,"remark":"VLESS-REALITY-443","enable":true,"expiryTime":0,"listen":"","port":443,"protocol":"vless","settings":serde_json::json!({"clients":[],"decryption":"none","encryption":"none","fallbacks":[]}).to_string(),"streamSettings":stream.to_string(),"sniffing":serde_json::json!({"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}).to_string()})
+    serde_json::json!({"up":0,"down":0,"total":0,"remark":format!("VLESS-REALITY-{port}"),"enable":true,"expiryTime":0,"listen":"","port":port,"protocol":"vless","settings":serde_json::json!({"clients":[],"decryption":"none","encryption":"none","fallbacks":[]}).to_string(),"streamSettings":stream.to_string(),"sniffing":serde_json::json!({"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}).to_string()})
 }
 
 fn hysteria2_inbound_body(sni: &str) -> serde_json::Value {
@@ -724,6 +812,11 @@ pub fn create_hysteria2_client(host: &str, email: &str, sni: &str) -> Result<(St
 }
 
 pub fn create_reality_client(host: &str, email: &str, sni: &str) -> Result<(String, u64), String> {
+    create_reality_client_on_port(host, email, sni, 443)
+}
+
+pub fn create_reality_client_on_port(host: &str, email: &str, sni: &str, port: u16) -> Result<(String, u64), String> {
+    if port == 0 { return Err("Некорректный порт".into()); }
     if !valid_http_host(host) || !valid_domain_name(sni) { return Err("Некорректный хост или SNI".into()); }
     if email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Некорректное имя клиента".into()); }
     let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|s| s.rsplit('@').next()) == Some(host)).collect();
@@ -731,10 +824,10 @@ pub fn create_reality_client(host: &str, email: &str, sni: &str) -> Result<(Stri
     let server = &servers[0]; let token = server_token(&server.id)?;
     let list = panel_request(&server.panel, &token, "inbounds/list", None)?;
     let items = list.get("obj").and_then(|v| v.as_array()).ok_or("Некорректный список inbound-ов")?;
-    let inbound_id = if let Some(existing) = items.iter().find(|v| v["port"] == 443) {
+    let inbound_id = if let Some(existing) = items.iter().find(|v| v["port"] == port) {
         let raw = existing.get("streamSettings").cloned().unwrap_or(serde_json::json!({}));
         let stream = if let Some(s) = raw.as_str() { serde_json::from_str::<serde_json::Value>(s).unwrap_or_default() } else { raw };
-        if existing["remark"] != "VLESS-REALITY-443" || existing["protocol"] != "vless" || stream["security"] != "reality" || stream["network"] != "tcp" { return Err("Порт 443 уже занят другим inbound-ом".into()); }
+        if existing["remark"] != format!("VLESS-REALITY-{port}") || existing["protocol"] != "vless" || stream["security"] != "reality" || stream["network"] != "tcp" { return Err(format!("Порт {port} уже занят другим inbound-ом")); }
         if !stream["realitySettings"]["serverNames"].as_array().is_some_and(|names| names.iter().any(|name| name == sni)) { return Err("На порту 443 уже есть Reality inbound с другим SNI".into()); }
         existing["id"].as_u64().ok_or("Некорректный ID inbound-а")?
     } else {
@@ -746,8 +839,8 @@ pub fn create_reality_client(host: &str, email: &str, sni: &str) -> Result<(Stri
         use std::io::Read;
         let mut bytes = [0u8; 8]; fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).map_err(|_| "Не удалось создать short ID")?;
         let short_id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let response = panel_request(&server.panel, &token, "inbounds/add", Some(reality_inbound_body(sni, private, public, &short_id)))?;
-        response.get("obj").and_then(|v| v.as_u64()).or_else(|| list_inbounds_for(&server.panel, &token).ok()?.as_array()?.iter().find(|i| i["remark"] == "VLESS-REALITY-443" && i["port"] == 443)?.get("id")?.as_u64()).ok_or("Панель создала inbound, но не вернула его ID")?
+        let response = panel_request(&server.panel, &token, "inbounds/add", Some(reality_inbound_body(sni, private, public, &short_id, port)))?;
+        response.get("obj").and_then(|v| v.as_u64()).or_else(|| list_inbounds_for(&server.panel, &token).ok()?.as_array()?.iter().find(|i| i["remark"] == format!("VLESS-REALITY-{port}") && i["port"] == port)?.get("id")?.as_u64()).ok_or("Панель создала inbound, но не вернула его ID")?
     };
     let list = panel_request(&server.panel, &token, "inbounds/list", None)?;
     let exists = list.get("obj").and_then(|v| v.as_array()).and_then(|a| a.iter().find(|i| i["id"] == inbound_id)).and_then(|i| i.get("settings")).map(|v| if let Some(s)=v.as_str() { serde_json::from_str::<serde_json::Value>(s).unwrap_or_default() } else { v.clone() }).and_then(|s| s.get("clients").and_then(|c| c.as_array()).map(|c| c.iter().any(|c| c["email"] == email))).unwrap_or(false);
@@ -949,6 +1042,124 @@ pub fn approve_pending_client(inbound_id: u64, email: &str) -> Result<String, St
     ))
 }
 
+// Connections imported from a share link, not tied to any saved server.
+#[derive(Clone, Serialize, Deserialize)]
+struct ImportedProfile { id: String, name: String, share_link: String, added_at: u64 }
+static IMPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn imported_path() -> Result<PathBuf, String> { Ok(config_path()?.with_file_name("imported-profiles.json")) }
+fn read_imported(path: &std::path::Path) -> Result<Vec<ImportedProfile>, String> {
+    match fs::read(path) {
+        Ok(data) => serde_json::from_slice(&data).map_err(|_| "Список импортированных конфигураций повреждён".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+fn write_imported(path: &std::path::Path, items: &[ImportedProfile]) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path.parent().ok_or("Некорректный путь к импортированным конфигурациям")?;
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
+    file.as_file().set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut file, items).map_err(|e| e.to_string())?;
+    file.as_file().sync_all().map_err(|e| e.to_string())?;
+    file.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+fn imported_summary(item: &ImportedProfile) -> serde_json::Value {
+    let url = url::Url::parse(&item.share_link).ok();
+    let hysteria = url.as_ref().is_some_and(|u| u.scheme() == "hysteria2");
+    let query = |name: &str| url.as_ref().and_then(|u| u.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()));
+    serde_json::json!({
+        "id": item.id, "name": item.name,
+        "host": url.as_ref().and_then(|u| u.host_str()).unwrap_or(""),
+        "port": url.as_ref().and_then(|u| u.port()).unwrap_or(443),
+        "transport": if hysteria { "hysteria2".into() } else { query("type").unwrap_or_else(|| "tcp".into()) },
+        "security": query("security").unwrap_or_default(),
+    })
+}
+fn valid_import_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) { return Err("Название должно быть от 1 до 128 символов".into()); }
+    Ok(name.to_owned())
+}
+fn extract_share_links(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
+        .filter(|part| part.starts_with("vless://") || part.starts_with("hysteria2://") || part.starts_with("hy2://"))
+        .map(str::to_owned).collect()
+}
+fn import_profiles_at(path: &std::path::Path, text: &str, name: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+    let links = extract_share_links(text);
+    if links.is_empty() { return Err("В тексте нет ссылки vless:// или hysteria2://".into()); }
+    if name.is_some() && links.len() > 1 { return Err("Название можно задать только для одной ссылки".into()); }
+    let _guard = IMPORT_LOCK.lock().map_err(|_| "Не удалось заблокировать список импортированных конфигураций")?;
+    let mut items = read_imported(path)?;
+    let mut added = Vec::new();
+    let mut last_error = None;
+    for link in links {
+        let link = match link.strip_prefix("hy2://") { Some(rest) => format!("hysteria2://{rest}"), None => link };
+        if let Err(e) = crate::profile::vless_config(&link, 10808) { last_error = Some(format!("Некорректная ссылка: {e}")); continue; }
+        if items.iter().any(|item| item.share_link == link) { last_error = Some("Эта конфигурация уже импортирована".into()); continue; }
+        let parsed = url::Url::parse(&link).map_err(|_| "Некорректная ссылка")?;
+        let fragment: String = url::form_urlencoded::parse(parsed.fragment().unwrap_or("").replace('+', "%2B").as_bytes()).map(|(k, v)| if v.is_empty() { k.into_owned() } else { format!("{k}={v}") }).collect();
+        let chosen = match name { Some(n) => valid_import_name(n)?, None => valid_import_name(&fragment).or_else(|_| valid_import_name(parsed.host_str().unwrap_or("Импорт")))? };
+        let item = ImportedProfile { id: new_server_id()?, name: chosen, share_link: link, added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) };
+        added.push(imported_summary(&item));
+        items.push(item);
+    }
+    if added.is_empty() { return Err(last_error.unwrap_or_else(|| "Не удалось импортировать конфигурацию".into())); }
+    write_imported(path, &items)?;
+    Ok(added)
+}
+pub fn import_profiles(text: &str, name: Option<&str>) -> Result<Vec<serde_json::Value>, String> { import_profiles_at(&imported_path()?, text, name) }
+pub fn list_imported_profiles() -> Result<Vec<serde_json::Value>, String> {
+    let _guard = IMPORT_LOCK.lock().map_err(|_| "Не удалось заблокировать список импортированных конфигураций")?;
+    Ok(read_imported(&imported_path()?)?.iter().map(imported_summary).collect())
+}
+fn update_imported(path: &std::path::Path, id: &str, change: impl FnOnce(&mut Vec<ImportedProfile>, usize) -> Result<(), String>) -> Result<(), String> {
+    if !valid_server_id(id) { return Err("Некорректный идентификатор конфигурации".into()); }
+    let _guard = IMPORT_LOCK.lock().map_err(|_| "Не удалось заблокировать список импортированных конфигураций")?;
+    let mut items = read_imported(path)?;
+    let index = items.iter().position(|item| item.id == id).ok_or("Конфигурация не найдена")?;
+    change(&mut items, index)?;
+    write_imported(path, &items)
+}
+pub fn rename_imported_profile(id: &str, name: &str) -> Result<(), String> {
+    let name = valid_import_name(name)?;
+    update_imported(&imported_path()?, id, |items, i| { items[i].name = name; Ok(()) })
+}
+pub fn delete_imported_profile(id: &str) -> Result<(), String> {
+    update_imported(&imported_path()?, id, |items, i| { items.remove(i); Ok(()) })
+}
+/// Hysteria 2 needs a VLESS/XHTTP relay to reach its server: prefer a saved-server client, then an imported one.
+pub fn imported_relay_link(exclude_id: &str) -> Result<Option<String>, String> {
+    for p in all_connectable_profiles()? {
+        if p["protocol"] == "vless" && p["transport"] == "xhttp" && p["has_local_config"] == true {
+            if let (Some(server), Some(inbound), Some(email)) = (p["server_id"].as_str(), p["inbound_id"].as_u64(), p["email"].as_str()) {
+                if let Ok(link) = cached_client_share_link(server, inbound, email) { return Ok(Some(link)); }
+            }
+        }
+    }
+    let _guard = IMPORT_LOCK.lock().map_err(|_| "Не удалось заблокировать список импортированных конфигураций")?;
+    Ok(read_imported(&imported_path()?)?.into_iter()
+        .find(|item| item.id != exclude_id && item.share_link.starts_with("vless://") && crate::profile::vless_xhttp_config(&item.share_link, 10808).is_ok())
+        .map(|item| item.share_link))
+}
+
+/// Optional explicit relay for REALITY profiles; the file contains a secret share link.
+pub fn reality_relay_link() -> Result<Option<String>, String> {
+    let path = config_path()?.with_file_name("reality-relay.json");
+    let data = match fs::read(path) { Ok(data) => data, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None), Err(e) => return Err(e.to_string()) };
+    let value: serde_json::Value = serde_json::from_slice(&data).map_err(|_| "Некорректная конфигурация Reality relay")?;
+    let link = value.get("share_link").and_then(|v| v.as_str()).ok_or("Не указан Reality relay")?;
+    crate::profile::vless_xhttp_config(link, 10808).map_err(|_| "Некорректный XHTTP relay для Reality")?;
+    Ok(Some(link.to_owned()))
+}
+pub fn imported_share_link(id: &str) -> Result<String, String> {
+    if !valid_server_id(id) { return Err("Некорректный идентификатор конфигурации".into()); }
+    let _guard = IMPORT_LOCK.lock().map_err(|_| "Не удалось заблокировать список импортированных конфигураций")?;
+    read_imported(&imported_path()?)?.into_iter().find(|item| item.id == id).map(|item| item.share_link).ok_or_else(|| "Конфигурация не найдена".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -985,6 +1196,34 @@ mod tests {
         assert_eq!(stream["tlsSettings"]["alpn"], serde_json::json!(["h3"]));
         assert_eq!(stream["tlsSettings"]["certificates"][0]["certificateFile"], "/root/cert/203-0-113-8.sslip.io/fullchain.pem");
         assert_eq!(stream["hysteriaSettings"]["version"], 2);
+    }
+    #[test]
+    fn imports_links_from_text_and_manages_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("imported-profiles.json");
+        let a = "vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=xhttp&security=tls&sni=example.org&path=%2Fa#Home%20NL";
+        let b = "vless://12345678-1234-1234-1234-123456789abd@example.net:443?type=xhttp&security=tls&sni=example.net&path=%2Fb";
+        let added = import_profiles_at(&path, &format!("  {a}\n\n{b} \n"), None).unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!(added[0]["name"], "Home NL");
+        assert_eq!(added[1]["name"], "example.net");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(import_profiles_at(&path, a, None).unwrap_err().contains("уже"));
+        assert!(import_profiles_at(&path, "hello", None).is_err());
+        let hy = import_profiles_at(&path, "hy2://secret%3Aauth@example.com:443/?sni=example.com#HY", None).unwrap();
+        assert_eq!(hy[0]["transport"], "hysteria2");
+        assert!(read_imported(&path).unwrap().last().unwrap().share_link.starts_with("hysteria2://"));
+        assert!(import_profiles_at(&path, "hysteria2://@example.com:443", None).is_err());
+        update_imported(&path, hy[0]["id"].as_str().unwrap(), |items, i| { items.remove(i); Ok(()) }).unwrap();
+        assert!(import_profiles_at(&path, "vless://bad@example.org:443", None).is_err());
+        assert!(import_profiles_at(&path, &format!("{a} {b}"), Some("x")).is_err());
+        let id = added[0]["id"].as_str().unwrap().to_owned();
+        update_imported(&path, &id, |items, i| { items[i].name = "Renamed".into(); Ok(()) }).unwrap();
+        assert_eq!(read_imported(&path).unwrap()[0].name, "Renamed");
+        update_imported(&path, &id, |items, i| { items.remove(i); Ok(()) }).unwrap();
+        assert_eq!(read_imported(&path).unwrap().len(), 1);
+        assert!(update_imported(&path, "../x", |_, _| Ok(())).is_err());
     }
     #[test]
     fn pinned_profiles_default_toggle_and_server_cleanup() {

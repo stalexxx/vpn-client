@@ -14,6 +14,51 @@ pub struct Progress {
 #[derive(Default)]
 pub struct InstallState(Mutex<Progress>);
 
+/// Temporary SSH_ASKPASS helper: prints the password from the child's environment, never stores it.
+struct Askpass(std::path::PathBuf);
+impl Askpass {
+    fn create() -> Result<Self, String> {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let dir = std::env::temp_dir().join(format!("vpnclient-askpass-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+        std::fs::create_dir(&dir).map_err(|_| "Не удалось подготовить вход по паролю")?;
+        let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        let path = dir.join("askpass.sh");
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&path).map_err(|_| "Не удалось подготовить вход по паролю")?;
+        file.write_all(b"#!/bin/sh\nprintf '%s\\n' \"$VPN_SSH_PASSWORD\"\n").map_err(|_| "Не удалось подготовить вход по паролю")?;
+        Ok(Askpass(path))
+    }
+}
+impl Drop for Askpass {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); if let Some(dir) = self.0.parent() { let _ = std::fs::remove_dir(dir); } }
+}
+fn valid_password(password: &str) -> bool { !password.is_empty() && password.len() <= 256 && !password.chars().any(|c| c == '\0' || c == '\n' || c == '\r') }
+/// ssh command for `target`; with a password it authenticates through SSH_ASKPASS and remembers an unknown host key on first use only.
+fn ssh_command(password: Option<&str>, askpass: Option<&Askpass>) -> Command {
+    let mut ssh = Command::new("/usr/bin/ssh");
+    ssh.args(["-T", "-o", "ConnectTimeout=10"]);
+    match (password, askpass) {
+        (Some(password), Some(askpass)) => {
+            ssh.args(["-o", "BatchMode=no", "-o", "StrictHostKeyChecking=accept-new", "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "NumberOfPasswordPrompts=1"])
+                .env("SSH_ASKPASS", &askpass.0).env("SSH_ASKPASS_REQUIRE", "force").env("DISPLAY", "vpnclient:0").env("VPN_SSH_PASSWORD", password);
+        }
+        _ => { ssh.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]); }
+    }
+    ssh
+}
+fn public_key_to_install() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let ssh_dir = std::path::PathBuf::from(home).join(".ssh");
+    for name in ["id_ed25519_vpn_client.pub", "id_ed25519.pub", "id_rsa.pub"] {
+        // Only a key whose private half exists locally is usable for the tunnel afterwards.
+        if !ssh_dir.join(name.trim_end_matches(".pub")).is_file() { continue; }
+        if let Ok(text) = std::fs::read_to_string(ssh_dir.join(name)) {
+            let line = text.lines().next().unwrap_or("").trim().to_owned();
+            if (line.starts_with("ssh-ed25519 ") || line.starts_with("ssh-rsa ") || line.starts_with("ecdsa-sha2-")) && line.len() < 2048 && !line.contains(['\'', '"', '\\', '`', '$']) { return Some(line); }
+        }
+    }
+    None
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut output = String::new(); let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -76,7 +121,7 @@ fn consume(progress: &mut Progress, raw: &str) {
         return;
     }
     let lower = line.to_ascii_lowercase();
-    let message = if lower.contains("permission denied") { Some("SSH: доступ отклонён; проверьте ключ и права.") }
+    let message = if lower.contains("permission denied") { Some("SSH: доступ отклонён; проверьте пароль или ключ и права.") }
     else if lower.contains("host key verification failed") { Some("SSH: ключ сервера отсутствует в known_hosts или изменился.") }
     else if lower.contains("connection refused") { Some("SSH: соединение отклонено сервером.") }
     else if lower.contains("could not resolve hostname") { Some("SSH: не удалось определить адрес сервера.") }
@@ -105,9 +150,12 @@ pub fn install_progress(state: tauri::State<'_, InstallState>) -> Result<Progres
     state.0.lock().map(|p| p.clone()).map_err(|_| "Состояние установки недоступно".into())
 }
 #[tauri::command]
-pub async fn install_panel(app: tauri::AppHandle, target: String) -> Result<(), String> {
+pub async fn install_panel(app: tauri::AppHandle, target: String, password: Option<String>, install_key: Option<bool>) -> Result<(), String> {
     use tauri::Manager;
     if !target.starts_with("root@") || !vpn_core::valid_ssh_target(&target) { return Err("Укажите SSH-цель в формате root@хост".into()); }
+    let password = password.filter(|p| !p.is_empty());
+    if let Some(p) = &password { if !valid_password(p) { return Err("Пароль не должен быть пустым, длиннее 256 символов или содержать переводы строк".into()); } }
+    let install_key = password.is_some() && install_key.unwrap_or(false);
     {
         let state = app.state::<InstallState>(); let mut p = state.0.lock().map_err(|_| "Состояние установки недоступно")?;
         if p.running { return Err("Установка уже выполняется".into()); }
@@ -115,7 +163,11 @@ pub async fn install_panel(app: tauri::AppHandle, target: String) -> Result<(), 
     }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<InstallState>();
-        let child = Command::new("/usr/bin/ssh").args(["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "--", &target,
+        let askpass = match password.as_deref().map(|_| Askpass::create()).transpose() {
+            Ok(a) => a,
+            Err(e) => { if let Ok(mut p) = state.0.lock() { p.running = false; p.finished = true; p.log.push(e); } return; }
+        };
+        let child = ssh_command(password.as_deref(), askpass.as_ref()).args(["--", &target,
             "bash -c 'set -o pipefail; curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh | XUI_NONINTERACTIVE=1 bash' 2>&1"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         match child {
@@ -125,8 +177,8 @@ pub async fn install_panel(app: tauri::AppHandle, target: String) -> Result<(), 
                 let status = child.wait();
                 let needs_result = status.as_ref().is_ok_and(|s| s.success()) && state.0.lock().map(|p| p.username.is_none() || p.password.is_none() || p.token.is_none() || p.url.is_none()).unwrap_or(false);
                 if needs_result {
-                    let result = Command::new("/usr/bin/ssh")
-                        .args(["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "--", &target,
+                    let result = ssh_command(password.as_deref(), askpass.as_ref())
+                        .args(["--", &target,
                             "if [ -f /etc/x-ui/install-result.env ]; then cat /etc/x-ui/install-result.env; else exit 44; fi"])
                         .stdin(Stdio::null()).stderr(Stdio::null()).output();
                     if let Ok(mut p) = state.0.lock() {
@@ -136,6 +188,24 @@ pub async fn install_panel(app: tauri::AppHandle, target: String) -> Result<(), 
                             _ => p.log.push("Не удалось прочитать файл результата установки по SSH.".into()),
                         }
                     }
+                }
+                if install_key && status.as_ref().is_ok_and(|s| s.success()) {
+                    let message = match public_key_to_install() {
+                        None => "Публичный SSH-ключ не найден в ~/.ssh: добавьте ключ на сервер вручную, иначе управление панелью будет недоступно.".to_owned(),
+                        Some(key) => {
+                            let script = "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; IFS= read -r k; grep -qxF \"$k\" ~/.ssh/authorized_keys || printf '%s\\n' \"$k\" >> ~/.ssh/authorized_keys";
+                            let spawned = ssh_command(password.as_deref(), askpass.as_ref()).args(["--", &target, script]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+                            match spawned {
+                                Ok(mut child) => {
+                                    if let Some(mut stdin) = child.stdin.take() { use std::io::Write; let _ = writeln!(stdin, "{key}"); }
+                                    if child.wait().is_ok_and(|s| s.success()) { "Ваш публичный SSH-ключ добавлен на сервер.".to_owned() }
+                                    else { "Не удалось добавить SSH-ключ на сервер: управление панелью по SSH-туннелю может не работать.".to_owned() }
+                                }
+                                Err(_) => "Не удалось запустить системный SSH для добавления ключа.".to_owned(),
+                            }
+                        }
+                    };
+                    if let Ok(mut p) = state.0.lock() { p.log.push(message); }
                 }
                 if let Ok(mut p) = state.0.lock() { p.running = false; p.finished = true; p.success = status.as_ref().map(|s| s.success()).unwrap_or(false); let message = match status { Ok(s) if s.success() => "Установка завершена.".to_owned(), Ok(s) => format!("Установка завершилась с ошибкой: код {}.", s.code().map(|c| c.to_string()).unwrap_or_else(|| "нет".into())), Err(_) => "Не удалось получить результат установки.".into() }; p.log.push(message); }
             }
@@ -153,6 +223,20 @@ pub fn clear_install(state: tauri::State<'_, InstallState>) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn askpass_prints_password_from_environment_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let askpass = Askpass::create().unwrap();
+        let path = askpass.0.clone();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        let out = Command::new(&path).env("VPN_SSH_PASSWORD", "p@ss $w'rd\"").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "p@ss $w'rd\"\n");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("p@ss"));
+        drop(askpass);
+        assert!(!path.exists());
+        assert!(valid_password("abc") && !valid_password("") && !valid_password("a\nb"));
+    }
     #[test]
     fn reports_known_errors_without_forwarding_secrets() {
         let mut p = Progress::default();

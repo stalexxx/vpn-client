@@ -5,6 +5,21 @@ mod xray;
 mod control;
 
 #[tauri::command]
+fn get_bypass_settings() -> Result<vpn_core::profile::Bypass, String> { vpn_core::read_bypass() }
+
+#[tauri::command]
+fn set_bypass_settings(bittorrent: bool, entries: Vec<String>) -> Result<vpn_core::profile::Bypass, String> { vpn_core::write_bypass(vpn_core::profile::Bypass { bittorrent, entries }) }
+
+#[tauri::command]
+fn get_log_level() -> Result<String, String> { helper::log_level() }
+
+#[tauri::command]
+fn set_log_level(verbose: bool) -> Result<String, String> { helper::set_log_level(if verbose { "info" } else { "warning" }) }
+
+#[tauri::command]
+fn vpn_stats() -> Result<serde_json::Value, String> { helper::stats() }
+
+#[tauri::command]
 fn build_info() -> String {
     format!("v{} · сборка {}", env!("CARGO_PKG_VERSION"), env!("VPN_BUILD_STAMP"))
 }
@@ -88,6 +103,19 @@ fn connect_profile(state: tauri::State<'_, xray::XrayState>, tray: tauri::State<
 }
 
 #[tauri::command]
+fn import_profiles(text: String, name: Option<String>) -> Result<Vec<serde_json::Value>, String> { vpn_core::import_profiles(&text, name.as_deref()) }
+#[tauri::command]
+fn list_imported_profiles() -> Result<Vec<serde_json::Value>, String> { vpn_core::list_imported_profiles() }
+#[tauri::command]
+fn rename_imported_profile(id: String, name: String) -> Result<(), String> { vpn_core::rename_imported_profile(&id, &name) }
+#[tauri::command]
+fn delete_imported_profile(id: String) -> Result<(), String> { vpn_core::delete_imported_profile(&id) }
+#[tauri::command]
+fn connect_imported_profile(state: tauri::State<'_, xray::XrayState>, tray: tauri::State<'_, tray::TrayStatus>, control: tauri::State<'_, control::ControlState>, id: String) -> Result<String, String> {
+    let _guard = control.operation.lock().map_err(|_| "Управление VPN недоступно")?;
+    xray::connect_imported_inner(&state, &tray, &id)
+}
+#[tauri::command]
 fn list_connectable_profiles() -> Result<Vec<serde_json::Value>, String> { vpn_core::list_connectable_profiles() }
 #[tauri::command]
 fn list_pinned_profiles() -> Result<Option<Vec<vpn_core::PinnedProfile>>, String> { vpn_core::list_pinned_profiles() }
@@ -128,6 +156,11 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             tray::get_vpn_mode,
             build_info,
+            vpn_stats,
+            get_log_level,
+            set_log_level,
+            get_bypass_settings,
+            set_bypass_settings,
             install::install_panel,
             install::install_progress,
             install::clear_install,
@@ -154,6 +187,7 @@ fn main() {
             xray::xray_stop,
             connect_profile
             ,list_connectable_profiles,
+            import_profiles, list_imported_profiles, rename_imported_profile, delete_imported_profile, connect_imported_profile,
             list_pinned_profiles,
             set_profile_pinned,
             open_admin
