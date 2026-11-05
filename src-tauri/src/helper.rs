@@ -61,7 +61,11 @@ fn component_is_trusted(path: &Path, uid: u32, gid: u32, mode: u32) -> bool {
     if uid != 0 || mode & 0o002 != 0 { return false; }
     mode & 0o020 == 0 || (path == Path::new("/Applications") && gid == ADMIN_GID)
 }
-fn verify_bundle_source(path: &Path) -> Result<(), String> {
+fn verify_bundle_source(path: &Path) -> Result<(), String> { verify_bundle_path(path, true) }
+/// Data files (Xray's geo databases) must be root-owned and non-writable like binaries, but are not executable.
+fn verify_bundle_data(path: &Path) -> Result<(), String> { verify_bundle_path(path, false) }
+fn exec_bit_ok(mode: u32, executable: bool) -> bool { !executable || mode & 0o111 != 0 }
+fn verify_bundle_path(path: &Path, executable: bool) -> Result<(), String> {
     for (index, component) in path.ancestors().enumerate() {
         let meta = std::fs::symlink_metadata(component).map_err(|e| format!("Не удалось проверить {}: {e}", component.display()))?;
         if (index == 0 && !meta.file_type().is_file()) || (index != 0 && !meta.file_type().is_dir()) {
@@ -70,7 +74,7 @@ fn verify_bundle_source(path: &Path) -> Result<(), String> {
         if !component_is_trusted(component, meta.uid(), meta.gid(), meta.permissions().mode()) {
             return Err(format!("{} должен принадлежать root и не быть доступным для записи группе или другим пользователям", component.display()));
         }
-        if index == 0 && meta.permissions().mode() & 0o111 == 0 { return Err(format!("{} не помечен как исполняемый файл", component.display())); }
+        if index == 0 && !exec_bit_ok(meta.permissions().mode(), executable) { return Err(format!("{} не помечен как исполняемый файл", component.display())); }
     }
     Ok(())
 }
@@ -108,7 +112,7 @@ pub fn ensure_installed() -> Result<(), String> {
     for path in [&helper, &xray] { verify_bundle_source(path)?; }
     // Xray's geoip.dat / geosite.dat travel with it (installed root-owned into ASSET_DIR) when the bundle has them.
     let geo: Vec<std::path::PathBuf> = ["geoip.dat", "geosite.dat"].iter().filter_map(|n| helpers.parent().map(|contents| contents.join("Resources").join(n))).filter(|p| p.exists()).collect();
-    for path in &geo { verify_bundle_source(path)?; }
+    for path in &geo { verify_bundle_data(path)?; }
     let home = std::env::var_os("HOME").ok_or("HOME is unavailable")?;
     let meta = std::fs::metadata(&home).map_err(|e| e.to_string())?;
     let uid = meta.uid();
@@ -204,5 +208,25 @@ mod tests {
         assert_eq!(script.matches("verify_source '/Applications/VPNClient.app/Contents/Resources/geo").count(), 2);
         assert!(script.contains("install -d -o root -g wheel -m 755 '/Library/PrivilegedHelperTools/vpnclient-assets'"));
         assert!(script.contains("-m 644 \"$stage/geo0\" '/Library/PrivilegedHelperTools/vpnclient-assets'/geoip.dat"));
+    }
+
+    #[test]
+    fn data_files_do_not_need_the_executable_bit_but_binaries_do() {
+        assert!(exec_bit_ok(0o644, false));
+        assert!(!exec_bit_ok(0o644, true));
+        assert!(exec_bit_ok(0o755, true));
+    }
+
+    /// Run on a machine with the app installed from the .pkg: `cargo test -- --ignored installed_bundle`.
+    #[test]
+    #[ignore]
+    fn installed_bundle_files_pass_source_verification() {
+        let contents = Path::new("/Applications/VPNClient.app/Contents");
+        verify_bundle_source(&contents.join("Helpers/xray")).unwrap();
+        verify_bundle_source(&contents.join("Helpers/vpn-tun-helper")).unwrap();
+        verify_bundle_data(&contents.join("Resources/geoip.dat")).unwrap();
+        verify_bundle_data(&contents.join("Resources/geosite.dat")).unwrap();
+        // The same data file is rejected when treated as a binary: this is the bug the data check fixes.
+        assert!(verify_bundle_source(&contents.join("Resources/geoip.dat")).is_err());
     }
 }
