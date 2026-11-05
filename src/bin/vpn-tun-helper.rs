@@ -13,6 +13,7 @@ use std::{
 
 const SOCKET: &str = "/var/run/vpnclient-tun.sock";
 const HELPER_DIR: &str = "/Library/Application Support/VpnClientHelper";
+const ASSET_DIR: &str = "/Library/PrivilegedHelperTools/vpnclient-assets";
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Deserialize)]
@@ -287,7 +288,7 @@ fn start(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: 
     let config = vpn_core::profile::vless_tun_config_with_options(link, &tun, relay_link, verbose_log(), Some(api_port), bypass)?;
     let config_path = root_path("config.json");
     write_secure(&config_path, config.to_string().as_bytes())?;
-    let check = Command::new(&state.xray).args(["run", "-test", "-config"]).arg(&config_path).stdout(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| e.to_string())?;
+    let check = Command::new(&state.xray).env("XRAY_LOCATION_ASSET", ASSET_DIR).args(["run", "-test", "-config"]).arg(&config_path).stdout(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| e.to_string())?;
     if !check.status.success() { let _ = fs::remove_file(&config_path); return Err(format!("Xray отклонил TUN-конфигурацию: {}", String::from_utf8_lossy(&check.stderr).trim())); }
     let service = active_network_service()?;
     let original = read_dns(&service)?;
@@ -305,7 +306,7 @@ fn start(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: 
         Ok(file) => file,
         Err(e) => return Err(append_rollback_error(e.to_string(), rollback_start(None, &config_path))),
     };
-    let child = match Command::new(&state.xray).args(["run", "-config"]).arg(&config_path).stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log_err)).spawn() {
+    let child = match Command::new(&state.xray).env("XRAY_LOCATION_ASSET", ASSET_DIR).args(["run", "-config"]).arg(&config_path).stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log_err)).spawn() {
         Ok(child) => child,
         Err(e) => return Err(append_rollback_error(e.to_string(), rollback_start(None, &config_path))),
     };

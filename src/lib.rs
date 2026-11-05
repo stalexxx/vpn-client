@@ -467,6 +467,50 @@ pub fn list_client_profiles(id: &str) -> Result<serde_json::Value, String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedProfile { pub server_id: String, pub inbound_id: u64, pub email: String }
 static PIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let (mut value, mut shift) = (0u64, 0);
+    loop {
+        let byte = *buf.get(*pos)?; *pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 { return Some(value); }
+        shift += 7;
+        if shift > 63 { return None; }
+    }
+}
+/// List codes (upper-case) in an Xray geoip.dat / geosite.dat: a protobuf of repeated entries whose field 1 is the code.
+pub fn geo_codes(path: &std::path::Path) -> Result<std::collections::HashSet<String>, String> {
+    let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bad = || format!("Некорректная база: {}", path.display());
+    let (mut pos, mut codes) = (0usize, std::collections::HashSet::new());
+    while pos < data.len() {
+        let tag = read_varint(&data, &mut pos).ok_or_else(bad)?;
+        if tag & 7 != 2 { return Err(bad()); }
+        let len = read_varint(&data, &mut pos).ok_or_else(bad)? as usize;
+        let end = pos.checked_add(len).filter(|e| *e <= data.len()).ok_or_else(bad)?;
+        if tag >> 3 == 1 {
+            let entry = &data[pos..end]; let mut p = 0;
+            if read_varint(entry, &mut p) == Some(0x0a) {
+                let n = read_varint(entry, &mut p).ok_or_else(bad)? as usize;
+                if let Some(code) = entry.get(p..p + n) { codes.insert(String::from_utf8_lossy(code).to_ascii_uppercase()); }
+            }
+        }
+        pos = end;
+    }
+    Ok(codes)
+}
+/// Reject `geoip:`/`geosite:` entries whose list is missing from the databases in `dir` (skipped when `dir` has none).
+pub fn check_geo_entries(entries: &[String], dir: &std::path::Path) -> Result<(), String> {
+    for (prefix, file) in [("geoip:", "geoip.dat"), ("geosite:", "geosite.dat")] {
+        let wanted: Vec<&str> = entries.iter().filter_map(|e| e.strip_prefix(prefix)).collect();
+        if wanted.is_empty() || !dir.join(file).exists() { continue; }
+        let codes = geo_codes(&dir.join(file))?;
+        for name in wanted {
+            let code = name.split('@').next().unwrap_or(name).to_ascii_uppercase();
+            if !codes.contains(&code) { return Err(format!("В базе {file} нет списка «{prefix}{name}»")); }
+        }
+    }
+    Ok(())
+}
 static BYPASS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn bypass_path() -> Result<PathBuf, String> { Ok(config_path()?.with_file_name("bypass.json")) }
 /// Traffic that must not go through the tunnel (defaults: BitTorrent direct, no extra entries).
@@ -1197,6 +1241,23 @@ mod tests {
         assert_eq!(stream["tlsSettings"]["certificates"][0]["certificateFile"], "/root/cert/203-0-113-8.sslip.io/fullchain.pem");
         assert_eq!(stream["hysteriaSettings"]["version"], 2);
     }
+    #[test]
+    fn geo_database_lists_are_read_and_missing_ones_rejected() {
+        // Two entries: [field1 { field1: "RU" }, field1 { field1: "PRIVATE" }].
+        let entry = |code: &str| { let mut inner = vec![0x0a, code.len() as u8]; inner.extend(code.bytes()); let mut e = vec![0x0a, inner.len() as u8]; e.extend(inner); e };
+        let dir = tempfile::tempdir().unwrap();
+        let mut data = entry("RU"); data.extend(entry("PRIVATE"));
+        fs::write(dir.path().join("geoip.dat"), &data).unwrap();
+        let codes = geo_codes(&dir.path().join("geoip.dat")).unwrap();
+        assert!(codes.contains("RU") && codes.contains("PRIVATE") && codes.len() == 2);
+        assert!(check_geo_entries(&["geoip:ru".into(), "example.com".into()], dir.path()).is_ok());
+        assert!(check_geo_entries(&["geoip:xx".into()], dir.path()).unwrap_err().contains("geoip:xx"));
+        // No geosite.dat in the directory: geosite entries are not checked (development builds).
+        assert!(check_geo_entries(&["geosite:whatever".into()], dir.path()).is_ok());
+        fs::write(dir.path().join("geoip.dat"), [0x0a, 0x7f]).unwrap();
+        assert!(geo_codes(&dir.path().join("geoip.dat")).is_err());
+    }
+
     #[test]
     fn imports_links_from_text_and_manages_them() {
         use std::os::unix::fs::PermissionsExt;

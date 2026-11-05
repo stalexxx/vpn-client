@@ -227,6 +227,12 @@ fn valid_wildcard(entry: &str) -> bool {
     entry.contains('*') && entry.chars().any(|c| c.is_ascii_alphanumeric()) && !entry.contains("**") && entry.len() <= 253 && valid_domain(&entry.replace('*', "x"))
 }
 fn is_wildcard(entry: &str) -> bool { entry.contains('*') }
+/// `geoip:ru` / `geosite:category-ru` — lists from Xray's geoip.dat / geosite.dat (name only; existence is checked against the files).
+fn valid_geo(entry: &str) -> bool {
+    let name = match entry.strip_prefix("geoip:").or_else(|| entry.strip_prefix("geosite:")) { Some(n) => n, None => return false };
+    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@!".contains(c))
+}
+fn is_ip_entry(entry: &str) -> bool { valid_ip_or_cidr(entry) || entry.starts_with("geoip:") }
 fn valid_ip_or_cidr(entry: &str) -> bool {
     match entry.split_once('/') {
         None => entry.parse::<std::net::IpAddr>().is_ok(),
@@ -246,7 +252,7 @@ impl Bypass {
             // `*.example.com` is just the domain rule (it already covers subdomains); other `*` stay as patterns.
             let entry = match entry.strip_prefix("*.") { Some(rest) if !rest.contains('*') && rest.contains('.') => rest.to_owned(), _ => entry };
             if entry.is_empty() { continue; }
-            if !(valid_ip_or_cidr(&entry) || valid_domain(&entry) || valid_wildcard(&entry)) {
+            if !(valid_ip_or_cidr(&entry) || valid_geo(&entry) || valid_domain(&entry) || valid_wildcard(&entry)) {
                 return Err(format!("Не похоже на домен, IP или подсеть: {}", raw.chars().take(40).collect::<String>()));
             }
             if !entries.contains(&entry) { entries.push(entry); }
@@ -307,8 +313,8 @@ pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Op
     let bypass = bypass.clone().validated()?;
     let mut rules: Vec<Value> = Vec::new();
     if bypass.bittorrent { rules.push(json!({"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"})); }
-    let domains: Vec<String> = bypass.entries.iter().filter(|e| !valid_ip_or_cidr(e)).map(|e| {
-        if is_wildcard(e) { format!("regexp:^{}$", e.replace('.', "\\.").replace('*', ".*")) } else { format!("domain:{e}") }
+    let domains: Vec<String> = bypass.entries.iter().filter(|e| !is_ip_entry(e)).map(|e| {
+        if e.starts_with("geosite:") { e.clone() } else if is_wildcard(e) { format!("regexp:^{}$", e.replace('.', "\\.").replace('*', ".*")) } else { format!("domain:{e}") }
     }).collect();
     if !domains.is_empty() {
         // Excluded domains must be dialed by name over IPv4: many networks have no IPv6, and the TUN accepts the
@@ -323,7 +329,7 @@ pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Op
         config["dns"] = json!({"servers": ["tcp://1.1.1.1", "tcp://1.0.0.1"], "queryStrategy": "UseIPv4"});
         rules.insert(0, json!({"type": "field", "ip": ["1.1.1.1", "1.0.0.1"], "port": "53", "network": "tcp", "outboundTag": "direct"}));
     }
-    let ips: Vec<&String> = bypass.entries.iter().filter(|e| valid_ip_or_cidr(e)).collect();
+    let ips: Vec<&String> = bypass.entries.iter().filter(|e| is_ip_entry(e)).collect();
     if !domains.is_empty() { rules.push(json!({"type": "field", "domain": domains, "outboundTag": "direct"})); }
     if !ips.is_empty() { rules.push(json!({"type": "field", "ip": ips, "outboundTag": "direct"})); }
     config["routing"] = json!({"domainStrategy": "AsIs", "rules": rules});
@@ -410,6 +416,12 @@ mod tests {
         let zr=vless_tun_config_with_options(link,"utun10",None,false,None,&zone).unwrap();
         assert_eq!(zr["routing"]["rules"][1]["domain"],json!(["regexp:^.*\\.ru$"]));
         assert!(Bypass{bittorrent:true,entries:vec!["ru".into()]}.validated().is_err());
+        // geoip / geosite lists pass through to Xray untouched.
+        let geo=Bypass{bittorrent:false,entries:vec!["GeoSite:TLD-RU".into(),"geosite:category-gov-ru".into(),"geoip:ru".into(),"geoip:private".into(),"10.0.0.0/8".into()]}.validated().unwrap();
+        let gr=vless_tun_config_with_options(link,"utun10",None,false,None,&geo).unwrap();
+        assert_eq!(gr["routing"]["rules"][1]["domain"],json!(["geosite:tld-ru","geosite:category-gov-ru"]));
+        assert_eq!(gr["routing"]["rules"][2]["ip"],json!(["geoip:ru","geoip:private","10.0.0.0/8"]));
+        for bad in ["geoip:","geosite:a b","geoip:ru/x","geo:ru"] { assert!(Bypass{bittorrent:true,entries:vec![bad.into()]}.validated().is_err(),"{bad}"); }
         for bad in ["*","**.com","a**b.com","*.*","exa mple.*"] { assert!(Bypass{bittorrent:true,entries:vec![bad.into()]}.validated().is_err(),"{bad}"); }
         for bad in ["bad entry","a..b","-x.com","10.0.0.0/33","localhost","1.2.3.4/x"] {
             assert!(Bypass{bittorrent:true,entries:vec![bad.into()]}.validated().is_err(),"{bad}");

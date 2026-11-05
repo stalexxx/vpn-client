@@ -8,6 +8,7 @@
 # The helper only trusts a root-owned bundle, so the app must be installed from
 # this .pkg (payload is owned by root:wheel), never run from target/.
 # Xray is taken from $XRAY_BIN (default: ~/Applications/Xray/xray).
+# GEO_DIR=/dir/with/geoip.dat+geosite.dat adds the databases that geoip:/geosite: exclusions need.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,6 +48,11 @@ cp "$APP_BIN" "$APP/Contents/MacOS/VPNClient"
 cp "$HELPER_BIN" "$APP/Contents/Helpers/vpn-tun-helper"
 cp "$MCP_BIN" "$APP/Contents/Helpers/vpn-mcp"
 cp "$XRAY_OUT" "$APP/Contents/Helpers/xray"
+# Domain/IP lists for geosite:/geoip: exclusions (from the official Xray release archive).
+if [ -n "${GEO_DIR:-}" ]; then
+  mkdir -p "$APP/Contents/Resources"
+  cp "$GEO_DIR/geoip.dat" "$GEO_DIR/geosite.dat" "$APP/Contents/Resources/"
+fi
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

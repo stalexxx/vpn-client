@@ -8,7 +8,14 @@ mod control;
 fn get_bypass_settings() -> Result<vpn_core::profile::Bypass, String> { vpn_core::read_bypass() }
 
 #[tauri::command]
-fn set_bypass_settings(bittorrent: bool, entries: Vec<String>) -> Result<vpn_core::profile::Bypass, String> { vpn_core::write_bypass(vpn_core::profile::Bypass { bittorrent, entries }) }
+fn set_bypass_settings(bittorrent: bool, entries: Vec<String>) -> Result<vpn_core::profile::Bypass, String> {
+    let bypass = vpn_core::profile::Bypass { bittorrent, entries }.validated()?;
+    // Packaged app: Contents/MacOS/VPNClient, databases in Contents/Resources (absent in development builds).
+    if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent()?.parent().map(|c| c.join("Resources"))) {
+        vpn_core::check_geo_entries(&bypass.entries, &dir)?;
+    }
+    vpn_core::write_bypass(bypass)
+}
 
 #[tauri::command]
 fn get_log_level() -> Result<String, String> { helper::log_level() }
