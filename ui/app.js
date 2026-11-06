@@ -108,7 +108,25 @@ async function saveBypass(){
     bypassMessage(`Сохранено: ${n} ${plural(n)}${b.bittorrent?' + BitTorrent':''}. ${when}`,true); return true;
   }catch(e){ bypassMessage(String(e)); return false; }
 }
-$('open-bypass').addEventListener('click',async()=>{ bypassModal.hidden=false; bypassMessage(''); try{ const b=await invoke('get_bypass_settings'); $('bypass-bittorrent').checked=b.bittorrent; $('bypass-entries').value=b.entries.join('\n'); bypassSnapshot=bypassKey(bypassForm()); }catch(e){ bypassMessage(`Не удалось загрузить настройки: ${e}`); }
+let geoLists=null;
+const geoEntries=()=>new Set($('bypass-entries').value.split(/\n/).map(x=>x.trim().toLowerCase()).filter(Boolean));
+function renderGeo(){
+  const root=$('geo-results'), note=$('geo-note'); root.replaceChildren();
+  if(!geoLists){ note.textContent=''; return; }
+  const kind=$('geo-kind').value, all=geoLists[kind]||[], q=$('geo-search').value.trim().toLowerCase();
+  if(!all.length){ note.textContent='Базы списков в этой сборке нет, их можно вписать вручную.'; return; }
+  const found=q?all.filter(n=>n.includes(q)):all, shown=found.slice(0,40), have=geoEntries();
+  shown.forEach(n=>{ const entry=`${kind}:${n}`, b=document.createElement('button'); b.type='button'; b.className='geo-chip'; b.textContent=entry; b.setAttribute('role','option');
+    if(have.has(entry)){ b.classList.add('added'); b.disabled=true; b.title='Уже добавлено'; }
+    else b.addEventListener('click',()=>{ const area=$('bypass-entries'); area.value=(area.value.trim()?area.value.replace(/\s+$/,'')+'\n':'')+entry+'\n'; bypassMessage(''); renderGeo(); });
+    root.append(b); });
+  note.textContent=found.length>shown.length?`Показано ${shown.length} из ${found.length}; уточните поиск.`:`Найдено: ${found.length}. Нажмите на список, чтобы добавить.`;
+}
+$('geo-kind').addEventListener('change',renderGeo);
+$('geo-search').addEventListener('input',renderGeo);
+$('bypass-entries').addEventListener('input',renderGeo);
+async function loadGeoLists(){ if(geoLists) { renderGeo(); return; } try{ geoLists=await invoke('list_geo_lists'); }catch{ geoLists={geoip:[],geosite:[]}; } renderGeo(); }
+$('open-bypass').addEventListener('click',async()=>{ bypassModal.hidden=false; bypassMessage(''); $('geo-search').value=''; loadGeoLists(); try{ const b=await invoke('get_bypass_settings'); $('bypass-bittorrent').checked=b.bittorrent; $('bypass-entries').value=b.entries.join('\n'); bypassSnapshot=bypassKey(bypassForm()); }catch(e){ bypassMessage(`Не удалось загрузить настройки: ${e}`); }
   try{ logSnapshot=(await invoke('get_log_level'))==='info'; $('log-verbose').checked=logSnapshot; $('log-verbose').disabled=false; }catch{ $('log-verbose').disabled=true; $('log-verbose').checked=false; } });
 $('bypass-cancel').addEventListener('click',async()=>{ if((bypassKey(bypassForm())!==bypassSnapshot || (!$('log-verbose').disabled && $('log-verbose').checked!==logSnapshot)) && !(await saveBypass())) return; bypassModal.hidden=true; });
 $('bypass-save').addEventListener('click',saveBypass);

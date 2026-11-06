@@ -1,6 +1,6 @@
 [package]
 name = "vpn-core"
-version = "0.3.15"
+version = "0.3.20"
 edition = "2021"
 
 [dependencies]

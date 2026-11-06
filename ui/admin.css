@@ -7,3 +7,4 @@
 
 .checkline{display:flex;align-items:center;gap:8px;font-weight:500}.checkline input{width:auto;margin:0}
 .dialog label.checkline{display:flex;flex-direction:row;align-items:center;gap:8px;font-weight:500}.dialog label.checkline input{width:auto;flex:none}
+.inbound-item .danger{font-size:11px;padding:6px 10px;flex:none}

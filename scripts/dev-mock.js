@@ -123,6 +123,8 @@ let mode = 'off';
     list_inbounds: ({serverId}) => inbounds(serverId),
     list_client_profiles: ({serverId}) => profilesFor(serverId),
     refresh_client_profiles: ({serverId}) => profilesFor(serverId),
+    list_geo_lists: () => ({geoip:['cn','ir','private','ru','ua','us'], geosite:['category-bank-ru','category-ecommerce-ru','category-gov-ru','category-ru','google','netflix','telegram','tld-ru','tld-cn','youtube']}),
+    delete_inbound: ({serverId,inboundId}) => { const list=inbounds(serverId); const clients=profilesFor(serverId); savedProfileMap.set(serverId,clients); const index=list.findIndex(i=>i.id===inboundId); if(index<0) throw 'Inbound не найден (mock)'; const [gone]=list.splice(index,1); savedInboundMap.set(serverId,list); for(let n=clients.length-1;n>=0;n--) if(clients[n].inbound_id===inboundId) clients.splice(n,1); savedProfileMap.set(serverId,clients); return `Удалён inbound ${inboundId} (${gone.remark}) (mock)`; },
     create_client: ({email}) => `Клиент ${email} создан (mock)`,
     client_qr: () => { const size = 25; return {link: 'vless://mock', size, pixels: Array.from({length: size * size}, (_, i) => ((i * 7 + (i >> 3)) % 3) === 0)}; },
     connect_profile: async () => { if (fail('connect_profile')) throw 'VPN запущен, но трафик через сервер не проходит: DNS и TCP недоступны.'; await delay(1200); mode = 'tun'; return 'VPN подключён через utun10 (mock)'; },

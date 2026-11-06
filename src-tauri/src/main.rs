@@ -18,6 +18,12 @@ fn set_bypass_settings(bittorrent: bool, entries: Vec<String>) -> Result<vpn_cor
 }
 
 #[tauri::command]
+fn list_geo_lists() -> Result<serde_json::Value, String> {
+    let dir = std::env::current_exe().ok().and_then(|exe| exe.parent()?.parent().map(|c| c.join("Resources")));
+    match dir { Some(dir) => vpn_core::geo_lists(&dir), None => Ok(serde_json::json!({"geoip": [], "geosite": []})) }
+}
+
+#[tauri::command]
 fn get_log_level() -> Result<String, String> { helper::log_level() }
 
 #[tauri::command]
@@ -92,6 +98,10 @@ async fn list_inbounds(server_id: String) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || vpn_core::server_inbounds(&server_id)).await.map_err(|e| e.to_string())?
 }
 #[tauri::command]
+async fn delete_inbound(server_id: String, inbound_id: u64) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || vpn_core::delete_server_inbound(&server_id, inbound_id)).await.map_err(|e| e.to_string())?
+}
+#[tauri::command]
 async fn create_client(server_id: String, inbound_id: u64, email: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || { vpn_core::create_client(&server_id, inbound_id, &email)?; Ok(format!("Клиент {email} создан.")) }).await.map_err(|e| e.to_string())?
 }
@@ -164,6 +174,7 @@ fn main() {
             tray::get_vpn_mode,
             build_info,
             vpn_stats,
+            list_geo_lists,
             get_log_level,
             set_log_level,
             get_bypass_settings,
@@ -188,6 +199,7 @@ fn main() {
             list_inbounds,
             cached_server_inbounds,
             create_client,
+            delete_inbound,
             client_qr,
             list_client_profiles,
             refresh_client_profiles,

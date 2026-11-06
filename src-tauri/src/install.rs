@@ -33,9 +33,10 @@ impl Drop for Askpass {
 }
 fn valid_password(password: &str) -> bool { !password.is_empty() && password.len() <= 256 && !password.chars().any(|c| c == '\0' || c == '\n' || c == '\r') }
 /// ssh command for `target`; with a password it authenticates through SSH_ASKPASS and remembers an unknown host key on first use only.
-fn ssh_command(password: Option<&str>, askpass: Option<&Askpass>) -> Command {
+fn ssh_command(password: Option<&str>, askpass: Option<&Askpass>, port: Option<u16>) -> Command {
     let mut ssh = Command::new("/usr/bin/ssh");
     ssh.args(["-T", "-o", "ConnectTimeout=10"]);
+    if let Some(port) = port { ssh.args(["-p", &port.to_string()]); }
     match (password, askpass) {
         (Some(password), Some(askpass)) => {
             ssh.args(["-o", "BatchMode=no", "-o", "StrictHostKeyChecking=accept-new", "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "NumberOfPasswordPrompts=1"])
@@ -122,7 +123,7 @@ fn consume(progress: &mut Progress, raw: &str) {
     }
     let lower = line.to_ascii_lowercase();
     let message = if lower.contains("permission denied") { Some("SSH: доступ отклонён; проверьте пароль или ключ и права.") }
-    else if lower.contains("host key verification failed") { Some("SSH: ключ сервера отсутствует в known_hosts или изменился.") }
+    else if lower.contains("host identification has changed") || lower.contains("host key verification failed") { Some("SSH: ключ сервера изменился (сервер переустановлен?) или отсутствует в known_hosts. Если вы уверены, что это ваш сервер, выполните в терминале: ssh-keygen -R <адрес сервера>") }
     else if lower.contains("connection refused") { Some("SSH: соединение отклонено сервером.") }
     else if lower.contains("could not resolve hostname") { Some("SSH: не удалось определить адрес сервера.") }
     else if lower.contains("connection timed out") { Some("SSH: время соединения истекло.") }
@@ -152,7 +153,7 @@ pub fn install_progress(state: tauri::State<'_, InstallState>) -> Result<Progres
 #[tauri::command]
 pub async fn install_panel(app: tauri::AppHandle, target: String, password: Option<String>, install_key: Option<bool>) -> Result<(), String> {
     use tauri::Manager;
-    if !target.starts_with("root@") || !vpn_core::valid_ssh_target(&target) { return Err("Укажите SSH-цель в формате root@хост".into()); }
+    if !target.starts_with("root@") || !vpn_core::valid_ssh_target(&target) { return Err("Укажите SSH-цель в формате root@хост или root@хост:порт".into()); }
     let password = password.filter(|p| !p.is_empty());
     if let Some(p) = &password { if !valid_password(p) { return Err("Пароль не должен быть пустым, длиннее 256 символов или содержать переводы строк".into()); } }
     let install_key = password.is_some() && install_key.unwrap_or(false);
@@ -163,11 +164,12 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
     }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<InstallState>();
+        let (dest, ssh_port) = vpn_core::split_ssh_target(&target);
         let askpass = match password.as_deref().map(|_| Askpass::create()).transpose() {
             Ok(a) => a,
             Err(e) => { if let Ok(mut p) = state.0.lock() { p.running = false; p.finished = true; p.log.push(e); } return; }
         };
-        let child = ssh_command(password.as_deref(), askpass.as_ref()).args(["--", &target,
+        let child = ssh_command(password.as_deref(), askpass.as_ref(), ssh_port).args(["--", dest,
             "bash -c 'set -o pipefail; curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh | XUI_NONINTERACTIVE=1 bash' 2>&1"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         match child {
@@ -177,8 +179,8 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
                 let status = child.wait();
                 let needs_result = status.as_ref().is_ok_and(|s| s.success()) && state.0.lock().map(|p| p.username.is_none() || p.password.is_none() || p.token.is_none() || p.url.is_none()).unwrap_or(false);
                 if needs_result {
-                    let result = ssh_command(password.as_deref(), askpass.as_ref())
-                        .args(["--", &target,
+                    let result = ssh_command(password.as_deref(), askpass.as_ref(), ssh_port)
+                        .args(["--", dest,
                             "if [ -f /etc/x-ui/install-result.env ]; then cat /etc/x-ui/install-result.env; else exit 44; fi"])
                         .stdin(Stdio::null()).stderr(Stdio::null()).output();
                     if let Ok(mut p) = state.0.lock() {
@@ -194,7 +196,7 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
                         None => "Публичный SSH-ключ не найден в ~/.ssh: добавьте ключ на сервер вручную, иначе управление панелью будет недоступно.".to_owned(),
                         Some(key) => {
                             let script = "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; IFS= read -r k; grep -qxF \"$k\" ~/.ssh/authorized_keys || printf '%s\\n' \"$k\" >> ~/.ssh/authorized_keys";
-                            let spawned = ssh_command(password.as_deref(), askpass.as_ref()).args(["--", &target, script]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+                            let spawned = ssh_command(password.as_deref(), askpass.as_ref(), ssh_port).args(["--", dest, script]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
                             match spawned {
                                 Ok(mut child) => {
                                     if let Some(mut stdin) = child.stdin.take() { use std::io::Write; let _ = writeln!(stdin, "{key}"); }

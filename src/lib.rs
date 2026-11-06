@@ -103,11 +103,27 @@ fn valid_http_host(host: &str) -> bool {
         && !host.starts_with('-')
 }
 
+/// Splits an optional `:port` suffix off an SSH target (`root@host:2222` -> (`root@host`, Some(2222))).
+pub fn split_ssh_target(target: &str) -> (&str, Option<u16>) {
+    if let Some((dest, port)) = target.rsplit_once(':') {
+        if !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(p) = port.parse::<u16>() { if p >= 1 { return (dest, Some(p)); } }
+        }
+    }
+    (target, None)
+}
+
+/// Host part of an SSH target, without user and port.
+pub fn ssh_host(target: &str) -> &str {
+    split_ssh_target(target).0.rsplit('@').next().unwrap_or(target)
+}
+
 pub fn valid_ssh_target(target: &str) -> bool {
     if target.is_empty() || target.len() > 255 || target.starts_with('-') {
         return false;
     }
-    let parts: Vec<_> = target.split('@').collect();
+    let (dest, _) = split_ssh_target(target);
+    let parts: Vec<_> = dest.split('@').collect();
     parts.len() <= 2
         && parts.iter().all(|part| {
             !part.is_empty()
@@ -161,6 +177,8 @@ fn ssh_tunnel(target: &str, port: u16) -> Result<(Tunnel, u16), String> {
         let key = PathBuf::from(home).join(".ssh/id_ed25519_vpn_client");
         if key.is_file() { ssh.arg("-i").arg(key); }
     }
+    let (dest, ssh_port) = split_ssh_target(target);
+    if let Some(p) = ssh_port { ssh.args(["-p", &p.to_string()]); }
     let child = ssh.args([
             "-N",
             "-o",
@@ -174,7 +192,7 @@ fn ssh_tunnel(target: &str, port: u16) -> Result<(Tunnel, u16), String> {
             "-L",
             &forward,
             "--",
-            target,
+            dest,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -319,17 +337,31 @@ pub fn server_inbounds(id: &str) -> Result<serde_json::Value, String> { let s = 
 
 pub fn list_inbounds_for_host(host: &str) -> Result<serde_json::Value, String> {
     if !valid_http_host(host) { return Err("Некорректный хост".into()); }
-    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|v| v.rsplit('@').next()) == Some(host)).collect();
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().map(ssh_host) == Some(host)).collect();
     if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
     let server = &servers[0];
     list_inbounds_for(&server.panel, &server_token(&server.id)?)
 }
 
+/// Deletes an inbound (and with it its clients) on the panel of a saved server, then refreshes the local profile cache.
+pub fn delete_server_inbound(server_id: &str, inbound_id: u64) -> Result<String, String> {
+    if inbound_id == 0 { return Err("Некорректный ID inbound-а".into()); }
+    let server = server_for(server_id)?;
+    let message = delete_inbound_on(&server, inbound_id)?;
+    // The deleted inbound's clients must disappear from the local cache; the deletion itself already succeeded.
+    let _ = refresh_client_profiles(&server.id);
+    Ok(message)
+}
+
 pub fn delete_inbound_for_host(host: &str, inbound_id: u64) -> Result<String, String> {
     if !valid_http_host(host) || inbound_id == 0 { return Err("Некорректный хост или ID inbound-а".into()); }
-    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|v| v.rsplit('@').next()) == Some(host)).collect();
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().map(ssh_host) == Some(host)).collect();
     if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
-    let server = &servers[0]; let token = server_token(&server.id)?;
+    delete_inbound_on(&servers[0], inbound_id)
+}
+
+fn delete_inbound_on(server: &Server, inbound_id: u64) -> Result<String, String> {
+    let token = server_token(&server.id)?;
     let list = list_inbounds_for(&server.panel, &token)?;
     let inbound = list.as_array().and_then(|a| a.iter().find(|v| v["id"].as_u64() == Some(inbound_id))).ok_or("Inbound с таким ID не найден на этом сервере")?;
     let remark = inbound["remark"].as_str().unwrap_or("(без имени)");
@@ -339,7 +371,7 @@ pub fn delete_inbound_for_host(host: &str, inbound_id: u64) -> Result<String, St
 
 pub fn delete_reality_inbound(host: &str) -> Result<String, String> {
     if !valid_http_host(host) { return Err("Некорректный хост".into()); }
-    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|v| v.rsplit('@').next()) == Some(host)).collect();
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().map(ssh_host) == Some(host)).collect();
     if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
     let server = &servers[0];
     let token = server_token(&server.id)?;
@@ -397,7 +429,7 @@ fn panel_request(
         let host = panel
             .panel_host
             .as_deref()
-            .unwrap_or_else(|| target.rsplit('@').next().unwrap_or(target));
+            .unwrap_or_else(|| ssh_host(target));
         if !valid_http_host(host) {
             return Err("Invalid panel host".into());
         }
@@ -510,6 +542,17 @@ pub fn check_geo_entries(entries: &[String], dir: &std::path::Path) -> Result<()
         }
     }
     Ok(())
+}
+/// Names of the lists available in the shipped geoip.dat / geosite.dat (lower-case, sorted); empty when a database is absent.
+pub fn geo_lists(dir: &std::path::Path) -> Result<serde_json::Value, String> {
+    let names = |file: &str| -> Result<Vec<String>, String> {
+        let path = dir.join(file);
+        if !path.exists() { return Ok(Vec::new()); }
+        let mut list: Vec<String> = geo_codes(&path)?.into_iter().map(|c| c.to_ascii_lowercase()).collect();
+        list.sort();
+        Ok(list)
+    };
+    Ok(serde_json::json!({"geoip": names("geoip.dat")?, "geosite": names("geosite.dat")?}))
 }
 static BYPASS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn bypass_path() -> Result<PathBuf, String> { Ok(config_path()?.with_file_name("bypass.json")) }
@@ -744,7 +787,9 @@ test -s "$CERT_DIR/privkey.pem" -a -s "$CERT_DIR/fullchain.pem""#);
         let key = PathBuf::from(home).join(".ssh/id_ed25519_vpn_client");
         if key.is_file() { ssh.arg("-i").arg(key); }
     }
-    let output = ssh.args(["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "--", target, &command])
+    let (dest, ssh_port) = split_ssh_target(target);
+    if let Some(p) = ssh_port { ssh.args(["-p", &p.to_string()]); }
+    let output = ssh.args(["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "--", dest, &command])
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .status().map_err(|_| "Не удалось запустить системный SSH для сертификата".to_owned())?;
     match status_code(output.code()) {
@@ -801,7 +846,7 @@ fn create_client_with_token(panel: &Panel, token: &str, inbound_id: u64, email: 
 pub fn create_xhttp_relay_client(host: &str, email: &str, sni: &str, port: u16) -> Result<(String, u64), String> {
     if !valid_http_host(host) || !valid_domain_name(sni) || port == 0 { return Err("Некорректный хост, SNI или порт".into()); }
     if email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Некорректное имя клиента".into()); }
-    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|s| s.rsplit('@').next()) == Some(host)).collect();
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().map(ssh_host) == Some(host)).collect();
     if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
     let server = &servers[0]; let token = server_token(&server.id)?;
     let remark = format!("VLESS-XHTTP-RELAY-{port}");
@@ -835,7 +880,7 @@ fn hysteria2_inbound_body(sni: &str) -> serde_json::Value {
 pub fn create_hysteria2_client(host: &str, email: &str, sni: &str) -> Result<(String, u64), String> {
     if !valid_http_host(host) || !valid_domain_name(sni) { return Err("Некорректный хост или SNI".into()); }
     if email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Некорректное имя клиента".into()); }
-    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|s| s.rsplit('@').next()) == Some(host)).collect();
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().map(ssh_host) == Some(host)).collect();
     if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
     let server = &servers[0]; let token = server_token(&server.id)?;
     let target = server.panel.ssh_target.as_deref().ok_or("Для выпуска сертификата укажите SSH-цель в настройках сервера")?;
@@ -863,7 +908,7 @@ pub fn create_reality_client_on_port(host: &str, email: &str, sni: &str, port: u
     if port == 0 { return Err("Некорректный порт".into()); }
     if !valid_http_host(host) || !valid_domain_name(sni) { return Err("Некорректный хост или SNI".into()); }
     if email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Некорректное имя клиента".into()); }
-    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().and_then(|s| s.rsplit('@').next()) == Some(host)).collect();
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().map(ssh_host) == Some(host)).collect();
     if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
     let server = &servers[0]; let token = server_token(&server.id)?;
     let list = panel_request(&server.panel, &token, "inbounds/list", None)?;
@@ -1013,7 +1058,7 @@ fn build_hysteria2_share_link(panel: &Panel, email: &str, auth: &str, inbound: &
     let stream = if let Some(raw) = stream.as_str() { serde_json::from_str(raw).map_err(|_| "Invalid Hysteria transport settings")? } else { stream };
     let tls = stream.get("tlsSettings").ok_or("Hysteria TLS settings are missing")?;
     let sni = tls.get("serverName").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).ok_or("Hysteria SNI is missing")?;
-    let host = inbound.get("shareAddr").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).or(panel.panel_host.as_deref()).or_else(|| panel.ssh_target.as_deref().map(|s| s.rsplit('@').next().unwrap_or(s))).ok_or("Public server address is missing")?;
+    let host = inbound.get("shareAddr").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).or(panel.panel_host.as_deref()).or_else(|| panel.ssh_target.as_deref().map(ssh_host)).ok_or("Public server address is missing")?;
     if !valid_http_host(host) { return Err("Invalid public server address".into()); }
     let port = inbound.get("port").and_then(|v| v.as_u64()).filter(|p| *p > 0 && *p <= 65535).ok_or("Invalid Hysteria port")?;
     let user = url::form_urlencoded::byte_serialize(auth.as_bytes()).collect::<String>();
@@ -1025,7 +1070,7 @@ fn build_client_share_link(panel: &Panel, email: &str, uuid: &str, inbound: &ser
     let settings = inbound.get("streamSettings").cloned().unwrap_or(serde_json::json!({}));
     let settings = if let Some(raw) = settings.as_str() { serde_json::from_str(raw).map_err(|_| "Invalid inbound transport settings")? } else { settings };
     let network = settings.get("network").and_then(|v| v.as_str()).unwrap_or("");
-    let host = inbound.get("shareAddr").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).or(panel.panel_host.as_deref()).or_else(|| panel.ssh_target.as_deref().map(|s| s.rsplit('@').next().unwrap_or(s))).ok_or("Public server address is missing")?;
+    let host = inbound.get("shareAddr").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).or(panel.panel_host.as_deref()).or_else(|| panel.ssh_target.as_deref().map(ssh_host)).ok_or("Public server address is missing")?;
     if !valid_http_host(host) { return Err("Invalid public server address".into()); }
     let port = inbound.get("port").and_then(|v| v.as_u64()).filter(|p| *p > 0 && *p <= 65535).ok_or("Invalid VLESS port")?;
     if network == "tcp" && settings.get("security").and_then(|v| v.as_str()) == Some("reality") {
@@ -1206,6 +1251,18 @@ pub fn imported_share_link(id: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ssh_target_accepts_optional_port() {
+        assert_eq!(split_ssh_target("root@example.com:2222"), ("root@example.com", Some(2222)));
+        assert_eq!(split_ssh_target("root@example.com"), ("root@example.com", None));
+        assert_eq!(ssh_host("root@example.com:2222"), "example.com");
+        assert_eq!(ssh_host("example.com"), "example.com");
+        assert!(valid_ssh_target("root@example.com:22") && valid_ssh_target("root@10.0.0.1:65535"));
+        for bad in ["root@example.com:0", "root@example.com:65536", "root@example.com:", "root@example.com:abc", "root@:22", "root@a:b:22", "-oProxy@x:22"] {
+            assert!(!valid_ssh_target(bad), "{bad}");
+        }
+    }
+
     use super::*;
     #[test]
     fn token_file_keeps_accounts_separate_and_private() {
@@ -1254,6 +1311,10 @@ mod tests {
         assert!(check_geo_entries(&["geoip:xx".into()], dir.path()).unwrap_err().contains("geoip:xx"));
         // No geosite.dat in the directory: geosite entries are not checked (development builds).
         assert!(check_geo_entries(&["geosite:whatever".into()], dir.path()).is_ok());
+        // The picker lists names lower-case and sorted; an absent database yields an empty list.
+        let lists = geo_lists(dir.path()).unwrap();
+        assert_eq!(lists["geoip"], serde_json::json!(["private", "ru"]));
+        assert_eq!(lists["geosite"], serde_json::json!([]));
         fs::write(dir.path().join("geoip.dat"), [0x0a, 0x7f]).unwrap();
         assert!(geo_codes(&dir.path().join("geoip.dat")).is_err());
     }

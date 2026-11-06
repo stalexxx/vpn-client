@@ -28,3 +28,11 @@
 .traffic-stats{grid-column:1/-1;margin:8px 0 0;font-size:10px;line-height:1.55;color:#d6e6da;font-variant-numeric:tabular-nums;white-space:pre-line}.traffic-stats[hidden]{display:none}
 .bypass-check{display:flex;gap:8px;align-items:flex-start;font-size:12px;line-height:1.4;margin:2px 0 10px;color:#1e2b22}.bypass-check input{margin-top:2px}
 .bypass-check input{width:auto;flex:0 0 auto}.import-status.ok{color:#17613b}footer .admin-link{white-space:nowrap}.footer-links{display:flex;gap:12px}
+
+.import-dialog>*{flex-shrink:0}
+.import-dialog .import-actions{position:sticky;bottom:-16px;background:#fff;padding:8px 0 2px;margin-top:2px}
+.geo-picker{display:flex;flex-direction:column;gap:6px}
+.geo-row{display:flex;gap:6px}.geo-row select{flex:0 0 auto;font:12px -apple-system,BlinkMacSystemFont,sans-serif;border:1px solid #cfd8d1;border-radius:8px;padding:6px;background:#fff}.geo-row input{flex:1 1 auto;min-width:0}
+.geo-results{display:flex;flex-wrap:wrap;gap:5px;max-height:84px;overflow:auto}
+.geo-chip{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid #cfd8d1;background:#f4f7f5;color:#1e2b22;border-radius:999px;padding:3px 9px;cursor:pointer}
+.geo-chip:hover{background:#e6efe9}.geo-chip.added{background:#dff0e6;border-color:#9ac5a7;color:#17613b;cursor:default}
