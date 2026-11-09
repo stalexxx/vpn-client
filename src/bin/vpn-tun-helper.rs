@@ -275,11 +275,21 @@ fn verify_tunnel_connectivity(tun: &str) -> Result<(), String> {
         }
     }
 }
-static AWG_CHILD: Mutex<Option<Child>> = Mutex::new(None);
-/// Stops the embedded AmneziaWG client (and removes its config), also one left over by a previous helper process.
+struct AwgProc { child: Child, port: u16 }
+static AWG_ACTIVE: Mutex<Option<AwgProc>> = Mutex::new(None);
+/// Physical interface seen before the tunnel came up (the default route points into the TUN afterwards).
+static PHYS_IFACE: Mutex<Option<String>> = Mutex::new(None);
+fn remember_physical_interface() -> Result<String, String> {
+    let route = Command::new("/sbin/route").args(["-n", "get", "default"]).output().map_err(|e| e.to_string())?;
+    match default_route_interface(&String::from_utf8_lossy(&route.stdout)) {
+        Ok(iface) if !iface.starts_with("utun") => { if let Ok(mut g) = PHYS_IFACE.lock() { *g = Some(iface.clone()); } Ok(iface) }
+        _ => PHYS_IFACE.lock().ok().and_then(|g| g.clone()).ok_or_else(|| "Маршрут по умолчанию ведёт в другой туннель: отключите его перед подключением AmneziaWG.".to_owned()),
+    }
+}
+/// Stops the active embedded AmneziaWG client (and removes its files), also one left over by a previous helper process.
 fn kill_awg() {
-    let child = AWG_CHILD.lock().ok().and_then(|mut g| g.take());
-    if let Some(mut child) = child { let _ = terminate_child(&mut child); }
+    let active = AWG_ACTIVE.lock().ok().and_then(|mut g| g.take());
+    if let Some(mut a) = active { let _ = terminate_child(&mut a.child); }
     else if let Some(pid) = fs::read_to_string(root_path("awg.pid")).ok().and_then(|v| v.trim().parse::<u32>().ok()) {
         if process_info(pid).ok().flatten().is_some_and(|(command, _)| command.contains(AWG_BIN)) {
             unsafe { libc::kill(pid as i32, libc::SIGTERM); }
@@ -287,49 +297,55 @@ fn kill_awg() {
             if process_info(pid).ok().flatten().is_some_and(|(command, _)| command.contains(AWG_BIN)) { unsafe { libc::kill(pid as i32, libc::SIGKILL); } }
         }
     }
-    let _ = fs::remove_file(root_path("awg.pid")); let _ = fs::remove_file(root_path("awg.conf"));
+    let _ = fs::remove_file(root_path("awg.pid"));
 }
-/// Runs the AmneziaWG client of an `awg://` profile as a loopback SOCKS5 proxy whose UDP sockets are pinned to the
-/// physical interface (so the tunnel to the server never enters our own TUN) and returns the `socks5://` link for Xray.
-fn start_awg(link: &str) -> Result<String, String> {
-    kill_awg();
+/// Spawns the AmneziaWG client of an `awg://` profile as a loopback SOCKS5 proxy whose UDP sockets are pinned to the
+/// physical interface (so the tunnel to the server never enters our own TUN). Does not touch the active one.
+fn spawn_awg(link: &str) -> Result<AwgProc, String> {
     let conf = vpn_core::awglink::link_to_conf(link)?;
-    let route = Command::new("/sbin/route").args(["-n", "get", "default"]).output().map_err(|e| e.to_string())?;
-    let iface = default_route_interface(&String::from_utf8_lossy(&route.stdout))?;
-    if iface.starts_with("utun") { return Err("Маршрут по умолчанию ведёт в другой туннель: отключите его перед подключением AmneziaWG.".into()); }
+    let iface = remember_physical_interface()?;
     let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).map_err(|e| e.to_string())?;
-    let conf_path = root_path("awg.conf");
+    let conf_path = root_path(&format!("awg-{port}.conf"));
     write_secure(&conf_path, conf.as_bytes())?;
     let log = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(root_path("awg.log")).map_err(|e| e.to_string())?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
-    let child = Command::new(AWG_BIN).arg(&conf_path).arg(format!("127.0.0.1:{port}")).env("AWG_BIND_IFACE", &iface)
-        .stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log_err)).spawn().map_err(|e| format!("Не удалось запустить клиент AmneziaWG: {e}"))?;
-    let pid = child.id();
-    if let Ok(mut g) = AWG_CHILD.lock() { *g = Some(child); }
-    let _ = write_secure(&root_path("awg.pid"), pid.to_string().as_bytes());
-    for _ in 0..100 {
-        if let Ok(mut g) = AWG_CHILD.lock() {
-            if let Some(status) = g.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
-                drop(g);
+    let spawned = Command::new(AWG_BIN).arg(&conf_path).arg(format!("127.0.0.1:{port}")).env("AWG_BIND_IFACE", &iface)
+        .stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log_err)).spawn();
+    let mut child = match spawned { Ok(c) => c, Err(e) => { let _ = fs::remove_file(&conf_path); return Err(format!("Не удалось запустить клиент AmneziaWG: {e}")); } };
+    let result = (|| {
+        for _ in 0..100 {
+            if let Ok(Some(status)) = child.try_wait() {
                 let log = fs::read_to_string(root_path("awg.log")).unwrap_or_default();
-                kill_awg();
                 return Err(format!("Клиент AmneziaWG завершился ({status}): {}", log.lines().last().unwrap_or("нет сообщения")));
             }
+            if TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(100)).is_ok() { return Ok(()); }
+            thread::sleep(Duration::from_millis(100));
         }
-        if TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(100)).is_ok() { return Ok(format!("socks5://127.0.0.1:{port}")); }
-        thread::sleep(Duration::from_millis(100));
-    }
-    kill_awg();
-    Err("Клиент AmneziaWG не запустился за 10 секунд".into())
+        Err("Клиент AmneziaWG не запустился за 10 секунд".to_owned())
+    })();
+    let _ = fs::remove_file(&conf_path); // the client has read it; the private key must not stay on disk
+    match result { Ok(()) => Ok(AwgProc { child, port }), Err(e) => { let _ = terminate_child(&mut child); Err(e) } }
 }
+/// Makes `new` the active client and stops the previous one.
+fn commit_awg(new: AwgProc) {
+    let _ = write_secure(&root_path("awg.pid"), new.child.id().to_string().as_bytes());
+    let old = AWG_ACTIVE.lock().ok().and_then(|mut g| g.replace(new));
+    if let Some(mut o) = old { let _ = terminate_child(&mut o.child); }
+}
+fn active_awg_port() -> Option<u16> { AWG_ACTIVE.lock().ok().and_then(|g| g.as_ref().map(|a| a.port)) }
+fn socks_link(port: u16) -> String { format!("socks5://127.0.0.1:{port}") }
 fn tunnel_running(state: &HelperState) -> bool {
     state.active.as_ref().is_some_and(|t| process_matches(&t.record)) || read_record().ok().flatten().is_some_and(|r| process_matches(&r))
 }
 fn start(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: &vpn_core::profile::Bypass, hot: bool) -> Result<String, String> {
-    if !link.starts_with(vpn_core::awglink::SCHEME) { return start_tunnel(state, link, relay_link, bypass, hot); }
     if tunnel_running(state) { return Ok("VPN уже подключён через TUN.".into()); }
-    let socks = start_awg(link)?;
-    match start_tunnel(state, &socks, None, bypass, hot) { Ok(m) => Ok(m), Err(e) => { kill_awg(); Err(e) } }
+    let _ = remember_physical_interface();
+    if !link.starts_with(vpn_core::awglink::SCHEME) { return start_tunnel(state, link, relay_link, bypass, hot); }
+    kill_awg();
+    let awg = spawn_awg(link)?;
+    let port = awg.port;
+    commit_awg(awg);
+    match start_tunnel(state, &socks_link(port), None, bypass, hot) { Ok(m) => Ok(m), Err(e) => { kill_awg(); Err(e) } }
 }
 /// `hot`: DNS is already pinned by the previous tunnel (kept by `stop(.., true)`), so it is neither restored nor re-journaled.
 fn start_tunnel(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: &vpn_core::profile::Bypass, hot: bool) -> Result<String, String> {
@@ -523,8 +539,15 @@ fn hot_switch(state: &HelperState, link: &str, relay_link: Option<&str>, bypass:
     if old_bypass != *bypass { return HotSwitch::NotApplicable("исключения изменились".into()); }
     let Some(port) = fs::read_to_string(root_path("api-port")).ok().and_then(|v| v.trim().parse::<u16>().ok()) else { return HotSwitch::NotApplicable("порт API не записан".into()) };
     let Ok(Some(record)) = read_record() else { return HotSwitch::NotApplicable("нет записи о процессе".into()) };
-    let (Ok(new), Ok(old)) = (vpn_outbounds(&record.tun_name, link, relay_link, bypass, port), vpn_outbounds(&record.tun_name, &old_link, old_relay.as_deref(), &old_bypass, port)) else { return HotSwitch::NotApplicable("не удалось собрать outbound".into()) };
-    if let Err(e) = park(state, port) { return HotSwitch::NotApplicable(e); }
+    // AmneziaWG profiles are SOCKS outbounds to a local client: start the new one beside the old one first.
+    let new_awg = if link.starts_with(vpn_core::awglink::SCHEME) { match spawn_awg(link) { Ok(a) => Some(a), Err(e) => return HotSwitch::NotApplicable(e) } } else { None };
+    let new_eff = new_awg.as_ref().map(|a| socks_link(a.port)).unwrap_or_else(|| link.to_owned());
+    let old_eff = if old_link.starts_with(vpn_core::awglink::SCHEME) { match active_awg_port() { Some(p) => socks_link(p), None => return HotSwitch::NotApplicable("клиент AmneziaWG не найден".into()) } } else { old_link.clone() };
+    let (Ok(new), Ok(old)) = (vpn_outbounds(&record.tun_name, &new_eff, if new_awg.is_some() { None } else { relay_link }, bypass, port), vpn_outbounds(&record.tun_name, &old_eff, if old_link.starts_with(vpn_core::awglink::SCHEME) { None } else { old_relay.as_deref() }, &old_bypass, port)) else {
+        if let Some(mut a) = new_awg { let _ = terminate_child(&mut a.child); }
+        return HotSwitch::NotApplicable("не удалось собрать outbound".into());
+    };
+    if let Err(e) = park(state, port) { if let Some(mut a) = new_awg { let _ = terminate_child(&mut a.child); } return HotSwitch::NotApplicable(e); }
     // From here on traffic is blocked; every exit path either restores the tunnel or leaves it blocked (never open).
     // `parked` tracks whether the kill rule is still in force so the rollback never parks twice (a second park could
     // remove the kill rule while the tail rule is already gone, which would open the tunnel).
@@ -533,7 +556,13 @@ fn hot_switch(state: &HelperState, link: &str, relay_link: Option<&str>, bypass:
         parked = false;
         if tcp_probe(Duration::from_secs(6)) { Ok(()) } else { Err("новый профиль не пропускает трафик".to_owned()) }
     });
+    if swapped.is_ok() {
+        // Committed: the old client (if any) goes away; a non-AmneziaWG profile leaves none running.
+        match new_awg { Some(a) => commit_awg(a), None => kill_awg() }
+        return HotSwitch::Switched;
+    }
     let Err(error) = swapped else { return HotSwitch::Switched };
+    if let Some(mut a) = new_awg { let _ = terminate_child(&mut a.child); }
     // Roll back to the previous profile.
     if !parked { if let Err(e) = park(state, port) { return HotSwitch::Failed(format!("Не удалось переключить профиль: {error}; откат не удался ({e}); текущий профиль не работает, переподключите VPN")); } }
     let restored = replace_vpn_outbounds(state, port, &old).and_then(|_| unpark(state, port));
@@ -646,6 +675,15 @@ fn main() {
 }
 
 fn reap_exited_process(state: &mut HelperState) {
+    // The embedded AmneziaWG client died while the tunnel is up: traffic is already blocked (no direct fallback), so
+    // take the VPN down cleanly instead of leaving a silent blackhole.
+    let awg_dead = AWG_ACTIVE.lock().ok().is_some_and(|mut g| g.as_mut().is_some_and(|a| a.child.try_wait().ok().flatten().is_some()));
+    if awg_dead && connected(state) {
+        eprintln!("vpn-tun-helper: клиент AmneziaWG завершился; VPN отключается");
+        if let Err(e) = stop(state, false) { eprintln!("vpn-tun-helper: {e}"); }
+        state.last = None;
+        return;
+    }
     let record = state.active.as_ref().map(|t| t.record.clone()).or_else(|| read_record().ok().flatten());
     let Some(record) = record else { return; };
     let child_exited = state.active.as_mut().and_then(|t| t.child.as_mut())

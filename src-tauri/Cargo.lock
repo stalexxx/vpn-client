@@ -4134,7 +4134,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vpn-core"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -4154,7 +4154,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-desktop"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "libc",
  "qrcode",
