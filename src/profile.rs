@@ -304,9 +304,36 @@ pub fn tail_rule() -> Value { json!({"type": "field", "network": "tcp,udp", "out
 /// Parked behind `tail` during a profile switch; becomes effective once `tail` is removed and drops everything.
 pub fn kill_rule() -> Value { json!({"type": "field", "network": "tcp,udp", "outboundTag": "block", "ruleTag": "kill"}) }
 
+/// Where Xray's gRPC API (stats, outbound and routing control) listens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiListen {
+    /// Loopback TCP port: reachable by every local process (kept for Windows).
+    Tcp(u16),
+    /// Absolute path of a unix socket, created by Xray with mode 0600 so that only its own user can connect.
+    Unix(String),
+}
+/// Longest unix socket path macOS accepts (`sun_path` is 104 bytes including the terminating NUL).
+pub const API_SOCKET_PATH_MAX: usize = 103;
+const API_SOCKET_MODE_SUFFIX: &str = ",0600";
+impl ApiListen {
+    /// The value of `api.listen` in the Xray config.
+    pub fn listen_value(&self) -> Result<String, String> {
+        match self {
+            ApiListen::Tcp(port) => Ok(format!("127.0.0.1:{port}")),
+            ApiListen::Unix(path) => {
+                // Xray takes the path as is (no `unix:` prefix, absolute only) and splits the mode off at the comma.
+                if !path.starts_with('/') { return Err("Путь сокета API должен быть абсолютным".into()); }
+                if path.contains(',') || path.chars().any(char::is_control) { return Err("Путь сокета API содержит недопустимые символы".into()); }
+                if path.len() + API_SOCKET_MODE_SUFFIX.len() > API_SOCKET_PATH_MAX { return Err("Путь сокета API слишком длинный".into()); }
+                Ok(format!("{path}{API_SOCKET_MODE_SUFFIX}"))
+            }
+        }
+    }
+}
+
 /// Same as `vless_tun_config_with_relay`; `verbose` turns on the info level and the
 /// access log (it records destination addresses, so it is opt-in and diagnostic only).
-pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Option<&str>, verbose: bool, api_port: Option<u16>, bypass: &Bypass) -> Result<Value, String> {
+pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Option<&str>, verbose: bool, api: Option<&ApiListen>, bypass: &Bypass) -> Result<Value, String> {
     let macos_name = interface.starts_with("utun") && interface[4..].chars().all(|c| c.is_ascii_digit());
     // Windows (wintun) adapters have a free-form name; accept a short alphanumeric one.
     let named = !interface.is_empty() && interface.len() <= 32 && interface.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
@@ -315,12 +342,13 @@ pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Op
     }
     let mut config = vless_config(link, 10808)?;
     // Helper keeps Xray's stdout in a root-only xray.log; an empty access path sends the access log there.
-    // Per-outbound traffic counters, readable only through a loopback StatsService (no handler/control services).
-    if let Some(port) = api_port {
+    // Per-outbound traffic counters, readable through the API's StatsService.
+    if let Some(api) = api {
+        let listen = api.listen_value()?;
         config["stats"] = json!({});
         config["policy"] = json!({"system": {"statsOutboundUplink": true, "statsOutboundDownlink": true}});
         // HandlerService/RoutingService let the helper swap the VPN outbound in place (profile switch without restarting Xray).
-        config["api"] = json!({"tag": "api", "listen": format!("127.0.0.1:{port}"), "services": ["StatsService", "HandlerService", "RoutingService"]});
+        config["api"] = json!({"tag": "api", "listen": listen, "services": ["StatsService", "HandlerService", "RoutingService"]});
     }
     if verbose { config["log"] = json!({"loglevel": "info", "access": ""}); }
     if let Some(relay_link) = relay_link {
@@ -428,7 +456,7 @@ mod tests {
         let config=vless_xhttp_tun_config(link,"utun10").unwrap();
         assert_eq!(config["log"]["loglevel"], "warning");
         assert!(config["log"].get("access").is_none());
-        let verbose=vless_tun_config_with_options(link,"utun10",None,true,Some(18085),&Bypass::default()).unwrap();
+        let verbose=vless_tun_config_with_options(link,"utun10",None,true,Some(&ApiListen::Tcp(18085)),&Bypass::default()).unwrap();
         assert_eq!(verbose["log"]["loglevel"], "info");
         assert_eq!(verbose["log"]["access"], "");
         assert_eq!(verbose["api"]["listen"], "127.0.0.1:18085");
@@ -487,6 +515,33 @@ mod tests {
         assert!(vless_config(&link.replace("pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","pbk=bad"),10808).is_err());
     }
     #[test]
+    fn api_listens_on_a_private_unix_socket_or_a_loopback_port() {
+        let link = "vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=xhttp&security=tls&sni=example.org&path=%2F";
+        let build = |api: Option<&ApiListen>| vless_tun_config_with_options(link, "utun10", None, false, api, &Bypass::default());
+        let path = "/Library/Application Support/VpnClientHelper/api.sock";
+        let unix = build(Some(&ApiListen::Unix(path.into()))).unwrap();
+        assert_eq!(unix["api"], json!({"tag": "api", "listen": format!("{path},0600"), "services": ["StatsService", "HandlerService", "RoutingService"]}));
+        assert_eq!(unix["policy"]["system"], json!({"statsOutboundUplink": true, "statsOutboundDownlink": true}));
+        // No TCP address of the API (and no `unix:` prefix, which Xray rejects) anywhere in the config.
+        let text = unix.to_string();
+        assert!(!text.contains("127.0.0.1") && !text.contains("unix:"), "{text}");
+        // The TCP variant is the previous config, and differs from the unix one only in the listen address.
+        let tcp = build(Some(&ApiListen::Tcp(18085))).unwrap();
+        assert_eq!(tcp["api"], json!({"tag": "api", "listen": "127.0.0.1:18085", "services": ["StatsService", "HandlerService", "RoutingService"]}));
+        let mut same = unix.clone();
+        same["api"]["listen"] = json!("127.0.0.1:18085");
+        assert_eq!(same, tcp);
+        let none = build(None).unwrap();
+        assert!(none.get("api").is_none() && none.get("stats").is_none() && none.get("policy").is_none());
+        // Longest accepted path: 103 bytes together with the mode suffix.
+        let longest = format!("/{}", "a".repeat(API_SOCKET_PATH_MAX - 6));
+        assert_eq!(ApiListen::Unix(longest.clone()).listen_value().unwrap().len(), API_SOCKET_PATH_MAX);
+        for bad in [format!("{longest}a"), format!("/{}", "я".repeat(49)), "api.sock".into(), "./api.sock".into(), "unix:/tmp/api.sock".into(), String::new(), "/tmp/a,b.sock".into(), "/tmp/api.sock,0666".into(), "/tmp/a\nb.sock".into(), "/tmp/a\0b.sock".into()] {
+            assert!(build(Some(&ApiListen::Unix(bad.clone()))).is_err(), "{bad:?}");
+        }
+        assert!(build(Some(&ApiListen::Unix("/tmp/with space/api.sock".into()))).is_ok());
+    }
+    #[test]
     fn chains_reality_through_xhttp_relay() {
         let reality = "vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=tcp&security=reality&sni=www.apple.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=01234567&fp=chrome";
         let relay = "vless://12345678-1234-1234-1234-123456789abc@relay.example:8443?type=xhttp&security=tls&sni=relay.example&path=%2F";
@@ -532,7 +587,7 @@ mod socks_tests {
     use super::*;
     #[test]
     fn loopback_socks_link_becomes_the_vpn_outbound_of_the_tun_config() {
-        let config = vless_tun_config_with_options("socks5://127.0.0.1:19999", "utun10", None, false, Some(18000), &Bypass::default()).unwrap();
+        let config = vless_tun_config_with_options("socks5://127.0.0.1:19999", "utun10", None, false, Some(&ApiListen::Tcp(18000)), &Bypass::default()).unwrap();
         let out = &config["outbounds"][0];
         assert_eq!((out["tag"].as_str(), out["protocol"].as_str(), out["settings"]["port"].as_u64()), (Some("vpn-out"), Some("socks"), Some(19999)));
         assert!(vless_config("socks5://10.0.0.1:1080", 10808).is_err(), "only loopback is allowed");
@@ -547,7 +602,7 @@ mod socks_tests {
     fn socks_link_credentials_go_into_the_outbound() {
         let config = vless_config("socks5://0011aabb:ccdd%40eeff@127.0.0.1:19999", 10808).unwrap();
         assert_eq!(config["outbounds"][0]["settings"], json!({"address":"127.0.0.1","port":19999,"user":"0011aabb","pass":"ccdd@eeff"}));
-        let tun = vless_tun_config_with_options("socks5://u:p@127.0.0.1:19999", "utun10", None, false, Some(18000), &Bypass::default()).unwrap();
+        let tun = vless_tun_config_with_options("socks5://u:p@127.0.0.1:19999", "utun10", None, false, Some(&ApiListen::Tcp(18000)), &Bypass::default()).unwrap();
         assert_eq!((tun["outbounds"][0]["tag"].as_str(), tun["outbounds"][0]["settings"]["user"].as_str(), tun["outbounds"][0]["settings"]["pass"].as_str()), (Some("vpn-out"), Some("u"), Some("p")));
         assert!(vless_config("socks5://u:p@10.0.0.1:1080", 10808).is_err(), "credentials do not lift the loopback restriction");
         assert!(vless_config("socks5://u:p@localhost:1080", 10808).is_err());

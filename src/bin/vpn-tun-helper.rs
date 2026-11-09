@@ -20,7 +20,7 @@ const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Deserialize)]
 struct Request { action: String, #[serde(default)] link: Option<String>, #[serde(default)] relay_link: Option<String>, #[serde(default)] lines: Option<usize>, #[serde(default)] filter: Option<String>, #[serde(default)] level: Option<String>, #[serde(default)] bypass: Option<vpn_core::profile::Bypass> }
 #[derive(Serialize)]
-struct Response { ok: bool, connected: bool, message: String, version: &'static str, connectivity_check: bool, reality_support: bool, hysteria2_support: bool, hysteria_chain_support: bool, awg_support: bool }
+struct Response { ok: bool, connected: bool, message: String, version: &'static str, connectivity_check: bool, reality_support: bool, hysteria2_support: bool, hysteria_chain_support: bool, awg_support: bool, api_socket: bool }
 #[derive(Clone, Serialize, Deserialize)]
 struct ProcessRecord { pid: u32, config_path: String, xray_path: String, tun_name: String, #[serde(default)] start_time: String }
 #[derive(Serialize, Deserialize)]
@@ -32,7 +32,29 @@ struct HelperState { uid: u32, xray: PathBuf, active: Option<Tunnel>, last: Opti
 enum DnsRestoreAction { RestoreOriginal, AlreadyRestored, Conflict }
 
 fn root_path(name: &str) -> PathBuf { Path::new(HELPER_DIR).join(name) }
-fn response(ok: bool, connected: bool, message: impl Into<String>) -> Response { Response { ok, connected, message: message.into(), version: HELPER_VERSION, connectivity_check: true, reality_support: true, hysteria2_support: true, hysteria_chain_support: true, awg_support: true } }
+fn response(ok: bool, connected: bool, message: impl Into<String>) -> Response { Response { ok, connected, message: message.into(), version: HELPER_VERSION, connectivity_check: true, reality_support: true, hysteria2_support: true, hysteria_chain_support: true, awg_support: true, api_socket: true } }
+/// Unix socket of Xray's API. The helper directory is root-only (0700) and Xray creates the socket with mode 0600,
+/// so only root can reach the services that replace outbounds and routing rules.
+fn api_socket() -> PathBuf { root_path("api.sock") }
+fn api_listen() -> vpn_core::profile::ApiListen { vpn_core::profile::ApiListen::Unix(api_socket().to_string_lossy().into_owned()) }
+/// The server address `xray api` expects for a unix socket (the bare path is not accepted).
+fn api_server(socket: &Path) -> String { format!("unix:{}", socket.display()) }
+/// Arguments of `xray api <sub>`: flags first, then the server and the timeout, then positional arguments.
+fn xray_api_args(server: &str, sub: &str, flags: &[&str], args: &[&str]) -> Vec<String> {
+    ["api", sub].iter().chain(flags).chain(&["-s", server, "-t", "5"]).chain(args).map(|a| (*a).to_owned()).collect()
+}
+/// Whether the API socket of a running Xray exists (one started by an older helper has none).
+fn api_socket_present() -> bool { fs::symlink_metadata(api_socket()).is_ok_and(|m| m.file_type().is_socket()) }
+fn xray_stats_args(server: &str) -> Vec<String> { vec!["api".into(), "statsquery".into(), "-t".into(), "2".into(), format!("--server={server}")] }
+/// Removes the API socket and the lock file Xray keeps beside it. Xray removes both on SIGTERM, but after a crash or
+/// SIGKILL they stay behind and the next start fails with "address already in use". Call only when Xray is not running.
+fn remove_api_socket() {
+    let socket = api_socket();
+    let _ = fs::remove_file(&socket);
+    let mut lock = socket.into_os_string();
+    lock.push(".lock");
+    let _ = fs::remove_file(lock);
+}
 fn process_info(pid: u32) -> Result<Option<(String, String)>, String> {
     let command = Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "command="]).output().map_err(|e| e.to_string())?;
     if !command.status.success() { return Ok(None); }
@@ -193,6 +215,7 @@ fn rollback_start(child: Option<&mut Child>, config_path: &Path) -> Result<(), S
     kill_awg();
     let _ = fs::remove_file(root_path("process.json"));
     let _ = fs::remove_file(config_path);
+    remove_api_socket();
     restore_dns()
 }
 fn append_rollback_error(error: String, rollback: Result<(), String>) -> String {
@@ -393,12 +416,13 @@ fn start_tunnel(state: &mut HelperState, link: &str, relay_link: Option<&str>, b
     if !hot { restore_dns()?; }
     let _ = fs::remove_file(root_path("config.json"));
     let tun = choose_utun()?;
-    let api_port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).map_err(|e| e.to_string())?;
-    write_secure(&root_path("api-port"), api_port.to_string().as_bytes())?;
-    let config = vpn_core::profile::vless_tun_config_with_options(link, &tun, relay_link, verbose_log(), Some(api_port), bypass)?;
+    let config = vpn_core::profile::vless_tun_config_with_options(link, &tun, relay_link, verbose_log(), Some(&api_listen()), bypass)?;
     let config_path = root_path("config.json");
     write_secure(&config_path, config.to_string().as_bytes())?;
-    let check = Command::new(&state.xray).env("XRAY_LOCATION_ASSET", ASSET_DIR).args(["run", "-test", "-config"]).arg(&config_path).stdout(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| e.to_string())?;
+    // No Xray of ours is running here; a socket left by a killed one would make the new one fail to bind.
+    remove_api_socket();
+    let check =Command::new(&state.xray).env("XRAY_LOCATION_ASSET", ASSET_DIR).args(["run", "-test", "-config"]).arg(&config_path).stdout(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| e.to_string())?;
+    remove_api_socket();
     if !check.status.success() { let _ = fs::remove_file(&config_path); return Err(format!("Xray отклонил TUN-конфигурацию: {}", String::from_utf8_lossy(&check.stderr).trim())); }
     if !hot {
         let service = active_network_service()?;
@@ -471,6 +495,7 @@ fn stop(state: &mut HelperState, keep_dns: bool) -> Result<(), String> {
         kill_awg();
         if !keep_dns { restore_dns()?; }
         let _ = fs::remove_file(root_path("config.json"));
+        remove_api_socket();
         return Ok(());
     };
     if let Some(child) = tunnel.as_mut().and_then(|t| t.child.as_mut()) {
@@ -486,6 +511,7 @@ fn stop(state: &mut HelperState, keep_dns: bool) -> Result<(), String> {
     if let Some(mut t) = tunnel { if let Some(child) = t.child.as_mut() { let _ = child.wait(); } }
     kill_awg();
     let _ = fs::remove_file(root_path("process.json")); let _ = fs::remove_file(root_path("config.json"));
+    remove_api_socket();
     if !keep_dns { restore_dns()?; }
     Ok(())
 }
@@ -528,9 +554,9 @@ fn switch(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass:
 
 enum HotSwitch { Switched, /** nothing was changed */ NotApplicable(String), /** the tunnel may be blocked or restored */ Failed(String) }
 
-/// `xray api <sub>` against the running instance's loopback API (flags first, then positional arguments).
-fn xray_api(state: &HelperState, port: u16, sub: &str, flags: &[&str], args: &[&str]) -> Result<(), String> {
-    let output = Command::new(&state.xray).args(["api", sub]).args(flags).args(["-s", &format!("127.0.0.1:{port}"), "-t", "5"]).args(args)
+/// `xray api <sub>` against the running instance's API socket.
+fn xray_api(state: &HelperState, sub: &str, flags: &[&str], args: &[&str]) -> Result<(), String> {
+    let output = Command::new(&state.xray).args(xray_api_args(&api_server(&api_socket()), sub, flags, args))
         .stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
     if output.status.success() { Ok(()) }
     else { Err(format!("xray api {sub}: {}", String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or("ошибка").trim())) }
@@ -542,27 +568,27 @@ fn swap_file(name: &str, value: &serde_json::Value) -> Result<String, String> {
 }
 /// Parks a rule that blackholes everything behind the tail rule, then removes the tail rule: from here on all
 /// non-excluded traffic is dropped until `unpark`.
-fn park(state: &HelperState, port: u16) -> Result<(), String> {
+fn park(state: &HelperState) -> Result<(), String> {
     let kill = swap_file("swap-kill.json", &serde_json::json!({"routing": {"rules": [vpn_core::profile::kill_rule()]}}))?;
-    xray_api(state, port, "adrules", &["-append"], &[&kill])?;
-    if let Err(e) = xray_api(state, port, "rmrules", &[], &["tail"]) { let _ = xray_api(state, port, "rmrules", &[], &["kill"]); return Err(e); }
+    xray_api(state, "adrules", &["-append"], &[&kill])?;
+    if let Err(e) = xray_api(state, "rmrules", &[], &["tail"]) { let _ = xray_api(state, "rmrules", &[], &["kill"]); return Err(e); }
     Ok(())
 }
 /// Restores the tail rule behind the kill rule (still blocking), then removes the kill rule.
-fn unpark(state: &HelperState, port: u16) -> Result<(), String> {
+fn unpark(state: &HelperState) -> Result<(), String> {
     let tail = swap_file("swap-tail.json", &serde_json::json!({"routing": {"rules": [vpn_core::profile::tail_rule()]}}))?;
-    xray_api(state, port, "adrules", &["-append"], &[&tail])?;
-    xray_api(state, port, "rmrules", &[], &["kill"])
+    xray_api(state, "adrules", &["-append"], &[&tail])?;
+    xray_api(state, "rmrules", &[], &["kill"])
 }
-fn replace_vpn_outbounds(state: &HelperState, port: u16, outbounds: &serde_json::Value) -> Result<(), String> {
+fn replace_vpn_outbounds(state: &HelperState, outbounds: &serde_json::Value) -> Result<(), String> {
     let file = swap_file("swap-out.json", outbounds)?;
-    let _ = xray_api(state, port, "rmo", &[], &["vpn-relay"]); // absent unless a relay is configured
-    xray_api(state, port, "rmo", &[], &["vpn-out"])?;
-    xray_api(state, port, "ado", &[], &[&file])
+    let _ = xray_api(state, "rmo", &[], &["vpn-relay"]); // absent unless a relay is configured
+    xray_api(state, "rmo", &[], &["vpn-out"])?;
+    xray_api(state, "ado", &[], &[&file])
 }
 /// The VPN-related outbounds (relay first) of the TUN config for a profile.
-fn vpn_outbounds(tun: &str, link: &str, relay: Option<&str>, bypass: &vpn_core::profile::Bypass, port: u16) -> Result<serde_json::Value, String> {
-    let config = vpn_core::profile::vless_tun_config_with_options(link, tun, relay, verbose_log(), Some(port), bypass)?;
+fn vpn_outbounds(tun: &str, link: &str, relay: Option<&str>, bypass: &vpn_core::profile::Bypass) -> Result<serde_json::Value, String> {
+    let config = vpn_core::profile::vless_tun_config_with_options(link, tun, relay, verbose_log(), Some(&api_listen()), bypass)?;
     let mut list: Vec<serde_json::Value> = config["outbounds"].as_array().map(|o| o.iter().filter(|o| o["tag"] == "vpn-out" || o["tag"] == "vpn-relay").cloned().collect()).unwrap_or_default();
     list.sort_by_key(|o| o["tag"] != "vpn-relay");
     if !list.iter().any(|o| o["tag"] == "vpn-out") { return Err("В конфигурации нет outbound-а vpn-out".into()); }
@@ -572,22 +598,23 @@ fn hot_switch(state: &HelperState, link: &str, relay_link: Option<&str>, bypass:
     let Some((old_link, old_relay, old_bypass)) = state.last.clone() else { return HotSwitch::NotApplicable("профиль не отслеживается".into()) };
     // Exclusion rules live in the config Xray was started with; if they changed, only a restart can apply them.
     if old_bypass != *bypass { return HotSwitch::NotApplicable("исключения изменились".into()); }
-    let Some(port) = fs::read_to_string(root_path("api-port")).ok().and_then(|v| v.trim().parse::<u16>().ok()) else { return HotSwitch::NotApplicable("порт API не записан".into()) };
+    // An Xray started by a previous helper version listens on a TCP port and has no socket: only a restart moves it over.
+    if !api_socket_present() { return HotSwitch::NotApplicable("у запущенного Xray нет сокета API".into()); }
     let Ok(Some(record)) = read_record() else { return HotSwitch::NotApplicable("нет записи о процессе".into()) };
     // AmneziaWG profiles are SOCKS outbounds to a local client: start the new one beside the old one first.
     let new_awg = if link.starts_with(vpn_core::awglink::SCHEME) { match spawn_awg(link) { Ok(a) => Some(a), Err(e) => return HotSwitch::NotApplicable(e) } } else { None };
     let new_eff = new_awg.as_ref().map(AwgProc::link).unwrap_or_else(|| link.to_owned());
     let old_eff = if old_link.starts_with(vpn_core::awglink::SCHEME) { match active_awg_link() { Some(l) => l, None => return HotSwitch::NotApplicable("клиент AmneziaWG не найден".into()) } } else { old_link.clone() };
-    let (Ok(new), Ok(old)) = (vpn_outbounds(&record.tun_name, &new_eff, if new_awg.is_some() { None } else { relay_link }, bypass, port), vpn_outbounds(&record.tun_name, &old_eff, if old_link.starts_with(vpn_core::awglink::SCHEME) { None } else { old_relay.as_deref() }, &old_bypass, port)) else {
+    let (Ok(new), Ok(old)) = (vpn_outbounds(&record.tun_name, &new_eff, if new_awg.is_some() { None } else { relay_link }, bypass), vpn_outbounds(&record.tun_name, &old_eff, if old_link.starts_with(vpn_core::awglink::SCHEME) { None } else { old_relay.as_deref() }, &old_bypass)) else {
         if let Some(mut a) = new_awg { let _ = terminate_child(&mut a.child); }
         return HotSwitch::NotApplicable("не удалось собрать outbound".into());
     };
-    if let Err(e) = park(state, port) { if let Some(mut a) = new_awg { let _ = terminate_child(&mut a.child); } return HotSwitch::NotApplicable(e); }
+    if let Err(e) = park(state) { if let Some(mut a) = new_awg { let _ = terminate_child(&mut a.child); } return HotSwitch::NotApplicable(e); }
     // From here on traffic is blocked; every exit path either restores the tunnel or leaves it blocked (never open).
     // `parked` tracks whether the kill rule is still in force so the rollback never parks twice (a second park could
     // remove the kill rule while the tail rule is already gone, which would open the tunnel).
     let mut parked = true;
-    let swapped = replace_vpn_outbounds(state, port, &new).and_then(|_| unpark(state, port)).and_then(|_| {
+    let swapped = replace_vpn_outbounds(state, &new).and_then(|_| unpark(state)).and_then(|_| {
         parked = false;
         if tcp_probe(Duration::from_secs(6)) { Ok(()) } else { Err("новый профиль не пропускает трафик".to_owned()) }
     });
@@ -599,8 +626,8 @@ fn hot_switch(state: &HelperState, link: &str, relay_link: Option<&str>, bypass:
     let Err(error) = swapped else { return HotSwitch::Switched };
     if let Some(mut a) = new_awg { let _ = terminate_child(&mut a.child); }
     // Roll back to the previous profile.
-    if !parked { if let Err(e) = park(state, port) { return HotSwitch::Failed(format!("Не удалось переключить профиль: {error}; откат не удался ({e}); текущий профиль не работает, переподключите VPN")); } }
-    let restored = replace_vpn_outbounds(state, port, &old).and_then(|_| unpark(state, port));
+    if !parked { if let Err(e) = park(state) { return HotSwitch::Failed(format!("Не удалось переключить профиль: {error}; откат не удался ({e}); текущий профиль не работает, переподключите VPN")); } }
+    let restored = replace_vpn_outbounds(state, &old).and_then(|_| unpark(state));
     match restored {
         Ok(()) if tcp_probe(Duration::from_secs(6)) => HotSwitch::Failed(format!("Не удалось переключить профиль: {error}; возвращён прежний профиль")),
         Ok(()) => HotSwitch::Failed(format!("Не удалось переключить профиль: {error}; прежний профиль тоже не пропускает трафик")),
@@ -624,8 +651,8 @@ fn handle(state: &mut HelperState, req: Request) -> Response {
         }
         "stats" => {
             if !connected(state) { return response(false, false, "VPN не подключён"); }
-            let port = match fs::read_to_string(root_path("api-port")).ok().and_then(|v| v.trim().parse::<u16>().ok()) { Some(p) => p, None => return response(false, true, "Статистика недоступна: порт API не записан") };
-            match Command::new(&state.xray).args(["api", "statsquery", "-t", "2"]).arg(format!("--server=127.0.0.1:{port}")).stdin(Stdio::null()).stderr(Stdio::null()).output() {
+            if !api_socket_present() { return response(false, true, "Статистика недоступна: у запущенного Xray нет сокета API, переподключите VPN"); }
+            match Command::new(&state.xray).args(xray_stats_args(&api_server(&api_socket()))).stdin(Stdio::null()).stderr(Stdio::null()).output() {
                 Ok(out) if out.status.success() => match parse_stats(&String::from_utf8_lossy(&out.stdout)) { Ok(v) => response(true, true, v.to_string()), Err(e) => response(false, true, e) },
                 _ => response(false, true, "Статистика Xray недоступна"),
             }
@@ -654,6 +681,8 @@ fn serve(uid: u32, xray: PathBuf) -> Result<(), String> {
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     let cpath = std::ffi::CString::new(SOCKET).map_err(|e| e.to_string())?;
     if unsafe { libc::chown(cpath.as_ptr(), uid, 20) } != 0 { return Err("Не удалось назначить владельца сокета".into()); }
+    // Left by a previous helper version, whose Xray API listened on a loopback TCP port.
+    let _ = fs::remove_file(root_path("api-port"));
     let mut state = HelperState { uid, xray, active: None, last: None };
     if let Some(record) = read_record()? {
         if record.start_time.is_empty() {
@@ -668,9 +697,13 @@ fn serve(uid: u32, xray: PathBuf) -> Result<(), String> {
         } else {
             let _ = fs::remove_file(root_path("process.json"));
             let _ = fs::remove_file(root_path("config.json"));
+            remove_api_socket();
             if let Err(e) = restore_dns() { eprintln!("vpn-tun-helper: startup recovery: {e}"); }
         }
-    } else if let Err(e) = restore_dns() { eprintln!("vpn-tun-helper: startup DNS recovery: {e}"); }
+    } else {
+        remove_api_socket();
+        if let Err(e) = restore_dns() { eprintln!("vpn-tun-helper: startup DNS recovery: {e}"); }
+    }
     if state.active.is_none() { kill_awg(); }
     let state = Arc::new(Mutex::new(state));
     let monitor_state = Arc::clone(&state);
@@ -730,6 +763,7 @@ fn reap_exited_process(state: &mut HelperState) {
     kill_awg();
     let _ = fs::remove_file(root_path("process.json"));
     let _ = fs::remove_file(root_path("config.json"));
+    remove_api_socket();
     if let Err(e) = restore_dns() { eprintln!("vpn-tun-helper: failed to restore DNS after Xray exit: {e}"); }
 }
 
@@ -887,10 +921,25 @@ mod tests {
     #[test]
     fn hot_switch_outbounds_contain_only_the_vpn_side() {
         let link = "vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=xhttp&security=tls&sni=example.org&path=%2F";
-        let out = vpn_outbounds("utun9", link, None, &vpn_core::profile::Bypass::default(), 18000).unwrap();
+        let out = vpn_outbounds("utun9", link, None, &vpn_core::profile::Bypass::default()).unwrap();
         let tags: Vec<_> = out["outbounds"].as_array().unwrap().iter().map(|o| o["tag"].as_str().unwrap().to_owned()).collect();
         // direct/block stay in the running config; only the replaceable outbound is swapped.
         assert_eq!(tags, vec!["vpn-out"]);
-        assert!(vpn_outbounds("utun9", "not a link", None, &vpn_core::profile::Bypass::default(), 18000).is_err());
+        assert!(vpn_outbounds("utun9", "not a link", None, &vpn_core::profile::Bypass::default()).is_err());
+    }
+
+    #[test]
+    fn xray_api_is_addressed_through_the_unix_socket() {
+        let server = api_server(&api_socket());
+        assert_eq!(server, "unix:/Library/Application Support/VpnClientHelper/api.sock");
+        // Flags first, then the server and the timeout, then positional arguments; the address stays one argument.
+        assert_eq!(xray_api_args(&server, "adrules", &["-append"], &["/x/swap-kill.json"]), ["api", "adrules", "-append", "-s", server.as_str(), "-t", "5", "/x/swap-kill.json"]);
+        assert_eq!(xray_api_args(&server, "rmrules", &[], &["tail"]), ["api", "rmrules", "-s", server.as_str(), "-t", "5", "tail"]);
+        assert_eq!(xray_api_args(&server, "rmo", &[], &["vpn-out"]), ["api", "rmo", "-s", server.as_str(), "-t", "5", "vpn-out"]);
+        assert_eq!(xray_stats_args(&server), ["api", "statsquery", "-t", "2", "--server=unix:/Library/Application Support/VpnClientHelper/api.sock"]);
+        // The config Xray is started with names the same socket, without the client-side prefix and with a private mode.
+        let link = "vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=xhttp&security=tls&sni=example.org&path=%2F";
+        let config = vpn_core::profile::vless_tun_config_with_options(link, "utun9", None, false, Some(&api_listen()), &vpn_core::profile::Bypass::default()).unwrap();
+        assert_eq!(config["api"]["listen"], "/Library/Application Support/VpnClientHelper/api.sock,0600");
     }
 }
