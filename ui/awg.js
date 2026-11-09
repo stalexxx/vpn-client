@@ -40,9 +40,10 @@
     const warp = /latest handshake: ([^\n]+)/.exec(st);
     $('awg-state').textContent = warp ? `WARP: рукопожатие ${warp[1]}.` : 'WARP: рукопожатия ещё не было — проверьте сервер.';
   }
+  function hideResult() { ['awg-conf-label', 'awg-link-label', 'awg-qr'].forEach(id => { $(id).hidden = true; }); $('awg-qr').replaceChildren(); }
   async function openServer(s) {
     current = s; savedPath = null; uninstallArmed = false; $('awg-uninstall').textContent = 'Удалить AmneziaWG с сервера';
-    $('awg-detail').hidden = false; $('awg-detail-title').textContent = `${s.name} · UDP ${s.port}`; $('awg-conf').hidden = true; $('awg-reveal').hidden = true; $('awg-state').textContent = 'Загружаем…'; renderServers();
+    $('awg-detail').hidden = false; $('awg-detail-title').textContent = `${s.name} · UDP ${s.port}`; hideResult(); $('awg-reveal').hidden = true; $('awg-state').textContent = 'Загружаем…'; renderServers();
     try { await loadDetail(); } catch (e) { $('awg-state').textContent = `Не удалось получить данные: ${e}`; }
   }
   $('open-awg').addEventListener('click', async () => {
@@ -67,8 +68,8 @@
     busyAwg = true; status('Создаём клиента…');
     try {
       const r = await invoke('awg_add_client', { id: current.id, client });
-      savedPath = r.path; $('awg-conf').value = r.conf; $('awg-conf').hidden = false; $('awg-reveal').hidden = false; $('awg-client-name').value = '';
-      status(`Конфиг сохранён: ${r.path}. Импортируйте его в приложение Amnezia; ключи в файле секретные.`); await loadDetail();
+      savedPath = r.path; $('awg-conf').value = r.conf; $('awg-conf-label').hidden = false; $('awg-link').value = r.link; $('awg-link-label').hidden = false; $('awg-qr').innerHTML = r.qr_svg; $('awg-qr').hidden = false; $('awg-reveal').hidden = false; $('awg-client-name').value = '';
+      status(`Конфиг сохранён: ${r.path}. Отсканируйте QR или импортируйте ссылку/файл в приложение Amnezia; ключи секретные.`); await loadDetail();
     } catch (e) { status(`Не удалось создать клиента: ${e}`); } finally { busyAwg = false; }
   });
   $('awg-reveal').addEventListener('click', () => { if (savedPath) invoke('awg_reveal', { path: savedPath }).catch(e => status(`${e}`)); });

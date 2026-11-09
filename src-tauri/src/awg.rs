@@ -23,7 +23,7 @@ pub async fn awg_status(id: String) -> Result<String, String> {
     blocking(move || amnezia::status(&amnezia::find_server(&id)?)).await
 }
 
-/// Creates the client and saves its `.conf` into ~/Downloads; returns `{path, conf}`.
+/// Creates the client and saves its `.conf` into ~/Downloads; returns `{path, conf, link, qr_svg}`.
 #[tauri::command]
 pub async fn awg_add_client(id: String, client: String) -> Result<serde_json::Value, String> {
     blocking(move || {
@@ -35,7 +35,9 @@ pub async fn awg_add_client(id: String, client: String) -> Result<serde_json::Va
         let path = dir.join(format!("{safe}-{client}.conf"));
         std::fs::write(&path, &conf).map_err(|e| e.to_string())?;
         vpn_core::compat::restrict_path(&path).map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({"path": path.to_string_lossy(), "conf": conf}))
+        let link = amnezia::vpn_link(&format!("{} · {}", server.name, client), &conf)?;
+        let qr = amnezia::qr_svg(&conf)?;
+        Ok(serde_json::json!({"path": path.to_string_lossy(), "conf": conf, "link": link, "qr_svg": qr}))
     }).await
 }
 

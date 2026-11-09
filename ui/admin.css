@@ -11,3 +11,7 @@
 
 .warp-box{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 14px;margin:0 0 14px;border:1px solid #dce2dd;border-radius:10px;background:#fff}.warp-box p{margin:3px 0 0;font-size:12px;line-height:1.4}.warp-box button{flex:none}
 .side-settings{margin-top:auto;width:100%}
+
+.awg-qr { display:flex; justify-content:center; margin:12px 0; }
+.awg-qr svg { width:240px; height:240px; background:#fff; border-radius:8px; }
+#awg-link, #awg-conf { width:100%; font-family:ui-monospace,monospace; font-size:11px; }

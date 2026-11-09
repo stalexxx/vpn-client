@@ -133,6 +133,59 @@ pub fn uninstall(server: &AwgServer) -> Result<(), String> {
     let mut all = list_servers()?; all.retain(|s| s.id != server.id); save_servers(&all)
 }
 
+
+fn conf_value<'a>(conf: &'a str, key: &str) -> Option<&'a str> {
+    conf.lines().find_map(|l| { let (k, v) = l.split_once('=')?; (k.trim() == key).then(|| v.trim()) })
+}
+
+/// `vpn://…` link understood by the Amnezia app: base64url of Qt's `qCompress` (4-byte big-endian length + zlib)
+/// of the JSON description of an AmneziaWG container.
+pub fn vpn_link(description: &str, conf: &str) -> Result<String, String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use flate2::{write::ZlibEncoder, Compression};
+    let need = |k: &str| conf_value(conf, k).map(str::to_string).ok_or_else(|| format!("В конфиге нет поля {k}"));
+    let (endpoint, address) = (need("Endpoint")?, need("Address")?);
+    let (host, port) = endpoint.rsplit_once(':').ok_or("Некорректный Endpoint")?;
+    let ip = address.split('/').next().unwrap_or_default();
+    let mut details = serde_json::Map::new();
+    for k in ["H1", "H2", "H3", "H4", "Jc", "Jmax", "Jmin", "S1", "S2"] { details.insert(k.into(), need(k)?.into()); }
+    let dns: Vec<&str> = conf_value(conf, "DNS").unwrap_or("1.1.1.1").split(',').map(str::trim).collect();
+    details.insert("client_ip".into(), ip.into());
+    details.insert("client_priv_key".into(), need("PrivateKey")?.into());
+    details.insert("config".into(), conf.into());
+    details.insert("hostName".into(), host.into());
+    details.insert("mtu".into(), "1280".into());
+    details.insert("persistent_keep_alive".into(), "25".into());
+    details.insert("port".into(), port.parse::<u16>().map_err(|_| "Некорректный порт")?.into());
+    details.insert("psk_key".into(), need("PresharedKey")?.into());
+    details.insert("server_pub_key".into(), need("PublicKey")?.into());
+    let mut awg = serde_json::Map::new();
+    for k in ["H1", "H2", "H3", "H4", "Jc", "Jmax", "Jmin", "S1", "S2"] { awg.insert(k.into(), need(k)?.into()); }
+    awg.insert("last_config".into(), serde_json::Value::Object(details).to_string().into());
+    awg.insert("port".into(), port.into());
+    awg.insert("transport_proto".into(), "udp".into());
+    let doc = serde_json::json!({
+        "containers": [{"awg": awg, "container": "amnezia-awg"}],
+        "defaultContainer": "amnezia-awg",
+        "description": description,
+        "dns1": dns.first().copied().unwrap_or("1.1.1.1"),
+        "dns2": dns.get(1).copied().unwrap_or("1.0.0.1"),
+        "hostName": host,
+    });
+    let json = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(&json).map_err(|e| e.to_string())?;
+    let mut out = (json.len() as u32).to_be_bytes().to_vec();
+    out.extend(enc.finish().map_err(|e| e.to_string())?);
+    Ok(format!("vpn://{}", URL_SAFE_NO_PAD.encode(out)))
+}
+
+/// SVG of a QR code carrying `text` (the plain `.conf`, which AmneziaWG clients scan directly).
+pub fn qr_svg(text: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L).map_err(|e| format!("QR: {e}"))?;
+    Ok(code.render::<qrcode::render::svg::Color>().min_dimensions(300, 300).quiet_zone(true).build())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,4 +197,21 @@ mod tests {
         assert_eq!(hex, binary_sha256());
     }
     #[test] fn scripts_are_embedded() { assert!(SETUP.contains("awg0")); assert!(ADD_CLIENT.contains("# client")); assert!(DEL_CLIENT.contains("remove")); }
+    #[test] fn vpn_link_roundtrips_to_the_container_description() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use std::io::Read;
+        let conf = "[Interface]\nPrivateKey = PRIV\nAddress = 10.8.1.2/32\nDNS = 1.1.1.1\nJc = 4\nJmin = 50\nJmax = 1000\nS1 = 94\nS2 = 125\nH1 = 11\nH2 = 22\nH3 = 33\nH4 = 44\n\n[Peer]\nPublicKey = SRVPUB\nPresharedKey = PSK\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 203.0.113.5:47821\nPersistentKeepalive = 25\n";
+        let link = vpn_link("test", conf).unwrap();
+        let raw = URL_SAFE_NO_PAD.decode(link.strip_prefix("vpn://").unwrap()).unwrap();
+        let len = u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
+        let mut json = String::new(); flate2::read::ZlibDecoder::new(&raw[4..]).read_to_string(&mut json).unwrap();
+        assert_eq!(json.len(), len);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["hostName"], "203.0.113.5"); assert_eq!(v["defaultContainer"], "amnezia-awg");
+        let awg = &v["containers"][0]["awg"]; assert_eq!(awg["Jc"], "4"); assert_eq!(awg["port"], "47821");
+        let last: serde_json::Value = serde_json::from_str(awg["last_config"].as_str().unwrap()).unwrap();
+        assert_eq!(last["client_ip"], "10.8.1.2"); assert_eq!(last["server_pub_key"], "SRVPUB"); assert_eq!(last["config"], conf);
+        assert!(vpn_link("x", "[Interface]\n").is_err());
+    }
+    #[test] fn qr_is_an_svg() { assert!(qr_svg("hello").unwrap().contains("<svg")); }
 }

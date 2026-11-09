@@ -1,6 +1,6 @@
 [package]
 name = "vpn-core"
-version = "0.3.26"
+version = "0.3.27"
 edition = "2021"
 
 [dependencies]
@@ -20,6 +20,9 @@ security-framework = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+flate2 = "1"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 sha2 = "0.10"

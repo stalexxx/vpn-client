@@ -61,7 +61,7 @@ let mode = 'off';
     awg_clients: () => [{name:'mac', address:'10.8.1.2'}],
     awg_status: () => 'active\nactive\n---\n  latest handshake: 12 seconds ago\n',
     awg_install: ({name}) => ({id:'a2', name, ssh_target:'root@x', port:41000, server_public_key:'k'}),
-    awg_add_client: ({client}) => ({path:'/Users/me/Downloads/'+client+'.conf', conf:'[Interface]\nPrivateKey = …'}),
+    awg_add_client: ({client}) => ({path:'/Users/me/Downloads/'+client+'.conf', conf:'[Interface]\nPrivateKey = …', link:'vpn://AAAA…', qr_svg:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><rect width="2" height="2"/><rect x="2" y="2" width="2" height="2"/></svg>'}),
     awg_delete_client: () => null, awg_uninstall: () => null, awg_reveal: () => null,
     probe_now: () => null,
     get_exit_ip: () => '203.0.113.7',
