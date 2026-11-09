@@ -193,7 +193,7 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
     if let Some(p) = &password { if !valid_password(p) { return Err("Пароль не должен быть пустым, длиннее 256 символов или содержать переводы строк".into()); } }
     let ssh_key = ssh_key.filter(|k| !k.is_empty());
     // Fail before anything runs if the chosen key is not a usable pair inside ~/.ssh (the key itself is never read).
-    if let Some(name) = &ssh_key { vpn_core::resolve_ssh_key(name)?; }
+    if let Some(name) = ssh_key.as_ref().filter(|n| n.as_str() != vpn_core::SYSTEM_SSH_KEY) { vpn_core::resolve_ssh_key(name)?; }
     let install_key = password.is_some() && install_key.unwrap_or(false);
     {
         let state = app.state::<InstallState>(); let mut p = state.0.lock().map_err(|_| "Состояние установки недоступно")?;

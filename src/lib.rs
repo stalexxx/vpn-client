@@ -82,6 +82,10 @@ pub struct Panel {
 pub const APP_SSH_KEY: &str = "id_ed25519_vpn_client";
 
 /// A key is referred to by file name inside `~/.ssh` only: no separators, no leading dot, not a `.pub`.
+/// Setting value meaning "let ssh decide" (agent, default identities, ~/.ssh/config), like running `ssh` in a terminal.
+pub const SYSTEM_SSH_KEY: &str = "@system";
+/// A stored key setting: a plain key file name or the system marker.
+pub fn valid_ssh_key_setting(name: &str) -> bool { name == SYSTEM_SSH_KEY || valid_ssh_key_name(name) }
 pub fn valid_ssh_key_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && !name.starts_with('.') && !name.contains("..") && !name.ends_with(".pub")
         && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
@@ -155,14 +159,14 @@ fn default_ssh_key_path() -> Result<PathBuf, String> { Ok(compat::data_dir()?.jo
 fn read_default_ssh_key_at(path: &std::path::Path) -> Result<Option<String>, String> {
     let data = match fs::read(path) { Ok(d) => d, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None), Err(e) => return Err(e.to_string()) };
     let value: serde_json::Value = serde_json::from_slice(&data).map_err(|_| "Некорректный файл ключа по умолчанию".to_owned())?;
-    Ok(value["key"].as_str().filter(|k| valid_ssh_key_name(k)).map(str::to_owned))
+    Ok(value["key"].as_str().filter(|k| valid_ssh_key_setting(k)).map(str::to_owned))
 }
 /// Stores `name` (validated against `ssh_dir`: both halves must exist there) or clears the default with `None`.
 fn write_default_ssh_key_at(path: &std::path::Path, ssh_dir: &std::path::Path, name: Option<&str>) -> Result<(), String> {
     let Some(name) = name.filter(|n| !n.is_empty()) else {
         return match fs::remove_file(path) { Ok(()) => Ok(()), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), Err(e) => Err(e.to_string()) };
     };
-    resolve_ssh_key_in(ssh_dir, name)?;
+    if name != SYSTEM_SSH_KEY { resolve_ssh_key_in(ssh_dir, name)?; }
     write_private(path, serde_json::json!({"key": name}).to_string().as_bytes())
 }
 /// App-wide default key name as stored (it may have vanished from `~/.ssh` since).
@@ -170,12 +174,14 @@ pub fn get_default_ssh_key() -> Result<Option<String>, String> { read_default_ss
 pub fn set_default_ssh_key(name: Option<&str>) -> Result<(), String> { write_default_ssh_key_at(&default_ssh_key_path()?, &ssh_dir()?, name) }
 /// The default key only if it is usable now; a stale setting falls back to the automatic behaviour instead of breaking ssh.
 pub fn default_ssh_key() -> Option<String> {
-    get_default_ssh_key().ok().flatten().filter(|name| resolve_ssh_key(name).is_ok())
+    get_default_ssh_key().ok().flatten().filter(|name| name == SYSTEM_SSH_KEY || resolve_ssh_key(name).is_ok())
 }
 /// Adds the identity options for a server: its chosen key, else the app-wide default key (each used exclusively),
 /// else the legacy behaviour (the app key if its private half exists, otherwise ssh's own defaults).
 pub fn apply_ssh_key(ssh: &mut std::process::Command, key: Option<&str>) -> Result<(), String> {
-    let chosen = match key { Some(name) => Some(resolve_ssh_key(name)?), None => default_ssh_key().and_then(|name| resolve_ssh_key(&name).ok()) };
+    let name = match key { Some(name) => Some(name.to_owned()), None => default_ssh_key() };
+    if name.as_deref() == Some(SYSTEM_SSH_KEY) { return Ok(()); }
+    let chosen = match (key, name) { (Some(name), _) => Some(resolve_ssh_key(name)?), (None, Some(name)) => resolve_ssh_key(&name).ok(), (None, None) => None };
     match chosen {
         Some(path) => { ssh.arg("-i").arg(path).args(["-o", "IdentitiesOnly=yes"]); }
         None => if let Ok(dir) = ssh_dir() {
@@ -202,7 +208,7 @@ pub fn validate_panel(panel: &Panel) -> Result<(), String> {
     {
         return Err("URL must not contain credentials, query or fragment".into());
     }
-    if panel.ssh_key.as_deref().is_some_and(|k| !valid_ssh_key_name(k)) { return Err("Некорректное имя SSH-ключа".into()); }
+    if panel.ssh_key.as_deref().is_some_and(|k| !valid_ssh_key_setting(k)) { return Err("Некорректное имя SSH-ключа".into()); }
     if let Some(host) = panel.panel_host.as_deref() {
         if panel.ssh_target.is_none() || !valid_http_host(host) {
             return Err("Invalid panel host".into());
@@ -1742,6 +1748,15 @@ mod tests {
             ssh_key: None
         })
         .is_ok());
+    }
+    #[test]
+    fn system_ssh_setting_adds_no_identity_options() {
+        assert!(valid_ssh_key_setting("@system") && valid_ssh_key_setting("id_rsa") && !valid_ssh_key_setting("@other") && !valid_ssh_key_name("@system"));
+        let mut cmd = std::process::Command::new("ssh");
+        apply_ssh_key(&mut cmd, Some("@system")).unwrap();
+        assert_eq!(cmd.get_args().count(), 0);
+        let panel = Panel { name: "x".into(), url: "https://example.com:2053/".into(), ssh_target: None, panel_host: None, ssh_key: Some("@system".into()) };
+        assert!(validate_panel(&panel).is_ok());
     }
     #[test]
     fn ssh_key_names_are_plain_file_names_and_resolve_only_inside_ssh_dir() {

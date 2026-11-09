@@ -43,7 +43,7 @@ fn save_server(id: Option<String>, name: String, url: String, token: String, ssh
     // Only a newly chosen key must resolve; the one already saved may have vanished from ~/.ssh and must not block a rename.
     if let Some(name) = &ssh_key {
         let unchanged = id.as_deref().and_then(|i| vpn_core::list_servers().ok()?.into_iter().find(|s| s.id == i)).and_then(|s| s.panel.ssh_key).as_deref() == Some(name.as_str());
-        if !unchanged { vpn_core::resolve_ssh_key(name)?; }
+        if !unchanged && name != vpn_core::SYSTEM_SSH_KEY { vpn_core::resolve_ssh_key(name)?; }
     }
     vpn_core::save_server(id, vpn_core::Panel { name, url, ssh_target, panel_host, ssh_key }, &token, country)
 }
