@@ -178,3 +178,12 @@ $('warp-toggle').addEventListener('click',async()=>{
   catch(e){if(selected(id))$('server-status').textContent=`WARP: ${e}`;}
   if(selected(id))await refreshWarp();
 });
+
+// Esc closes the topmost open dialog through its own close/cancel button (so running operations stay protected).
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || e.defaultPrevented) return;
+  const open = [...document.querySelectorAll('.modal')].filter(m => !m.hidden);
+  const top = open[open.length - 1]; if (!top) return;
+  const button = top.querySelector('.close-button'); if (!button || button.disabled) return;
+  e.preventDefault(); button.click();
+});
