@@ -36,7 +36,7 @@ impl Drop for Askpass {
     fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); if let Some(dir) = self.0.parent() { let _ = std::fs::remove_dir(dir); } }
 }
 fn valid_password(password: &str) -> bool { !password.is_empty() && password.len() <= 256 && !password.chars().any(|c| c == '\0' || c == '\n' || c == '\r') }
-/// ssh command for `target`; with a password it authenticates through SSH_ASKPASS and remembers an unknown host key on first use only.
+/// ssh command for `target`; all authentication modes require a previously verified host key.
 /// `key` is the chosen private key name in ~/.ssh; it only applies to key authentication.
 fn ssh_command(password: Option<&str>, askpass: Option<&Askpass>, port: Option<u16>, key: Option<&str>) -> Command {
     let mut ssh = Command::new("/usr/bin/ssh");
@@ -44,7 +44,7 @@ fn ssh_command(password: Option<&str>, askpass: Option<&Askpass>, port: Option<u
     if let Some(port) = port { ssh.args(["-p", &port.to_string()]); }
     match (password, askpass) {
         (Some(password), Some(askpass)) => {
-            ssh.args(["-o", "BatchMode=no", "-o", "StrictHostKeyChecking=accept-new", "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "NumberOfPasswordPrompts=1"])
+            ssh.args(["-o", "BatchMode=no", "-o", "StrictHostKeyChecking=yes", "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "NumberOfPasswordPrompts=1"])
                 .env("SSH_ASKPASS", &askpass.0).env("SSH_ASKPASS_REQUIRE", "force").env("DISPLAY", "vpnclient:0").env("VPN_SSH_PASSWORD", password);
         }
         _ => {
@@ -158,7 +158,8 @@ fn consume(progress: &mut Progress, raw: &str) {
     }
     let lower = line.to_ascii_lowercase();
     let message = if lower.contains("permission denied") { Some("SSH: доступ отклонён; проверьте пароль или ключ и права.") }
-    else if lower.contains("host identification has changed") || lower.contains("host key verification failed") { Some("SSH: ключ сервера изменился (сервер переустановлен?) или отсутствует в known_hosts. Если вы уверены, что это ваш сервер, выполните в терминале: ssh-keygen -R <адрес сервера>") }
+    else if lower.contains("host identification has changed") { Some("SSH: ключ сервера изменился. Сверьте новый отпечаток по независимому каналу, прежде чем обновлять known_hosts.") }
+    else if lower.contains("host key verification failed") || lower.contains("no matching host key") || lower.contains("no ed25519 host key is known") || lower.contains("no ecdsa host key is known") || lower.contains("no rsa host key is known") { Some("SSH: ключ сервера не подтверждён. Сверьте его отпечаток по независимому каналу и добавьте проверенный ключ в known_hosts.") }
     else if lower.contains("connection refused") { Some("SSH: соединение отклонено сервером.") }
     else if lower.contains("could not resolve hostname") { Some("SSH: не удалось определить адрес сервера.") }
     else if lower.contains("connection timed out") { Some("SSH: время соединения истекло.") }
@@ -342,6 +343,8 @@ mod tests {
         let args = |c: &Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
         let with_password = args(&ssh_command(Some("pw"), Some(&askpass), None, Some("work")));
         assert!(!with_password.iter().any(|a| a == "-i" || a == "IdentitiesOnly=yes"));
+        assert!(with_password.iter().any(|a| a == "StrictHostKeyChecking=yes"));
+        assert!(!with_password.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
         assert!(with_password.iter().any(|a| a.starts_with("PreferredAuthentications=password")));
         // An unusable key name adds no identity (it was rejected before the install started) but stays non-interactive.
         let by_key = args(&ssh_command(None, None, Some(2222), Some("../evil")));

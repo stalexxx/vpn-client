@@ -106,7 +106,9 @@ fn start(engine: &Engine, link: &str, relay: Option<&str>) -> Result<String, Str
     if !xray.is_file() { return Err(format!("Не найден {}: переустановите приложение", xray.display())); }
     let api_port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).map_err(|e| e.to_string())?;
     let bypass = vpn_core::read_bypass()?;
-    let config = vpn_core::profile::vless_tun_config_with_options(link, TUN_NAME, relay, verbose(), Some(&vpn_core::profile::ApiListen::Tcp(api_port)), &bypass)?;
+    let mut config = vpn_core::profile::vless_tun_config_with_options(link, TUN_NAME, relay, verbose(), Some(&vpn_core::profile::ApiListen::Tcp(api_port)), &bypass)?;
+    // Windows restarts Xray when switching profiles; its unauthenticated API needs statistics only.
+    config["api"]["services"] = json!(["StatsService"]);
     let config_path = runtime_dir()?.join("config.json");
     fs::write(&config_path, config.to_string()).map_err(|e| format!("Не удалось записать конфигурацию: {e}"))?;
     let assets = resources_dir()?;

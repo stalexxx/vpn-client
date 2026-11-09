@@ -64,7 +64,7 @@ fn ssh_run(target: &str, key: Option<&str>, env: &[(&str, &str)], script: &str, 
         let mut ssh = Command::new("/usr/bin/ssh");
         crate::apply_ssh_key(&mut ssh, key)?;
         if let Some(p) = port { ssh.args(["-p", &p.to_string()]); }
-        ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=25", "-o", "StrictHostKeyChecking=accept-new", "--", dest, remote]);
+        ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=25", "-o", "StrictHostKeyChecking=yes", "--", dest, remote]);
         Ok(ssh)
     };
     if let Some((bytes, remote_path)) = upload {
