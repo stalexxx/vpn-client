@@ -268,7 +268,7 @@ pub fn main() {
             select_mcp_profile, get_mcp_profile, open_admin, import_profiles, list_imported_profiles,
             rename_imported_profile, delete_imported_profile, get_bypass_settings, set_bypass_settings,
             list_geo_lists, get_log_level, set_log_level, vpn_stats,
-            crate::probes::get_probe_results, crate::probes::probe_now,
+            crate::probes::get_probe_results, crate::probes::probe_now, crate::probes::get_exit_ip,
         ])
         .build(tauri::generate_context!())
         .expect("failed to start VPN Client")

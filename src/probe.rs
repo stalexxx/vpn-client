@@ -222,3 +222,10 @@ mod tests {
         assert!(snap.contains_key("a") && !snap.contains_key("b"));
     }
 }
+
+/// Public address the world sees for this machine (goes through the tunnel when it is up).
+pub fn exit_ip() -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(8)).build().map_err(|e| e.to_string())?;
+    let body: serde_json::Value = client.get("https://api.ipify.org?format=json").send().and_then(|r| r.json()).map_err(|e| e.to_string())?;
+    body["ip"].as_str().map(str::to_string).ok_or_else(|| "нет поля ip".to_string())
+}

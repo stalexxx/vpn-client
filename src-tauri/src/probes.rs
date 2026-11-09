@@ -9,3 +9,9 @@ pub fn get_probe_results(probes: tauri::State<'_, ProbeHandle>) -> HashMap<Strin
 /// Run a probe round now instead of waiting for the next scheduled one.
 #[tauri::command]
 pub fn probe_now(probes: tauri::State<'_, ProbeHandle>) { probes.probe_now(); }
+
+/// What api.ipify.org reports (shown under the connected profile).
+#[tauri::command]
+pub async fn get_exit_ip() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(vpn_core::probe::exit_ip).await.map_err(|e| e.to_string())?
+}

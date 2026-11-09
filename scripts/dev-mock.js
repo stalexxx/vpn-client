@@ -58,6 +58,7 @@ let mode = 'off';
     // Latency marks for every visible profile, cycling through fast / medium / slow / no answer / UDP.
     get_probe_results: () => { const all = [...handlers.list_connectable_profiles().map(p => `${p.server_id}:${p.inbound_id}:${p.email}`), ...imported.map(i => `imported:${i.id}`)]; const ts = Math.floor(Date.now()/1000) - 42; const out = {}; all.forEach((k, i) => { const v = [{ms:38},{ms:212},{ms:530},{ms:null,error:'таймаут'},{udp:true}][i % 5]; out[k] = { ms: v.ms ?? null, error: v.error ?? null, ts, udp: !!v.udp }; }); return out; },
     probe_now: () => null,
+    get_exit_ip: () => '203.0.113.7',
     get_vpn_mode: () => mode,
     list_servers: () => servers,
     list_connectable_profiles: () => (readPins(), servers.flatMap(server => profilesFor(server.id).filter(p => usable(p) && (pinnedProfiles === null || pinnedProfiles.some(k=>sameKey(k,{server_id:server.id,inbound_id:p.inbound_id,email:p.email})))).map(p => ({...p, server_id:server.id, server_name:server.name, country:server.country})))),

@@ -102,6 +102,14 @@ async function connectSelected(p) {
   $('connection-message').textContent = mode==='tun' ? 'Переключаем профиль…' : 'Подключаем TUN…';
   const result=p.imported ? await invoke('connect_imported_profile',{id:p.imported_id}) : await invoke('connect_profile',{serverId:p.server_id,inboundId:p.inbound_id,email:p.email});
   mode='tun'; connectedKey=key(p); $('connection-error').hidden=true; $('connection-message').textContent=result;
+  showExitIp();
+}
+async function showExitIp() {
+  const el=$('exit-ip'); el.hidden=false; el.textContent='Внешний IP: проверяем…';
+  for (let i=0;i<3;i++) {
+    try { const ip=await invoke('get_exit_ip'); if(mode==='tun') el.textContent=`Внешний IP (ipify): ${ip}`; return; } catch(e) { if(mode!=='tun') break; await new Promise(r=>setTimeout(r,1500)); }
+  }
+  el.textContent='Внешний IP: не удалось получить';
 }
 async function switchProfile() {
   const p=profiles.find(item=>key(item)===selectedProfileKey);
@@ -113,12 +121,12 @@ async function switchProfile() {
 }
 $('vpn-toggle').addEventListener('click',async()=>{
   if(busy)return; busy=true; connectionState(mode); $('connection-error').hidden=true;
-  try { if(mode!=='off') { await invoke('xray_stop'); mode='off'; connectedKey=null; $('connection-error').hidden=true; $('connection-message').textContent='VPN отключён.'; } else { const p=profiles.find(item=>key(item)===selectedProfileKey); if(!canConnect(p)) return; await connectSelected(p); } }
+  try { if(mode!=='off') { await invoke('xray_stop'); mode='off'; connectedKey=null; $('exit-ip').hidden=true; $('connection-error').hidden=true; $('connection-message').textContent='VPN отключён.'; } else { const p=profiles.find(item=>key(item)===selectedProfileKey); if(!canConnect(p)) return; await connectSelected(p); } }
   catch(e) { mode=await invoke('get_vpn_mode').catch(()=>'off'); if(mode==='off') connectedKey=null; $('connection-error').textContent=`Не удалось выполнить действие: ${e}`; $('connection-error').hidden=false; }
   finally { busy=false; connectionState(mode); }
 });
 invoke('build_info').then(value=>$('build-info').textContent=value).catch(()=>$('build-info').textContent='Версия неизвестна');
-invoke('get_vpn_mode').then(connectionState).catch(()=>connectionState('off'));
+invoke('get_vpn_mode').then(m=>{connectionState(m); if(m==='tun') showExitIp();}).catch(()=>connectionState('off'));
 loadProfiles();
 pollProbes();
 

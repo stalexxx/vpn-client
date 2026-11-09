@@ -242,7 +242,8 @@ pub fn main() {
             set_profile_pinned,
             open_admin,
             crate::probes::get_probe_results,
-            crate::probes::probe_now
+            crate::probes::probe_now,
+            crate::probes::get_exit_ip
             ,control::select_mcp_profile
             ,control::get_mcp_profile
         ])
