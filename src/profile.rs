@@ -15,12 +15,22 @@ pub fn vless_config(link: &str, socks_port: u16) -> Result<Value, String> {
 }
 
 /// A loopback SOCKS5 proxy as the VPN outbound. The helper runs the embedded AmneziaWG client (`awgsocks`) on that
-/// address and hands Xray this link instead of the `awg://` one.
+/// address and hands Xray this link instead of the `awg://` one. `socks5://user:pass@127.0.0.1:port` adds the
+/// per-run credentials of that client (flat `user`/`pass` outbound settings, checked against Xray 26.10.21).
 pub fn socks5_config(url: &Url, socks_port: u16) -> Result<Value, String> {
     let host = url.host_str().ok_or("Missing SOCKS address")?;
     let port = url.port().ok_or("Missing SOCKS port")?;
     if host != "127.0.0.1" || port == 0 || socks_port == 0 { return Err("Only a loopback SOCKS proxy is supported".into()); }
-    Ok(json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":socks_port,"protocol":"socks","settings":{"udp":true}}],"outbounds":[{"protocol":"socks","settings":{"address":host,"port":port}}]}))
+    let decode = |v: &str| percent_encoding::percent_decode_str(v).decode_utf8().map(|v| v.into_owned()).map_err(|_| "Invalid SOCKS credentials".to_owned());
+    let (user, pass) = (decode(url.username())?, decode(url.password().unwrap_or(""))?);
+    let mut settings = json!({"address":host,"port":port});
+    if !user.is_empty() || !pass.is_empty() {
+        // RFC 1929 needs both fields, 1..=255 bytes each.
+        if user.is_empty() || pass.is_empty() || user.len() > 255 || pass.len() > 255 { return Err("Invalid SOCKS credentials".into()); }
+        settings["user"] = json!(user);
+        settings["pass"] = json!(pass);
+    }
+    Ok(json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":socks_port,"protocol":"socks","settings":{"udp":true}}],"outbounds":[{"protocol":"socks","settings":settings}]}))
 }
 
 /// Translate a Hysteria 2 share link into an Xray client configuration.
@@ -527,5 +537,21 @@ mod socks_tests {
         assert_eq!((out["tag"].as_str(), out["protocol"].as_str(), out["settings"]["port"].as_u64()), (Some("vpn-out"), Some("socks"), Some(19999)));
         assert!(vless_config("socks5://10.0.0.1:1080", 10808).is_err(), "only loopback is allowed");
         assert!(vless_config("socks5://127.0.0.1", 10808).is_err());
+    }
+    #[test]
+    fn socks_link_without_credentials_has_no_user_in_the_outbound() {
+        let config = vless_config("socks5://127.0.0.1:19999", 10808).unwrap();
+        assert_eq!(config["outbounds"][0]["settings"], json!({"address":"127.0.0.1","port":19999}));
+    }
+    #[test]
+    fn socks_link_credentials_go_into_the_outbound() {
+        let config = vless_config("socks5://0011aabb:ccdd%40eeff@127.0.0.1:19999", 10808).unwrap();
+        assert_eq!(config["outbounds"][0]["settings"], json!({"address":"127.0.0.1","port":19999,"user":"0011aabb","pass":"ccdd@eeff"}));
+        let tun = vless_tun_config_with_options("socks5://u:p@127.0.0.1:19999", "utun10", None, false, Some(18000), &Bypass::default()).unwrap();
+        assert_eq!((tun["outbounds"][0]["tag"].as_str(), tun["outbounds"][0]["settings"]["user"].as_str(), tun["outbounds"][0]["settings"]["pass"].as_str()), (Some("vpn-out"), Some("u"), Some("p")));
+        assert!(vless_config("socks5://u:p@10.0.0.1:1080", 10808).is_err(), "credentials do not lift the loopback restriction");
+        assert!(vless_config("socks5://u:p@localhost:1080", 10808).is_err());
+        assert!(vless_config("socks5://u@127.0.0.1:1080", 10808).is_err(), "user without password");
+        assert!(vless_config("socks5://:p@127.0.0.1:1080", 10808).is_err(), "password without user");
     }
 }

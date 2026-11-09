@@ -275,7 +275,52 @@ fn verify_tunnel_connectivity(tun: &str) -> Result<(), String> {
         }
     }
 }
-struct AwgProc { child: Child, port: u16 }
+/// A running embedded AmneziaWG client: its loopback SOCKS port and the credentials generated for this run.
+struct AwgProc { child: Child, port: u16, user: String, pass: String }
+impl AwgProc { fn link(&self) -> String { socks_link(&self.user, &self.pass, self.port) } }
+const AWG_LOG_MAX: u64 = 1024 * 1024;
+const AWG_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The only line the client prints to stdout: `READY <port>`, the port it actually listens on.
+fn parse_ready_line(line: &str) -> Option<u16> {
+    line.trim_end_matches(['\r', '\n']).strip_prefix("READY ")?.parse::<u16>().ok().filter(|p| *p != 0)
+}
+fn hex_string(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+/// Random SOCKS login and password for one client run (16 bytes each, hex).
+fn random_socks_credentials() -> Result<(String, String), String> {
+    let mut raw = [0u8; 32];
+    vpn_core::compat::random_bytes(&mut raw)?;
+    Ok((hex_string(&raw[..16]), hex_string(&raw[16..])))
+}
+/// Opens a log for appending (a previous client may still be writing to it); one grown past `max` is emptied first.
+fn open_append_log(path: &Path, max: u64) -> Result<fs::File, String> {
+    if fs::metadata(path).is_ok_and(|m| m.len() > max) { OpenOptions::new().write(true).truncate(true).open(path).map_err(|e| e.to_string())?; }
+    OpenOptions::new().append(true).create(true).mode(0o600).open(path).map_err(|e| e.to_string())
+}
+/// Waits for the `READY <port>` line on the client's stdout: fails when the client exits, prints something else or
+/// stays silent for `timeout`.
+fn wait_ready(child: &mut Child, stdout: impl Read + Send + 'static, timeout: Duration) -> Result<u16, String> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || { let mut line = String::new(); let _ = BufReader::new(stdout.take(64)).read_line(&mut line); let _ = sender.send(line); });
+    let deadline = Instant::now() + timeout;
+    let exited = |status: std::process::ExitStatus| {
+        let log = fs::read_to_string(root_path("awg.log")).unwrap_or_default();
+        format!("Клиент AmneziaWG завершился ({status}): {}", log.lines().last().unwrap_or("нет сообщения"))
+    };
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => return match parse_ready_line(&line) {
+                Some(port) => Ok(port),
+                // EOF without the line: the client is exiting; give it a moment so that its message can be reported.
+                None if line.is_empty() => { thread::sleep(Duration::from_millis(200)); Err(child.try_wait().ok().flatten().map(exited).unwrap_or_else(|| "Клиент AmneziaWG не сообщил порт".to_owned())) }
+                None => Err("Клиент AmneziaWG вернул неожиданный ответ".to_owned()),
+            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("Клиент AmneziaWG не сообщил порт".to_owned()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if let Ok(Some(status)) = child.try_wait() { return Err(exited(status)); }
+        if Instant::now() >= deadline { return Err("Клиент AmneziaWG не запустился за 10 секунд".to_owned()); }
+    }
+}
 static AWG_ACTIVE: Mutex<Option<AwgProc>> = Mutex::new(None);
 /// Physical interface seen before the tunnel came up (the default route points into the TUN afterwards).
 static PHYS_IFACE: Mutex<Option<String>> = Mutex::new(None);
@@ -304,27 +349,17 @@ fn kill_awg() {
 fn spawn_awg(link: &str) -> Result<AwgProc, String> {
     let conf = vpn_core::awglink::link_to_conf(link)?;
     let iface = remember_physical_interface()?;
-    let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).map_err(|e| e.to_string())?;
-    let conf_path = root_path(&format!("awg-{port}.conf"));
-    write_secure(&conf_path, conf.as_bytes())?;
-    let log = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(root_path("awg.log")).map_err(|e| e.to_string())?;
-    let log_err = log.try_clone().map_err(|e| e.to_string())?;
-    let spawned = Command::new(AWG_BIN).arg(&conf_path).arg(format!("127.0.0.1:{port}")).env("AWG_BIND_IFACE", &iface)
-        .stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log_err)).spawn();
-    let mut child = match spawned { Ok(c) => c, Err(e) => { let _ = fs::remove_file(&conf_path); return Err(format!("Не удалось запустить клиент AmneziaWG: {e}")); } };
-    let result = (|| {
-        for _ in 0..100 {
-            if let Ok(Some(status)) = child.try_wait() {
-                let log = fs::read_to_string(root_path("awg.log")).unwrap_or_default();
-                return Err(format!("Клиент AmneziaWG завершился ({status}): {}", log.lines().last().unwrap_or("нет сообщения")));
-            }
-            if TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(100)).is_ok() { return Ok(()); }
-            thread::sleep(Duration::from_millis(100));
-        }
-        Err("Клиент AmneziaWG не запустился за 10 секунд".to_owned())
-    })();
-    let _ = fs::remove_file(&conf_path); // the client has read it; the private key must not stay on disk
-    match result { Ok(()) => Ok(AwgProc { child, port }), Err(e) => { let _ = terminate_child(&mut child); Err(e) } }
+    let (user, pass) = random_socks_credentials()?;
+    let log = open_append_log(&root_path("awg.log"), AWG_LOG_MAX)?;
+    // The client picks the port itself (no bind-and-release race) and gets the configuration over stdin, so the
+    // private key never reaches the disk; the SOCKS credentials keep other local processes out of the proxy.
+    let mut child = Command::new(AWG_BIN).arg("-").arg("127.0.0.1:0").env("AWG_BIND_IFACE", &iface).env("AWG_SOCKS_USER", &user).env("AWG_SOCKS_PASS", &pass)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(log)).spawn().map_err(|e| format!("Не удалось запустить клиент AmneziaWG: {e}"))?;
+    // Dropping the handle closes stdin: the client reads the configuration until EOF. A failed write means it is
+    // already gone, which `wait_ready` reports with its last log line.
+    if let Some(mut stdin) = child.stdin.take() { let _ = stdin.write_all(conf.as_bytes()); }
+    let result = match child.stdout.take() { Some(stdout) => wait_ready(&mut child, stdout, AWG_READY_TIMEOUT), None => Err("Не удалось запустить клиент AmneziaWG".to_owned()) };
+    match result { Ok(port) => Ok(AwgProc { child, port, user, pass }), Err(e) => { let _ = terminate_child(&mut child); Err(e) } }
 }
 /// Makes `new` the active client and stops the previous one.
 fn commit_awg(new: AwgProc) {
@@ -332,8 +367,8 @@ fn commit_awg(new: AwgProc) {
     let old = AWG_ACTIVE.lock().ok().and_then(|mut g| g.replace(new));
     if let Some(mut o) = old { let _ = terminate_child(&mut o.child); }
 }
-fn active_awg_port() -> Option<u16> { AWG_ACTIVE.lock().ok().and_then(|g| g.as_ref().map(|a| a.port)) }
-fn socks_link(port: u16) -> String { format!("socks5://127.0.0.1:{port}") }
+fn active_awg_link() -> Option<String> { AWG_ACTIVE.lock().ok().and_then(|g| g.as_ref().map(AwgProc::link)) }
+fn socks_link(user: &str, pass: &str, port: u16) -> String { format!("socks5://{user}:{pass}@127.0.0.1:{port}") }
 fn tunnel_running(state: &HelperState) -> bool {
     state.active.as_ref().is_some_and(|t| process_matches(&t.record)) || read_record().ok().flatten().is_some_and(|r| process_matches(&r))
 }
@@ -343,9 +378,9 @@ fn start(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: 
     if !link.starts_with(vpn_core::awglink::SCHEME) { return start_tunnel(state, link, relay_link, bypass, hot); }
     kill_awg();
     let awg = spawn_awg(link)?;
-    let port = awg.port;
+    let socks = awg.link();
     commit_awg(awg);
-    match start_tunnel(state, &socks_link(port), None, bypass, hot) { Ok(m) => Ok(m), Err(e) => { kill_awg(); Err(e) } }
+    match start_tunnel(state, &socks, None, bypass, hot) { Ok(m) => Ok(m), Err(e) => { kill_awg(); Err(e) } }
 }
 /// `hot`: DNS is already pinned by the previous tunnel (kept by `stop(.., true)`), so it is neither restored nor re-journaled.
 fn start_tunnel(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: &vpn_core::profile::Bypass, hot: bool) -> Result<String, String> {
@@ -541,8 +576,8 @@ fn hot_switch(state: &HelperState, link: &str, relay_link: Option<&str>, bypass:
     let Ok(Some(record)) = read_record() else { return HotSwitch::NotApplicable("нет записи о процессе".into()) };
     // AmneziaWG profiles are SOCKS outbounds to a local client: start the new one beside the old one first.
     let new_awg = if link.starts_with(vpn_core::awglink::SCHEME) { match spawn_awg(link) { Ok(a) => Some(a), Err(e) => return HotSwitch::NotApplicable(e) } } else { None };
-    let new_eff = new_awg.as_ref().map(|a| socks_link(a.port)).unwrap_or_else(|| link.to_owned());
-    let old_eff = if old_link.starts_with(vpn_core::awglink::SCHEME) { match active_awg_port() { Some(p) => socks_link(p), None => return HotSwitch::NotApplicable("клиент AmneziaWG не найден".into()) } } else { old_link.clone() };
+    let new_eff = new_awg.as_ref().map(AwgProc::link).unwrap_or_else(|| link.to_owned());
+    let old_eff = if old_link.starts_with(vpn_core::awglink::SCHEME) { match active_awg_link() { Some(l) => l, None => return HotSwitch::NotApplicable("клиент AmneziaWG не найден".into()) } } else { old_link.clone() };
     let (Ok(new), Ok(old)) = (vpn_outbounds(&record.tun_name, &new_eff, if new_awg.is_some() { None } else { relay_link }, bypass, port), vpn_outbounds(&record.tun_name, &old_eff, if old_link.starts_with(vpn_core::awglink::SCHEME) { None } else { old_relay.as_deref() }, &old_bypass, port)) else {
         if let Some(mut a) = new_awg { let _ = terminate_child(&mut a.child); }
         return HotSwitch::NotApplicable("не удалось собрать outbound".into());
@@ -701,6 +736,60 @@ fn reap_exited_process(state: &mut HelperState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_line_carries_the_port() {
+        assert_eq!(parse_ready_line("READY 50123\n"), Some(50123));
+        assert_eq!(parse_ready_line("READY 50123"), Some(50123));
+        for bad in ["", "READY", "READY \n", "READY 0\n", "READY 70000\n", "READY 12 34\n", "ready 5000\n", " READY 5000\n", "READY -1\n", "2026/01/01 config: bad key\n"] { assert_eq!(parse_ready_line(bad), None, "{bad:?}"); }
+    }
+
+    #[test]
+    fn socks_link_carries_credentials_that_reach_the_xray_outbound() {
+        let (user, pass) = random_socks_credentials().unwrap();
+        let (user2, pass2) = random_socks_credentials().unwrap();
+        for v in [&user, &pass, &user2, &pass2] { assert!(v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit()), "{v}"); }
+        assert!(user != pass && user != user2 && pass != pass2);
+        assert_eq!(socks_link("ab", "cd", 4242), "socks5://ab:cd@127.0.0.1:4242");
+        let config = vpn_core::profile::vless_config(&socks_link(&user, &pass, 4242), 10808).unwrap();
+        assert_eq!(config["outbounds"][0]["settings"], serde_json::json!({"address":"127.0.0.1","port":4242,"user":user,"pass":pass}));
+    }
+
+    #[test]
+    fn client_log_is_appended_and_emptied_only_when_too_large() {
+        let path = std::env::temp_dir().join(format!("vpn-helper-awg-log-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        open_append_log(&path, 10).unwrap().write_all(b"first\n").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let mut still_open = open_append_log(&path, 10).unwrap();
+        still_open.write_all(b"more\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\nmore\n", "a log under the limit is kept");
+        open_append_log(&path, 10).unwrap().write_all(b"new\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n", "a log over the limit is emptied");
+        still_open.write_all(b"old client\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\nold client\n", "a writer that is still running appends after the reset");
+        let _ = fs::remove_file(&path);
+    }
+
+    fn sh(script: &str) -> Child { Command::new("/bin/sh").args(["-c", script]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap() }
+    fn ready_of(script: &str, timeout: Duration) -> Result<u16, String> {
+        let mut child = sh(script);
+        let stdout = child.stdout.take().unwrap();
+        let result = wait_ready(&mut child, stdout, timeout);
+        let _ = child.kill();
+        let _ = child.wait();
+        result
+    }
+
+    #[test]
+    fn ready_port_is_read_from_the_client_stdout() {
+        assert_eq!(ready_of("echo 'READY 4242'; exec sleep 5", Duration::from_secs(5)), Ok(4242));
+        assert!(ready_of("exit 3", Duration::from_secs(5)).unwrap_err().contains("завершился"));
+        assert!(ready_of("echo hello; exec sleep 5", Duration::from_secs(5)).unwrap_err().contains("неожиданный"));
+        let started = Instant::now();
+        assert!(ready_of("exec sleep 5", Duration::from_millis(300)).unwrap_err().contains("не запустился"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     #[test]
     fn stats_sum_direct_and_vpn_outbounds_only() {

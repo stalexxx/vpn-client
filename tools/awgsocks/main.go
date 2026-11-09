@@ -1,12 +1,17 @@
 // awgsocks: AmneziaWG client in userspace (netstack) exposed as a local SOCKS5 proxy (TCP CONNECT + UDP ASSOCIATE).
 // Xray uses it as the "vpn-out" outbound, so routing rules, hot switching, DNS pinning and stats keep working.
-// Usage: awgsocks <wg.conf> <listen host:port>
+// Usage: awgsocks <wg.conf | -> <listen host:port>
+// "-" reads the configuration from stdin until EOF, so the private key never has to touch the disk.
+// Port 0 picks a free port; once listening, exactly one line "READY <port>" is printed to stdout.
+// AWG_SOCKS_USER / AWG_SOCKS_PASS: when set, SOCKS5 username/password authentication (RFC 1929) is mandatory.
 // Built inside the amneziawg-go module (cmd/awgsocks) so it uses the same device/netstack packages.
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -42,12 +47,7 @@ type conf struct {
 	uapi  string
 }
 
-func parseConf(path string) (*conf, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+func parseConf(f io.Reader) (*conf, error) {
 	c := &conf{mtu: 1280}
 	var iface, peer strings.Builder
 	section := ""
@@ -128,15 +128,46 @@ func parseConf(path string) (*conf, error) {
 	if len(c.dns) == 0 {
 		c.dns = []netip.Addr{netip.MustParseAddr("1.1.1.1")}
 	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
 	c.uapi = iface.String() + peer.String()
 	return c, nil
 }
 
+// creds are the SOCKS5 credentials; nil means the proxy is open (no authentication).
+type creds struct{ user, pass [sha256.Size]byte }
+
+func newCreds(user, pass string) *creds {
+	if user == "" && pass == "" {
+		return nil
+	}
+	return &creds{sha256.Sum256([]byte(user)), sha256.Sum256([]byte(pass))}
+}
+
+// check compares in constant time; hashing first keeps the comparison independent of the lengths too.
+func (a *creds) check(user, pass []byte) bool {
+	u, p := sha256.Sum256(user), sha256.Sum256(pass)
+	return subtle.ConstantTimeCompare(u[:], a.user[:])&subtle.ConstantTimeCompare(p[:], a.pass[:]) == 1
+}
+
 func main() {
 	if len(os.Args) != 3 {
-		log.Fatal("usage: awgsocks <wg.conf> <host:port>")
+		log.Fatal("usage: awgsocks <wg.conf | -> <host:port>")
 	}
-	c, err := parseConf(os.Args[1])
+	auth := newCreds(os.Getenv("AWG_SOCKS_USER"), os.Getenv("AWG_SOCKS_PASS"))
+	os.Unsetenv("AWG_SOCKS_USER")
+	os.Unsetenv("AWG_SOCKS_PASS")
+	var in io.Reader = os.Stdin
+	if os.Args[1] != "-" {
+		f, err := os.Open(os.Args[1])
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		defer f.Close()
+		in = f
+	}
+	c, err := parseConf(in)
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
@@ -155,13 +186,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("READY")
+	fmt.Printf("READY %d\n", ln.Addr().(*net.TCPAddr).Port)
+	os.Stdout.Close() // nothing else is ever written there
 	for {
 		cn, err := ln.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
-		go serve(cn, tnet, ln.Addr().(*net.TCPAddr).IP)
+		go serve(cn, tnet, ln.Addr().(*net.TCPAddr).IP, auth)
 	}
 }
 
@@ -212,17 +244,58 @@ func reply(c net.Conn, code byte, addr net.Addr) {
 	c.Write(b)
 }
 
-func serve(c net.Conn, tnet *netstack.Net, bindIP net.IP) {
-	defer c.Close()
-	c.SetDeadline(time.Now().Add(15 * time.Second))
+// negotiate runs the SOCKS5 method selection (RFC 1928) and, with credentials configured, the username/password
+// sub-negotiation (RFC 1929). It answers a refusal itself; the caller just closes the connection on false.
+func negotiate(c io.ReadWriter, auth *creds) bool {
 	h := make([]byte, 2)
 	if _, err := io.ReadFull(c, h); err != nil || h[0] != 5 {
+		return false
+	}
+	methods := make([]byte, h[1])
+	if _, err := io.ReadFull(c, methods); err != nil {
+		return false
+	}
+	want := byte(0)
+	if auth != nil {
+		want = 2
+	}
+	if !strings.Contains(string(methods), string([]byte{want})) {
+		c.Write([]byte{5, 0xff})
+		return false
+	}
+	c.Write([]byte{5, want})
+	if auth == nil {
+		return true
+	}
+	if _, err := io.ReadFull(c, h); err != nil || h[0] != 1 {
+		return false
+	}
+	user := make([]byte, h[1])
+	if _, err := io.ReadFull(c, user); err != nil {
+		return false
+	}
+	l := make([]byte, 1)
+	if _, err := io.ReadFull(c, l); err != nil {
+		return false
+	}
+	pass := make([]byte, l[0])
+	if _, err := io.ReadFull(c, pass); err != nil {
+		return false
+	}
+	if !auth.check(user, pass) {
+		c.Write([]byte{1, 1})
+		return false
+	}
+	c.Write([]byte{1, 0})
+	return true
+}
+
+func serve(c net.Conn, tnet *netstack.Net, bindIP net.IP, auth *creds) {
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(15 * time.Second))
+	if !negotiate(c, auth) {
 		return
 	}
-	if _, err := io.CopyN(io.Discard, c, int64(h[1])); err != nil {
-		return
-	}
-	c.Write([]byte{5, 0})
 	q := make([]byte, 4)
 	if _, err := io.ReadFull(c, q); err != nil {
 		return
