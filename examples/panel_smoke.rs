@@ -18,6 +18,7 @@ fn main() -> Result<(), String> {
         url: args[1].clone(),
         ssh_target: Some(args[2].clone()),
         panel_host: Some(args[3].clone()),
+        ssh_key: None,
     };
     let inbounds = vpn_core::list_inbounds_for(&panel, token)?;
     println!(

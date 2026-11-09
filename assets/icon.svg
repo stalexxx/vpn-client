@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/><stop offset="1" stop-color="#1e3a8a"/>
+    </linearGradient>
+    <linearGradient id="sh" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#dbeafe"/>
+    </linearGradient>
+    <filter id="drop" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#0b1b4d" flood-opacity=".45"/>
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="none" stroke="#ffffff" stroke-opacity=".18" stroke-width="4"/>
+  <path filter="url(#drop)" fill="url(#sh)" d="M512 232 L737 316 V510 C737 649 647 746 512 800 C377 746 287 649 287 510 V316 Z"/>
+  <g fill="#1e40af">
+    <rect x="426" y="494" width="172" height="128" rx="24"/>
+    <path d="M458 494 V464 a54 54 0 0 1 108 0 V494 h-30 V464 a24 24 0 0 0 -48 0 V494 Z"/>
+  </g>
+  <circle cx="512" cy="548" r="18" fill="#dbeafe"/>
+  <rect x="504" y="552" width="16" height="42" rx="8" fill="#dbeafe"/>
+</svg>

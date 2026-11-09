@@ -8,3 +8,6 @@
 .checkline{display:flex;align-items:center;gap:8px;font-weight:500}.checkline input{width:auto;margin:0}
 .dialog label.checkline{display:flex;flex-direction:row;align-items:center;gap:8px;font-weight:500}.dialog label.checkline input{width:auto;flex:none}
 .inbound-item .danger{font-size:11px;padding:6px 10px;flex:none}
+
+.warp-box{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 14px;margin:0 0 14px;border:1px solid #dce2dd;border-radius:10px;background:#fff}.warp-box p{margin:3px 0 0;font-size:12px;line-height:1.4}.warp-box button{flex:none}
+.side-settings{margin-top:auto;width:100%}

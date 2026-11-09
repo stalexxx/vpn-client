@@ -12,6 +12,7 @@
   ];
   const wizardTokens = new Map(), wizardInboundMap = new Map(), wizardProfileMap = new Map();
   const savedInboundMap = new Map(), savedProfileMap = new Map();
+  const warpState = new Set();
   let wizardSequence = 1, inboundSequence = 10;
   const defaultInbounds = id => [
     {id: 1, remark: 'xhttp-443', port: 443, protocol: 'vless', enable: true, transport: 'xhttp'},
@@ -54,6 +55,9 @@ let mode = 'off';
     set_log_level: ({ verbose }) => { logLevel = verbose ? 'info' : 'warning'; return 'ok'; },
     get_bypass_settings: () => bypassState,
     set_bypass_settings: ({ bittorrent, entries }) => { if (entries.some(e => /\s/.test(e))) throw 'Не похоже на домен, IP или подсеть: ' + entries[0]; bypassState = { bittorrent, entries }; return bypassState; },
+    // Latency marks for every visible profile, cycling through fast / medium / slow / no answer / UDP.
+    get_probe_results: () => { const all = [...handlers.list_connectable_profiles().map(p => `${p.server_id}:${p.inbound_id}:${p.email}`), ...imported.map(i => `imported:${i.id}`)]; const ts = Math.floor(Date.now()/1000) - 42; const out = {}; all.forEach((k, i) => { const v = [{ms:38},{ms:212},{ms:530},{ms:null,error:'таймаут'},{udp:true}][i % 5]; out[k] = { ms: v.ms ?? null, error: v.error ?? null, ts, udp: !!v.udp }; }); return out; },
+    probe_now: () => null,
     get_vpn_mode: () => mode,
     list_servers: () => servers,
     list_connectable_profiles: () => (readPins(), servers.flatMap(server => profilesFor(server.id).filter(p => usable(p) && (pinnedProfiles === null || pinnedProfiles.some(k=>sameKey(k,{server_id:server.id,inbound_id:p.inbound_id,email:p.email})))).map(p => ({...p, server_id:server.id, server_name:server.name, country:server.country})))),
@@ -82,11 +86,21 @@ let mode = 'off';
     connect_imported_profile: async ({id}) => { if (!imported.some(i => i.id === id)) throw 'Конфигурация не найдена'; if (fail('connect_profile')) throw 'VPN запущен, но трафик через сервер не проходит: DNS и TCP недоступны.'; await delay(800); mode = 'tun'; return 'VPN подключён (mock, импорт)'; },
     open_admin: () => null,
     panel_hostname: ({url}) => { try { return new URL(url).hostname; } catch { throw 'Некорректный адрес панели'; } },
-    save_server: ({id, name, url, country, sshTarget, panelHost, token}) => {
+    list_ssh_keys: () => [
+      {name: 'id_ed25519_vpn_client', kind: 'ed25519', comment: 'me@mac', app_key: true},
+      {name: 'id_rsa', kind: 'rsa', comment: 'work@laptop', app_key: false},
+    ],
+    list_orphan_ssh_pubs: () => ['id_old_laptop'],
+    get_default_ssh_key: () => window.__mockDefaultSshKey || null,
+    set_default_ssh_key: ({key}) => {
+      if (key && !['id_ed25519_vpn_client', 'id_rsa'].includes(key)) throw `SSH-ключ ${key} не найден в ~/.ssh`;
+      window.__mockDefaultSshKey = key || null;
+    },
+    save_server: ({id, name, url, country, sshTarget, panelHost, token, sshKey}) => {
       if (fail('save_server')) throw 'Не удалось сохранить сервер';
       if (id && !servers.some(server => server.id === id)) throw 'Сервер не найден';
       if (!id && !token?.trim()) throw 'Укажите API-токен';
-      const saved = {id: id || 'd'.repeat(32), name, url, country: country || null, ssh_target: sshTarget || null, panel_host: panelHost || null};
+      const saved = {id: id || 'd'.repeat(32), name, url, country: country || null, ssh_target: sshTarget || null, panel_host: panelHost || null, ssh_key: sshKey || null};
       const index = servers.findIndex(server => server.id === saved.id);
       if (index < 0) servers.push(saved); else servers[index] = saved;
       return saved;
@@ -116,7 +130,7 @@ let mode = 'off';
     wizard_client_qr: () => { if (fail('wizard_client_qr')) throw 'Не удалось получить ссылку клиента (mock)'; const size=25; return {link:'vless://mock-wizard-profile',size,pixels:Array.from({length:size*size},(_,i)=>((i*7+(i>>3))%3)===0)}; },
     save_wizard_server: ({wizardId, panel, country}) => {
       if (fail('save_wizard_server')) throw 'Не удалось сохранить сервер (mock)';
-      const saved={id:wizardId,name:panel.name,url:panel.url,ssh_target:panel.ssh_target,panel_host:panel.panel_host,country:country||null};
+      const saved={id:wizardId,name:panel.name,url:panel.url,ssh_target:panel.ssh_target,panel_host:panel.panel_host,ssh_key:panel.ssh_key||null,country:country||null};
       servers.push(saved); savedInboundMap.set(saved.id,wizardInboundMap.get(wizardId)||[]); savedProfileMap.set(saved.id,wizardProfileMap.get(wizardId)||[]); wizardTokens.delete(wizardId); return saved;
     },
     cached_server_inbounds: ({serverId}) => inbounds(serverId),
@@ -124,22 +138,28 @@ let mode = 'off';
     list_client_profiles: ({serverId}) => profilesFor(serverId),
     refresh_client_profiles: ({serverId}) => profilesFor(serverId),
     list_geo_lists: () => ({geoip:['cn','ir','private','ru','ua','us'], geosite:['category-bank-ru','category-ecommerce-ru','category-gov-ru','category-ru','google','netflix','telegram','tld-ru','tld-cn','youtube']}),
+    server_warp_status: ({serverId}) => warpState.has(serverId),
+    enable_server_warp: async ({serverId}) => { await new Promise(r=>setTimeout(r,600)); if(window.__warpFail) throw new Error('Панель не зарегистрировала WARP'); warpState.add(serverId); return 'WARP включён на сервере (мок)'; },
+    disable_server_warp: async ({serverId}) => { await new Promise(r=>setTimeout(r,600)); warpState.delete(serverId); return 'WARP отключён на сервере (мок)'; },
     delete_inbound: ({serverId,inboundId}) => { const list=inbounds(serverId); const clients=profilesFor(serverId); savedProfileMap.set(serverId,clients); const index=list.findIndex(i=>i.id===inboundId); if(index<0) throw 'Inbound не найден (mock)'; const [gone]=list.splice(index,1); savedInboundMap.set(serverId,list); for(let n=clients.length-1;n>=0;n--) if(clients[n].inbound_id===inboundId) clients.splice(n,1); savedProfileMap.set(serverId,clients); return `Удалён inbound ${inboundId} (${gone.remark}) (mock)`; },
     create_client: ({email}) => `Клиент ${email} создан (mock)`,
     client_qr: () => { const size = 25; return {link: 'vless://mock', size, pixels: Array.from({length: size * size}, (_, i) => ((i * 7 + (i >> 3)) % 3) === 0)}; },
     connect_profile: async () => { if (fail('connect_profile')) throw 'VPN запущен, но трафик через сервер не проходит: DNS и TCP недоступны.'; await delay(1200); mode = 'tun'; return 'VPN подключён через utun10 (mock)'; },
     xray_stop: () => { mode = 'off'; return null; },
     // Like the real command, resolves only when the installation has finished; the page polls install_progress meanwhile.
-    install_panel: async ({target, password, installKey}) => {
+    install_panel: async ({target, password, installKey, sshKey}) => {
       if (password !== undefined && password !== null && !password) throw 'Пароль не должен быть пустым';
-      window.__lastInstallArgs = {target, hasPassword: !!password, installKey};
+      window.__lastInstallArgs = {target, hasPassword: !!password, installKey, sshKey};
       install = {running: true, finished: false, success: false, log: [], url: null, username: null, password: null, token: null};
       for (const line of installScript) { await delay(600); install.log.push(line); }
       if (password && installKey) install.log.push('Ваш публичный SSH-ключ добавлен на сервер.');
       if (password && fail('wrong_password')) { Object.assign(install, {running: false, finished: true, success: false}); install.log.push('SSH: доступ отклонён; проверьте пароль или ключ и права.'); throw 'Установка завершилась с ошибкой'; }
       const ok = !fail('install_panel');
       Object.assign(install, {running: false, finished: true, success: ok, url: ok ? 'http://203.0.113.9:2053/mock/' : null,
-        username: ok ? 'mockadmin' : null, password: ok ? 'mockpass' : null, token: ok && params.get('no_token') !== '1' ? 'mock-token' : null});
+        username: ok ? 'mockadmin' : null, password: ok ? 'mockpass' : null, token: ok && params.get('no_token') !== '1' ? 'mock-token' : null, local_only: ok && (!password || installKey),
+        // like the backend: the chosen key, else the default pair that was authorized by a password install
+        ssh_key: ok ? (sshKey || (password && installKey ? 'id_ed25519_vpn_client' : null)) : null});
+      if (ok && (!password || installKey)) install.log.push('✓ Панель закрыта от интернета: слушает только 127.0.0.1, приложение управляет ею через SSH-туннель.');
       if (!ok) throw 'Установка завершилась с ошибкой (mock)';
       return null;
     },

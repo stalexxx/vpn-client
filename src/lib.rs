@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, os::unix::fs::OpenOptionsExt, path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
+pub mod compat;
+use compat::OpenOptionsExt;
 
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "local.vpn-client.3x-ui";
 
 // Tokens are stored per user. Keychain is consulted only when migrating an
@@ -11,12 +14,12 @@ where F: FnOnce(&mut std::collections::BTreeMap<String, String>) -> Result<(T, b
 }
 fn token_store_at<F, T>(path: &std::path::Path, f: F) -> Result<T, String>
 where F: FnOnce(&mut std::collections::BTreeMap<String, String>) -> Result<(T, bool), String> {
-    use std::os::fd::AsRawFd;
     let dir = path.parent().ok_or("Некорректный путь хранилища токенов")?;
     fs::create_dir_all(dir).map_err(|_| "Не удалось создать каталог токенов")?;
     let lock = fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
         .open(dir.join("panel-tokens.lock")).map_err(|_| "Не удалось открыть хранилище токенов")?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 { return Err("Не удалось заблокировать хранилище токенов".into()); }
+    #[cfg(unix)] { use std::os::fd::AsRawFd; if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 { return Err("Не удалось заблокировать хранилище токенов".into()); } }
+    #[cfg(not(unix))] let _ = &lock;
     let mut tokens = match fs::read(path) {
         Ok(data) => serde_json::from_slice(&data).map_err(|_| "Некорректное хранилище токенов")?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::collections::BTreeMap::new(),
@@ -37,12 +40,20 @@ fn token_set(account: &str, token: &str) -> Result<(), String> {
 fn token_get(account: &str) -> Result<String, String> {
     token_store(|tokens| {
         if let Some(token) = tokens.get(account) { return Ok((token.clone(), false)); }
-        let bytes = security_framework::passwords::get_generic_password(SERVICE, account)
-            .map_err(|_| "Токен не найден; при необходимости укажите его в настройках сервера".to_owned())?;
+        let bytes = keychain_token(account)?;
         let token = String::from_utf8(bytes).map_err(|_| "Некорректный сохранённый токен")?;
         tokens.insert(account.to_owned(), token.clone());
         Ok((token, true))
     })
+}
+#[cfg(target_os = "macos")]
+fn keychain_token(account: &str) -> Result<Vec<u8>, String> {
+    security_framework::passwords::get_generic_password(SERVICE, account)
+        .map_err(|_| "Токен не найден; при необходимости укажите его в настройках сервера".to_owned())
+}
+#[cfg(not(target_os = "macos"))]
+fn keychain_token(_account: &str) -> Result<Vec<u8>, String> {
+    Err("Токен не найден; при необходимости укажите его в настройках сервера".to_owned())
 }
 fn token_delete(account: &str) -> Result<(), String> {
     token_store(|tokens| { let changed = tokens.remove(account).is_some(); Ok(((), changed)) })
@@ -61,11 +72,122 @@ pub struct Panel {
     pub ssh_target: Option<String>,
     #[serde(default)]
     pub panel_host: Option<String>,
+    /// Name (not path) of the private key in `~/.ssh` used for this server's SSH; `None` keeps the legacy
+    /// behaviour (the app key `id_ed25519_vpn_client` if it exists, otherwise ssh's own defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<String>,
+}
+
+/// Private key created for this app; the default choice and the legacy fallback.
+pub const APP_SSH_KEY: &str = "id_ed25519_vpn_client";
+
+/// A key is referred to by file name inside `~/.ssh` only: no separators, no leading dot, not a `.pub`.
+pub fn valid_ssh_key_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && !name.starts_with('.') && !name.contains("..") && !name.ends_with(".pub")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+fn home_dir() -> Result<PathBuf, String> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).ok_or_else(|| "Домашний каталог не найден".to_owned())
+}
+fn ssh_dir() -> Result<PathBuf, String> { Ok(home_dir()?.join(".ssh")) }
+/// Path of the private key `name` in `dir`. Never reads the key: it only checks that both halves are regular files
+/// (a symlink is accepted only if it stays inside `dir`).
+fn resolve_ssh_key_in(dir: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    if !valid_ssh_key_name(name) { return Err("Некорректное имя SSH-ключа".into()); }
+    let base = fs::canonicalize(dir).map_err(|_| "Каталог ~/.ssh не найден".to_owned())?;
+    for file in [name.to_owned(), format!("{name}.pub")] {
+        let path = dir.join(&file);
+        let resolved = fs::canonicalize(&path).map_err(|_| format!("SSH-ключ {file} не найден в ~/.ssh"))?;
+        if !resolved.starts_with(&base) || !fs::metadata(&resolved).map(|m| m.is_file()).unwrap_or(false) {
+            return Err(format!("SSH-ключ {file} должен быть обычным файлом внутри ~/.ssh"));
+        }
+    }
+    Ok(dir.join(name))
+}
+pub fn resolve_ssh_key(name: &str) -> Result<PathBuf, String> { resolve_ssh_key_in(&ssh_dir()?, name) }
+fn parse_public_key(text: &str) -> Option<String> {
+    let line = text.lines().next().unwrap_or("").trim();
+    let known = line.starts_with("ssh-ed25519 ") || line.starts_with("ssh-rsa ") || line.starts_with("ecdsa-sha2-");
+    (known && line.len() < 2048 && !line.contains(['\'', '"', '\\', '`', '$'])).then(|| line.to_owned())
+}
+/// The single `.pub` line of key `name`, safe to pass to a remote shell as data.
+pub fn ssh_public_key_line(name: &str) -> Result<String, String> {
+    let dir = ssh_dir()?;
+    resolve_ssh_key_in(&dir, name)?;
+    let text = fs::read_to_string(dir.join(format!("{name}.pub"))).map_err(|_| "Не удалось прочитать публичный SSH-ключ".to_owned())?;
+    parse_public_key(&text).ok_or_else(|| "Публичный SSH-ключ имеет неподдерживаемый формат".to_owned())
+}
+#[derive(Clone, Serialize, PartialEq, Debug)]
+pub struct SshKeyInfo { pub name: String, pub kind: String, pub comment: String, pub app_key: bool }
+fn list_ssh_keys_in(dir: &std::path::Path) -> Vec<SshKeyInfo> {
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    let mut keys: Vec<SshKeyInfo> = entries.filter_map(|e| e.ok()).filter_map(|e| {
+        let file = e.file_name().into_string().ok()?;
+        let name = file.strip_suffix(".pub")?.to_owned();
+        resolve_ssh_key_in(dir, &name).ok()?;
+        let line = parse_public_key(&fs::read_to_string(e.path()).ok()?)?;
+        let mut parts = line.split_whitespace();
+        let kind = match parts.next()? { "ssh-ed25519" => "ed25519", "ssh-rsa" => "rsa", _ => "ecdsa" }.to_owned();
+        let comment = parts.nth(1).unwrap_or("").chars().take(64).collect();
+        Some(SshKeyInfo { app_key: name == APP_SSH_KEY, name, kind, comment })
+    }).collect();
+    keys.sort_by(|a, b| b.app_key.cmp(&a.app_key).then_with(|| a.name.cmp(&b.name)));
+    keys
+}
+/// Names of `.pub` files whose private half is absent (e.g. only the public key was copied over): they cannot be used to log in.
+/// Only file names are inspected; no key file is read except for the `.pub` format check.
+fn list_orphan_ssh_pubs_in(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    let mut names: Vec<String> = entries.filter_map(|e| e.ok()).filter_map(|e| {
+        let name = e.file_name().into_string().ok()?.strip_suffix(".pub")?.to_owned();
+        if !valid_ssh_key_name(&name) || fs::symlink_metadata(dir.join(&name)).is_ok() { return None; }
+        parse_public_key(&fs::read_to_string(e.path()).ok()?)?;
+        Some(name)
+    }).collect();
+    names.sort();
+    names
+}
+pub fn list_orphan_ssh_pubs() -> Vec<String> { ssh_dir().map(|d| list_orphan_ssh_pubs_in(&d)).unwrap_or_default() }
+/// Private keys in `~/.ssh` that have a matching `.pub` (the app key first).
+pub fn list_ssh_keys() -> Vec<SshKeyInfo> { ssh_dir().map(|d| list_ssh_keys_in(&d)).unwrap_or_default() }
+fn default_ssh_key_path() -> Result<PathBuf, String> { Ok(compat::data_dir()?.join("default-ssh-key.json")) }
+/// The stored name of the app-wide default key, whether or not the key still exists (for showing it in settings).
+fn read_default_ssh_key_at(path: &std::path::Path) -> Result<Option<String>, String> {
+    let data = match fs::read(path) { Ok(d) => d, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None), Err(e) => return Err(e.to_string()) };
+    let value: serde_json::Value = serde_json::from_slice(&data).map_err(|_| "Некорректный файл ключа по умолчанию".to_owned())?;
+    Ok(value["key"].as_str().filter(|k| valid_ssh_key_name(k)).map(str::to_owned))
+}
+/// Stores `name` (validated against `ssh_dir`: both halves must exist there) or clears the default with `None`.
+fn write_default_ssh_key_at(path: &std::path::Path, ssh_dir: &std::path::Path, name: Option<&str>) -> Result<(), String> {
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return match fs::remove_file(path) { Ok(()) => Ok(()), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), Err(e) => Err(e.to_string()) };
+    };
+    resolve_ssh_key_in(ssh_dir, name)?;
+    write_private(path, serde_json::json!({"key": name}).to_string().as_bytes())
+}
+/// App-wide default key name as stored (it may have vanished from `~/.ssh` since).
+pub fn get_default_ssh_key() -> Result<Option<String>, String> { read_default_ssh_key_at(&default_ssh_key_path()?) }
+pub fn set_default_ssh_key(name: Option<&str>) -> Result<(), String> { write_default_ssh_key_at(&default_ssh_key_path()?, &ssh_dir()?, name) }
+/// The default key only if it is usable now; a stale setting falls back to the automatic behaviour instead of breaking ssh.
+pub fn default_ssh_key() -> Option<String> {
+    get_default_ssh_key().ok().flatten().filter(|name| resolve_ssh_key(name).is_ok())
+}
+/// Adds the identity options for a server: its chosen key, else the app-wide default key (each used exclusively),
+/// else the legacy behaviour (the app key if its private half exists, otherwise ssh's own defaults).
+pub fn apply_ssh_key(ssh: &mut std::process::Command, key: Option<&str>) -> Result<(), String> {
+    let chosen = match key { Some(name) => Some(resolve_ssh_key(name)?), None => default_ssh_key().and_then(|name| resolve_ssh_key(&name).ok()) };
+    match chosen {
+        Some(path) => { ssh.arg("-i").arg(path).args(["-o", "IdentitiesOnly=yes"]); }
+        None => if let Ok(dir) = ssh_dir() {
+            let path = dir.join(APP_SSH_KEY);
+            if path.is_file() { ssh.arg("-i").arg(path); }
+        },
+    }
+    Ok(())
 }
 
 fn config_path() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("HOME is unavailable")?;
-    Ok(PathBuf::from(home).join("Library/Application Support/VpnClient/panel.json"))
+    Ok(compat::data_dir()?.join("panel.json"))
 }
 
 pub fn validate_panel(panel: &Panel) -> Result<(), String> {
@@ -80,6 +202,7 @@ pub fn validate_panel(panel: &Panel) -> Result<(), String> {
     {
         return Err("URL must not contain credentials, query or fragment".into());
     }
+    if panel.ssh_key.as_deref().is_some_and(|k| !valid_ssh_key_name(k)) { return Err("Некорректное имя SSH-ключа".into()); }
     if let Some(host) = panel.panel_host.as_deref() {
         if panel.ssh_target.is_none() || !valid_http_host(host) {
             return Err("Invalid panel host".into());
@@ -163,7 +286,7 @@ impl Drop for Tunnel {
         let _ = self.0.wait();
     }
 }
-fn ssh_tunnel(target: &str, port: u16) -> Result<(Tunnel, u16), String> {
+fn ssh_tunnel(target: &str, port: u16, key: Option<&str>) -> Result<(Tunnel, u16), String> {
     use std::{
         net::{TcpListener, TcpStream},
         process::{Command, Stdio},
@@ -173,10 +296,7 @@ fn ssh_tunnel(target: &str, port: u16) -> Result<(Tunnel, u16), String> {
     drop(listener);
     let forward = format!("127.0.0.1:{local}:127.0.0.1:{port}");
     let mut ssh = Command::new("/usr/bin/ssh");
-    if let Some(home) = std::env::var_os("HOME") {
-        let key = PathBuf::from(home).join(".ssh/id_ed25519_vpn_client");
-        if key.is_file() { ssh.arg("-i").arg(key); }
-    }
+    apply_ssh_key(&mut ssh, key)?;
     let (dest, ssh_port) = split_ssh_target(target);
     if let Some(p) = ssh_port { ssh.args(["-p", &p.to_string()]); }
     let child = ssh.args([
@@ -259,9 +379,8 @@ pub struct Server {
 fn servers_path() -> Result<PathBuf, String> { Ok(config_path()?.with_file_name("servers.json")) }
 fn valid_server_id(id: &str) -> bool { id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) }
 fn new_server_id() -> Result<String, String> {
-    use std::io::Read;
     let mut bytes = [0u8; 16];
-    fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).map_err(|e| e.to_string())?;
+    compat::random_bytes(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 fn write_servers(path: &std::path::Path, servers: &[Server]) -> Result<(), String> {
@@ -369,6 +488,148 @@ fn delete_inbound_on(server: &Server, inbound_id: u64) -> Result<String, String>
     Ok(format!("Удалён inbound {inbound_id} ({remark}) с сервера {}", server.panel.name))
 }
 
+// ---- Cloudflare WARP as the server's exit -------------------------------------------------------------------
+// User traffic must not leave from the address clients connect to. The panel's Xray template gets a WireGuard
+// outbound "warp" as the default outbound plus an explicit catch-all rule; if WARP is down traffic fails
+// (a closed door), it never falls back to the server's own address.
+const WARP_TAG: &str = "warp";
+const WARP_ENDPOINT: &str = "engage.cloudflareclient.com:2408";
+
+/// WireGuard keypair (standard base64, as WireGuard and the Cloudflare API expect).
+fn wireguard_keypair() -> Result<(String, String), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut secret = [0u8; 32];
+    compat::random_bytes(&mut secret)?;
+    let secret = x25519_dalek::StaticSecret::from(secret);
+    let public = x25519_dalek::PublicKey::from(&secret);
+    Ok((STANDARD.encode(secret.to_bytes()), STANDARD.encode(public.as_bytes())))
+}
+
+/// Builds the Xray WireGuard outbound from the panel's `warp/reg` answer and our private key.
+fn warp_outbound(private_key: &str, registration: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let config = &registration["config"]["config"];
+    let public_key = config["peers"][0]["public_key"].as_str().filter(|k| !k.is_empty()).ok_or("WARP: нет публичного ключа пира")?;
+    let v4 = config["interface"]["addresses"]["v4"].as_str().filter(|a| a.parse::<std::net::Ipv4Addr>().is_ok()).ok_or("WARP: нет IPv4-адреса интерфейса")?;
+    let mut addresses = vec![format!("{v4}/32")];
+    if let Some(v6) = config["interface"]["addresses"]["v6"].as_str().filter(|a| a.parse::<std::net::Ipv6Addr>().is_ok()) { addresses.push(format!("{v6}/128")); }
+    let reserved: Vec<u8> = config["client_id"].as_str().and_then(|id| STANDARD.decode(id).ok()).filter(|b| b.len() == 3).ok_or("WARP: некорректный client_id")?;
+    Ok(serde_json::json!({
+        "tag": WARP_TAG,
+        "protocol": "wireguard",
+        "settings": {
+            "mtu": 1280,
+            "secretKey": private_key,
+            "address": addresses,
+            "domainStrategy": "ForceIP",
+            "reserved": reserved,
+            "peers": [{"publicKey": public_key, "allowedIPs": ["0.0.0.0/0", "::/0"], "endpoint": WARP_ENDPOINT, "keepAlive": 25}],
+            "noKernelTun": false
+        }
+    }))
+}
+
+/// Template without any WARP outbound or rule pointing at it.
+fn template_without_warp(template: &serde_json::Value) -> serde_json::Value {
+    let mut template = template.clone();
+    if let Some(outbounds) = template["outbounds"].as_array_mut() { outbounds.retain(|o| o["tag"] != WARP_TAG); }
+    if let Some(rules) = template["routing"]["rules"].as_array_mut() { rules.retain(|r| r["outboundTag"] != WARP_TAG); }
+    template
+}
+/// Template with `outbound` first (Xray's default outbound) and a final catch-all rule to it. Idempotent.
+fn template_with_warp(template: &serde_json::Value, outbound: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut template = template_without_warp(template);
+    template["outbounds"].as_array_mut().ok_or("В шаблоне Xray нет outbounds")?.insert(0, outbound);
+    if !template["routing"]["rules"].is_array() { template["routing"]["rules"] = serde_json::json!([]); }
+    template["routing"]["rules"].as_array_mut().ok_or("В шаблоне Xray нет routing.rules")?
+        .push(serde_json::json!({"type": "field", "network": "tcp,udp", "outboundTag": WARP_TAG}));
+    Ok(template)
+}
+fn template_has_warp(template: &serde_json::Value) -> bool {
+    template["outbounds"].as_array().is_some_and(|o| o.iter().any(|o| o["tag"] == WARP_TAG))
+}
+
+fn xray_template(panel: &Panel, token: &str) -> Result<(serde_json::Value, String), String> {
+    let answer = panel_send(panel, token, "xray/", PanelBody::Form(Vec::new()))?;
+    let obj: serde_json::Value = serde_json::from_str(answer["obj"].as_str().ok_or("Панель не вернула настройки Xray")?).map_err(|_| "Некорректные настройки Xray")?;
+    let template = match &obj["xraySetting"] { serde_json::Value::String(text) => serde_json::from_str(text).map_err(|_| "Некорректный шаблон Xray")?, other => other.clone() };
+    if !template.is_object() { return Err("Некорректный шаблон Xray".into()); }
+    Ok((template, obj["outboundTestUrl"].as_str().unwrap_or("https://www.google.com/generate_204").to_owned()))
+}
+fn apply_xray_template(panel: &Panel, token: &str, template: &serde_json::Value, test_url: &str) -> Result<(), String> {
+    panel_send(panel, token, "xray/update", PanelBody::Form(vec![("xraySetting", template.to_string()), ("outboundTestUrl", test_url.to_owned())]))?;
+    // The template is already saved at this point. A failed restart request (the panel can drop the connection while
+    // Xray restarts) is not a failure: callers verify the Xray state afterwards and roll back if it did not come up.
+    let _ = panel_send(panel, token, "server/restartXrayService", PanelBody::Form(Vec::new()));
+    Ok(())
+}
+/// Waits until the panel reports Xray running (a template Xray rejects leaves it in an error state).
+fn xray_running_after_restart(panel: &Panel, token: &str) -> bool {
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_secs(2));
+        if let Ok(status) = panel_send(panel, token, "server/status", PanelBody::Get) {
+            if status["obj"]["xray"]["state"] == "running" { return true; }
+        }
+    }
+    false
+}
+fn server_by_host(host: &str) -> Result<Server, String> {
+    if !valid_http_host(host) { return Err("Некорректный хост".into()); }
+    let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().map(ssh_host) == Some(host)).collect();
+    if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
+    Ok(servers.into_iter().next().unwrap())
+}
+fn warp_backup_path(server: &Server) -> Result<PathBuf, String> {
+    if !valid_server_id(&server.id) { return Err("Invalid server ID".into()); }
+    Ok(compat::data_dir()?.join(format!("xray-template-backup-{}.json", server.id)))
+}
+fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    fs::create_dir_all(path.parent().ok_or("Invalid path")?).map_err(|e| e.to_string())?;
+    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path).map_err(|e| e.to_string())?;
+    compat::restrict_file(&file).map_err(|e| e.to_string())?;
+    file.write_all(data).and_then(|_| file.sync_all()).map_err(|e| e.to_string())
+}
+
+/// Registers WARP through the panel and routes all user traffic of the server through it.
+/// The original template is saved first; if Xray does not come back up it is restored automatically.
+pub fn enable_warp_for_host(host: &str) -> Result<String, String> { enable_warp_on(&server_by_host(host)?) }
+pub fn enable_warp_for_server(server_id: &str) -> Result<String, String> { enable_warp_on(&server_for(server_id)?) }
+fn enable_warp_on(server: &Server) -> Result<String, String> {
+    let token = server_token(&server.id)?;
+    let (template, test_url) = xray_template(&server.panel, &token)?;
+    if template_has_warp(&template) { return Ok(format!("WARP уже включён на сервере {}", server.panel.name)); }
+    let (private_key, public_key) = wireguard_keypair()?;
+    let answer = panel_send(&server.panel, &token, "xray/warp/reg", PanelBody::Form(vec![("privateKey", private_key.clone()), ("publicKey", public_key)]))?;
+    let registration: serde_json::Value = serde_json::from_str(answer["obj"].as_str().ok_or("Панель не зарегистрировала WARP")?).map_err(|_| "Некорректный ответ регистрации WARP")?;
+    let updated = template_with_warp(&template, warp_outbound(&private_key, &registration)?)?;
+    write_private(&warp_backup_path(&server)?, template.to_string().as_bytes())?;
+    apply_xray_template(&server.panel, &token, &updated, &test_url)?;
+    if !xray_running_after_restart(&server.panel, &token) {
+        apply_xray_template(&server.panel, &token, &template, &test_url)?;
+        return Err(format!("Xray не запустился с WARP; прежний шаблон восстановлен (копия: {})", warp_backup_path(&server)?.display()));
+    }
+    Ok(format!("WARP включён на сервере {}: весь трафик пользователей выходит через Cloudflare. Копия прежнего шаблона: {}", server.panel.name, warp_backup_path(&server)?.display()))
+}
+/// Removes the WARP outbound and its rules; the rest of the template is left as it is on the server.
+pub fn disable_warp_for_host(host: &str) -> Result<String, String> { disable_warp_on(&server_by_host(host)?) }
+pub fn disable_warp_for_server(server_id: &str) -> Result<String, String> { disable_warp_on(&server_for(server_id)?) }
+fn disable_warp_on(server: &Server) -> Result<String, String> {
+    let token = server_token(&server.id)?;
+    let (template, test_url) = xray_template(&server.panel, &token)?;
+    if !template_has_warp(&template) { return Ok(format!("WARP на сервере {} не включён", server.panel.name)); }
+    apply_xray_template(&server.panel, &token, &template_without_warp(&template), &test_url)?;
+    if !xray_running_after_restart(&server.panel, &token) { return Err("Xray не запустился после отключения WARP; проверьте панель".into()); }
+    Ok(format!("WARP отключён на сервере {}", server.panel.name))
+}
+
+/// Whether the server's Xray template currently routes user traffic through WARP.
+pub fn warp_status_for_server(server_id: &str) -> Result<bool, String> {
+    let server = server_for(server_id)?;
+    let token = server_token(&server.id)?;
+    Ok(template_has_warp(&xray_template(&server.panel, &token)?.0))
+}
+
 pub fn delete_reality_inbound(host: &str) -> Result<String, String> {
     if !valid_http_host(host) { return Err("Некорректный хост".into()); }
     let servers: Vec<_> = list_servers()?.into_iter().filter(|s| s.panel.panel_host.as_deref() == Some(host) || s.panel.ssh_target.as_deref().map(ssh_host) == Some(host)).collect();
@@ -400,12 +661,24 @@ fn panel_request(
     route: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
+    panel_send(panel, token, route, body.map_or(PanelBody::Get, PanelBody::Json))
+}
+
+/// `Form(vec![])` is a POST with an empty form (several 3x-ui endpoints are POST without parameters).
+enum PanelBody { Get, Json(serde_json::Value), Form(Vec<(&'static str, String)>) }
+
+fn panel_send(
+    panel: &Panel,
+    token: &str,
+    route: &str,
+    body: PanelBody,
+) -> Result<serde_json::Value, String> {
     validate_panel(panel)?;
     let mut url = url::Url::parse(&panel.url).map_err(|_| "Invalid panel URL")?;
     let tunnel_target = if url.host_str() == Some("127.0.0.1") { panel.ssh_target.as_deref() } else { None };
     let _tunnel = if let Some(target) = tunnel_target {
         let remote_port = url.port().ok_or("Missing panel port")?;
-        let (tunnel, local_port) = ssh_tunnel(target, remote_port)?;
+        let (tunnel, local_port) = ssh_tunnel(target, remote_port, panel.ssh_key.as_deref())?;
         url.set_port(Some(local_port))
             .map_err(|_| "Invalid tunnel port")?;
         Some(tunnel)
@@ -419,10 +692,14 @@ fn panel_request(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
-    let mut request = if let Some(body) = body {
-        client.post(endpoint).json(&body)
-    } else {
-        client.get(endpoint)
+    let mut request = match body {
+        PanelBody::Json(body) => client.post(endpoint).json(&body),
+        PanelBody::Form(fields) => {
+            let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in &fields { encoded.append_pair(key, value); }
+            client.post(endpoint).header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded").body(encoded.finish())
+        }
+        PanelBody::Get => client.get(endpoint),
     }
     .bearer_auth(token);
     if let Some(target) = tunnel_target {
@@ -471,8 +748,7 @@ struct ProfileCache {
 }
 fn profile_cache_path(id: &str) -> Result<PathBuf, String> {
     if !valid_server_id(id) { return Err("Invalid server ID".into()); }
-    let home = std::env::var_os("HOME").ok_or("HOME is unavailable")?;
-    Ok(PathBuf::from(home).join(format!("Library/Application Support/VpnClient/client-profiles-{id}.json")))
+    Ok(compat::data_dir()?.join(format!("client-profiles-{id}.json")))
 }
 fn public_profiles(profiles: &[CachedClientProfile]) -> Result<serde_json::Value, String> {
     let value = profiles.iter().map(|p| serde_json::json!({
@@ -565,14 +841,13 @@ pub fn read_bypass() -> Result<profile::Bypass, String> {
     }
 }
 pub fn write_bypass(bypass: profile::Bypass) -> Result<profile::Bypass, String> {
-    use std::os::unix::fs::PermissionsExt;
     let bypass = bypass.validated()?;
     let _guard = BYPASS_LOCK.lock().map_err(|_| "Не удалось заблокировать настройки")?;
     let path = bypass_path()?;
     let dir = path.parent().ok_or("Некорректный путь настроек")?;
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
-    file.as_file().set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    compat::restrict_file(file.as_file()).map_err(|e| e.to_string())?;
     serde_json::to_writer(&mut file, &bypass).map_err(|e| e.to_string())?;
     file.as_file().sync_all().map_err(|e| e.to_string())?;
     file.persist(&path).map_err(|e| e.to_string())?;
@@ -587,11 +862,10 @@ fn read_pins(path: &std::path::Path) -> Result<Option<Vec<PinnedProfile>>, Strin
     }
 }
 fn write_pins(path: &std::path::Path, pins: &[PinnedProfile]) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     let dir = path.parent().ok_or("Некорректный путь к списку конфигураций")?;
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
-    file.as_file().set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    compat::restrict_file(file.as_file()).map_err(|e| e.to_string())?;
     serde_json::to_writer(&mut file, pins).map_err(|e| e.to_string())?;
     file.as_file().sync_all().map_err(|e| e.to_string())?;
     file.persist(path).map_err(|e| e.to_string())?;
@@ -691,10 +965,9 @@ pub fn refresh_client_profiles(id: &str) -> Result<serde_json::Value, String> {
     let path = profile_cache_path(id)?;
     let parent = path.parent().ok_or("Invalid profile cache path")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    compat::restrict_path(&path).map_err(|e| e.to_string())?;
     file.write_all(&serde_json::to_vec(&cache).map_err(|e| e.to_string())?).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
     public_profiles(&cache.profiles)
 }
@@ -767,7 +1040,7 @@ pub fn build_inbound_request(template_id: &str, params: &InboundParams) -> Resul
 /// Obtain a Let's Encrypt cert using the same acme.sh and /root/cert/<domain>
 /// layout used by 3x-ui's SSL certificate manager. Secrets and raw command
 /// output are deliberately never returned to the UI.
-pub fn ensure_wizard_certificate(target: &str, domain: &str) -> Result<(), String> {
+pub fn ensure_wizard_certificate(target: &str, domain: &str, key: Option<&str>) -> Result<(), String> {
     if !target.starts_with("root@") || !valid_ssh_target(target) { return Err("Проверьте SSH-цель root@хост".into()); }
     if !valid_domain_name(domain) { return Err("Некорректное доменное имя сертификата".into()); }
     let command = format!(r#"set -eu
@@ -783,10 +1056,7 @@ chmod 600 "$CERT_DIR/privkey.pem"
 chmod 644 "$CERT_DIR/fullchain.pem"
 test -s "$CERT_DIR/privkey.pem" -a -s "$CERT_DIR/fullchain.pem""#);
     let mut ssh = std::process::Command::new("/usr/bin/ssh");
-    if let Some(home) = std::env::var_os("HOME") {
-        let key = PathBuf::from(home).join(".ssh/id_ed25519_vpn_client");
-        if key.is_file() { ssh.arg("-i").arg(key); }
-    }
+    apply_ssh_key(&mut ssh, key)?;
     let (dest, ssh_port) = split_ssh_target(target);
     if let Some(p) = ssh_port { ssh.args(["-p", &p.to_string()]); }
     let output = ssh.args(["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "--", dest, &command])
@@ -822,7 +1092,7 @@ pub fn create_wizard_inbound(id: &str, panel: &Panel, target: &str, template_id:
     validate_panel(panel)?;
     build_inbound_request(template_id, params)?;
     let token = staged_wizard_token(id)?;
-    ensure_wizard_certificate(target, &params.server_name)?;
+    ensure_wizard_certificate(target, &params.server_name, panel.ssh_key.as_deref())?;
     create_inbound(panel, &token, template_id, params)
 }
 
@@ -831,7 +1101,7 @@ pub fn create_server_inbound(id: &str, template_id: &str, params: &InboundParams
     build_inbound_request(template_id, params)?;
     let token = server_token(id)?;
     let target = server.panel.ssh_target.as_deref().ok_or("Для выпуска сертификата укажите SSH-цель в настройках сервера")?;
-    ensure_wizard_certificate(target, &params.server_name)?;
+    ensure_wizard_certificate(target, &params.server_name, server.panel.ssh_key.as_deref())?;
     create_inbound(&server.panel, &token, template_id, params)
 }
 
@@ -884,7 +1154,7 @@ pub fn create_hysteria2_client(host: &str, email: &str, sni: &str) -> Result<(St
     if servers.len() != 1 { return Err("Нужна ровно одна сохранённая панель для указанного хоста".into()); }
     let server = &servers[0]; let token = server_token(&server.id)?;
     let target = server.panel.ssh_target.as_deref().ok_or("Для выпуска сертификата укажите SSH-цель в настройках сервера")?;
-    ensure_wizard_certificate(target, sni)?;
+    ensure_wizard_certificate(target, sni, server.panel.ssh_key.as_deref())?;
     let list = panel_request(&server.panel, &token, "inbounds/list", None)?;
     let items = list.get("obj").and_then(|v| v.as_array()).ok_or("Некорректный список inbound-ов")?;
     let id = if let Some(existing) = items.iter().find(|v| v["remark"] == "HYSTERIA2-UDP-443" && v["port"] == 443 && v["protocol"] == "hysteria") {
@@ -925,8 +1195,7 @@ pub fn create_reality_client_on_port(host: &str, email: &str, sni: &str, port: u
         let text = String::from_utf8(output.stdout).map_err(|_| "Некорректный ответ генератора ключей")?;
         let private = text.lines().find_map(|line| line.strip_prefix("PrivateKey:").map(str::trim)).filter(|v| !v.is_empty()).ok_or("Генератор не вернул закрытый ключ")?;
         let public = text.lines().find_map(|line| line.strip_prefix("Password (PublicKey):").or_else(|| line.strip_prefix("PublicKey:")).map(str::trim)).filter(|v| !v.is_empty()).ok_or("Генератор не вернул открытый ключ")?;
-        use std::io::Read;
-        let mut bytes = [0u8; 8]; fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).map_err(|_| "Не удалось создать short ID")?;
+        let mut bytes = [0u8; 8]; compat::random_bytes(&mut bytes).map_err(|_| "Не удалось создать short ID")?;
         let short_id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let response = panel_request(&server.panel, &token, "inbounds/add", Some(reality_inbound_body(sni, private, public, &short_id, port)))?;
         response.get("obj").and_then(|v| v.as_u64()).or_else(|| list_inbounds_for(&server.panel, &token).ok()?.as_array()?.iter().find(|i| i["remark"] == format!("VLESS-REALITY-{port}") && i["port"] == port)?.get("id")?.as_u64()).ok_or("Панель создала inbound, но не вернула его ID")?
@@ -987,8 +1256,7 @@ fn clear_pending_for_server(pending_path: &std::path::Path, legacy_path: &std::p
     Ok(())
 }
 fn pending_path() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("HOME is unavailable")?;
-    Ok(PathBuf::from(home).join("Library/Application Support/VpnClient/pending-client.json"))
+    Ok(compat::data_dir()?.join("pending-client.json"))
 }
 pub fn queue_client(inbound_id: u64, email: &str) -> Result<PendingClient, String> {
     let panel = load_panel()?.ok_or("No panel configured")?;
@@ -1144,11 +1412,10 @@ fn read_imported(path: &std::path::Path) -> Result<Vec<ImportedProfile>, String>
     }
 }
 fn write_imported(path: &std::path::Path, items: &[ImportedProfile]) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     let dir = path.parent().ok_or("Некорректный путь к импортированным конфигурациям")?;
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
-    file.as_file().set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    compat::restrict_file(file.as_file()).map_err(|e| e.to_string())?;
     serde_json::to_writer(&mut file, items).map_err(|e| e.to_string())?;
     file.as_file().sync_all().map_err(|e| e.to_string())?;
     file.persist(path).map_err(|e| e.to_string())?;
@@ -1277,7 +1544,7 @@ mod tests {
     }
     #[test]
     fn reality_share_link_round_trips_into_client_config() {
-        let panel = Panel { name:"test".into(), url:"http://127.0.0.1:2053/".into(), ssh_target:Some("root@198.51.100.2".into()), panel_host:None };
+        let panel = Panel { name:"test".into(), url:"http://127.0.0.1:2053/".into(), ssh_target:Some("root@198.51.100.2".into()), panel_host:None, ssh_key:None };
         let stream = serde_json::json!({"network":"tcp","security":"reality","realitySettings":{"serverNames":["www.microsoft.com"],"shortIds":["01234567"],"settings":{"publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","fingerprint":"chrome","spiderX":"/"}}});
         let inbound = serde_json::json!({"enable":true,"protocol":"vless","port":443,"streamSettings":stream,"settings":{"clients":[{"email":"client-1","flow":"xtls-rprx-vision"}]}});
         let link = build_client_share_link(&panel,"client-1","12345678-1234-1234-1234-123456789abc",&inbound).unwrap();
@@ -1369,7 +1636,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pending = dir.path().join("pending-client.json");
         let legacy = dir.path().join("panel.json");
-        let server = Server { id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(), country:None, panel:Panel {name:"A".into(),url:"https://a.example".into(),ssh_target:None,panel_host:None} };
+        let server = Server { id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(), country:None, panel:Panel {name:"A".into(),url:"https://a.example".into(),ssh_target:None,panel_host:None,ssh_key:None} };
         fs::write(&legacy, serde_json::to_vec(&server.panel).unwrap()).unwrap();
         let write_pending = |id: Option<&str>| fs::write(&pending, serde_json::to_vec(&PendingClient {server_id:id.map(str::to_owned), inbound_id:1, email:"client".into(), inbound_name:"inbound".into(),panel_name:"A".into()}).unwrap()).unwrap();
         write_pending(Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
@@ -1432,6 +1699,7 @@ mod tests {
             url: url.into(),
             ssh_target: Some(target.into()),
             panel_host: None,
+            ssh_key: None,
         };
         assert!(validate_panel(&panel("http://127.0.0.1:28004/path/", "root@203.0.113.10")).is_ok());
         assert!(validate_panel(&panel(
@@ -1459,7 +1727,8 @@ mod tests {
                     name: "x".into(),
                     url: url.into(),
                     ssh_target: None,
-                    panel_host: None
+                    panel_host: None,
+                    ssh_key: None
                 })
                 .is_err(),
                 "{url}"
@@ -1469,10 +1738,76 @@ mod tests {
             name: "x".into(),
             url: "https://example.com:2053/custom".into(),
             ssh_target: None,
-            panel_host: None
+            panel_host: None,
+            ssh_key: None
         })
         .is_ok());
     }
+    #[test]
+    fn ssh_key_names_are_plain_file_names_and_resolve_only_inside_ssh_dir() {
+        for ok in ["id_ed25519_vpn_client", "id_rsa", "work-key.2024", "k"] { assert!(valid_ssh_key_name(ok), "{ok}"); }
+        for bad in ["", ".hidden", "../id_rsa", "a/b", "a\\b", "id_rsa.pub", "a..b", "a b", "ключ", "-oProxyCommand=x", &"x".repeat(65)] {
+            // A leading '-' is also harmless: the key is always passed after -i, never as a bare argument.
+            if bad == "-oProxyCommand=x" { continue; }
+            assert!(!valid_ssh_key_name(bad), "{bad}");
+        }
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".ssh"); fs::create_dir(&dir).unwrap();
+        let outside = home.path().join("outside"); fs::write(&outside, "x").unwrap();
+        fs::write(dir.join("id_ed25519_vpn_client"), "PRIVATE-SECRET").unwrap();
+        fs::write(dir.join("id_ed25519_vpn_client.pub"), "ssh-ed25519 AAAAC3Nza me@host\n").unwrap();
+        fs::write(dir.join("work"), "PRIVATE-SECRET").unwrap();
+        fs::write(dir.join("work.pub"), "ssh-rsa AAAAB3 work@laptop\n").unwrap();
+        fs::write(dir.join("lonely"), "PRIVATE-SECRET").unwrap(); // no .pub
+        fs::write(dir.join("orphan.pub"), "ssh-ed25519 AAAA o\n").unwrap(); // no private half
+        fs::write(dir.join("evil"), "x").unwrap();
+        fs::write(dir.join("evil.pub"), "ssh-ed25519 AAAA $(reboot)\n").unwrap();
+        #[cfg(unix)] { std::os::unix::fs::symlink(&outside, dir.join("linked")).unwrap(); fs::write(dir.join("linked.pub"), "ssh-ed25519 AAAA l\n").unwrap(); }
+        assert_eq!(list_orphan_ssh_pubs_in(&dir), ["orphan"], "only a .pub with no private file is reported");
+        let keys = list_ssh_keys_in(&dir);
+        let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(names, ["id_ed25519_vpn_client", "work"], "app key first; keys without .pub, orphans, unsafe .pub and outside symlinks are hidden");
+        assert!(keys[0].app_key && keys[0].kind == "ed25519" && keys[0].comment == "me@host" && keys[1].kind == "rsa");
+        assert!(!serde_json::to_string(&keys).unwrap().contains("PRIVATE-SECRET"));
+        assert_eq!(resolve_ssh_key_in(&dir, "work").unwrap(), dir.join("work"));
+        assert!(resolve_ssh_key_in(&dir, "lonely").is_err() && resolve_ssh_key_in(&dir, "missing").is_err() && resolve_ssh_key_in(&dir, "../outside").is_err());
+        #[cfg(unix)] assert!(resolve_ssh_key_in(&dir, "linked").is_err());
+        assert_eq!(parse_public_key("ssh-ed25519 AAAA c\nsecond line").as_deref(), Some("ssh-ed25519 AAAA c"));
+        assert!(parse_public_key("ssh-ed25519 AAAA $(x)").is_none() && parse_public_key("-----BEGIN OPENSSH PRIVATE KEY-----").is_none());
+    }
+    #[test]
+    fn default_ssh_key_is_validated_stored_privately_and_clearable() {
+        let ssh = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("default-ssh-key.json");
+        std::fs::write(ssh.path().join("work"), "PRIVATE").unwrap();
+        std::fs::write(ssh.path().join("work.pub"), "ssh-ed25519 AAAA w\n").unwrap();
+        std::fs::write(ssh.path().join("lonely.pub"), "ssh-ed25519 AAAA l\n").unwrap();
+        assert_eq!(read_default_ssh_key_at(&path).unwrap(), None);
+        // Unusable names are refused and nothing is written.
+        for bad in ["lonely", "missing", "../x", "k.pub"] { assert!(write_default_ssh_key_at(&path, ssh.path(), Some(bad)).is_err(), "{bad}"); }
+        assert!(!path.exists());
+        write_default_ssh_key_at(&path, ssh.path(), Some("work")).unwrap();
+        assert_eq!(read_default_ssh_key_at(&path).unwrap().as_deref(), Some("work"));
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600); }
+        // A tampered file with a path-like name reads as "no default".
+        std::fs::write(&path, r#"{"key":"../../etc/passwd"}"#).unwrap();
+        assert_eq!(read_default_ssh_key_at(&path).unwrap(), None);
+        write_default_ssh_key_at(&path, ssh.path(), Some("work")).unwrap();
+        write_default_ssh_key_at(&path, ssh.path(), None).unwrap();
+        assert_eq!(read_default_ssh_key_at(&path).unwrap(), None);
+        write_default_ssh_key_at(&path, ssh.path(), Some("")).unwrap(); // clearing an already empty setting is fine
+    }
+    #[test]
+    fn panel_validation_rejects_bad_ssh_key_names_and_old_servers_still_parse() {
+        let mut panel = Panel { name: "x".into(), url: "https://example.com:2053/".into(), ssh_target: None, panel_host: None, ssh_key: Some("work".into()) };
+        assert!(validate_panel(&panel).is_ok());
+        for bad in ["../x", "a/b", ".k", "k.pub"] { panel.ssh_key = Some(bad.into()); assert!(validate_panel(&panel).is_err(), "{bad}"); }
+        let old: Panel = serde_json::from_str(r#"{"name":"A","url":"https://a.example","ssh_target":null,"panel_host":null}"#).unwrap();
+        assert!(old.ssh_key.is_none());
+        assert!(!serde_json::to_string(&old).unwrap().contains("ssh_key"));
+    }
+
     #[test]
     fn inbound_request_builds_vless_xhttp_tls_body_with_3x_ui_certificate_paths() {
         let params = InboundParams { remark: "xhttp-443".into(), port: 443, server_name: "203-0-113-8.sslip.io".into(), path: "/a1b2c3".into() };
@@ -1500,7 +1835,7 @@ mod tests {
         assert_eq!(stream, serde_json::json!({"network":"xhttp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.2","maxVersion":"1.3","alpn":["h2","http/1.1"],"rejectUnknownSni":false,"certificates":[{"certificateFile":"/root/cert/example.com/fullchain.pem","keyFile":"/root/cert/example.com/privkey.pem","oneTimeLoading":false,"usage":"encipherment","buildChain":false}],"settings":{"fingerprint":"","echConfigList":""}},"xhttpSettings":{"path":"/","host":"","headers":{}}}));
         let sniff: serde_json::Value=serde_json::from_str(body["sniffing"].as_str().unwrap()).unwrap();
         assert_eq!(sniff,serde_json::json!({"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}));
-        let panel=Panel{name:"test".into(),url:"https://example.com".into(),ssh_target:Some("root@example.com".into()),panel_host:None};
+        let panel=Panel{name:"test".into(),url:"https://example.com".into(),ssh_target:Some("root@example.com".into()),panel_host:None,ssh_key:None};
         let inbound=serde_json::json!({"enable":true,"protocol":"vless","port":443,"streamSettings":stream});
         let link=build_client_share_link(&panel,"client","00000000-0000-0000-0000-000000000000",&inbound).unwrap();
         let config=crate::profile::vless_xhttp_config(&link,10808).unwrap();
@@ -1521,12 +1856,55 @@ mod tests {
         assert!(validate_inbound_params(&params("xhttp", 443, "example.com", "x")).is_err());
         assert!(validate_inbound_params(&params("xhttp", 443, "bad..domain", "/x")).is_err());
     }
+    #[test]
+    fn warp_template_edit_is_idempotent_and_reversible() {
+        let template = serde_json::json!({
+            "outbounds": [{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"blocked"}],
+            "routing": {"rules": [{"type":"field","outboundTag":"blocked","protocol":["bittorrent"]}]}
+        });
+        let reg = serde_json::json!({"config":{"config":{"client_id":"mk9i","peers":[{"public_key":"PUB","endpoint":{"host":"engage.cloudflareclient.com:2408"}}],"interface":{"addresses":{"v4":"172.16.0.2","v6":"2606:4700:110:898b:f96b:74c7:fe2a:83fb"}}}}});
+        let outbound = warp_outbound("PRIV", &reg).unwrap();
+        assert_eq!(outbound["settings"]["reserved"], serde_json::json!([154, 79, 98]));
+        assert_eq!(outbound["settings"]["address"][0], "172.16.0.2/32");
+        assert_eq!(outbound["settings"]["peers"][0]["publicKey"], "PUB");
+        let with = template_with_warp(&template, outbound.clone()).unwrap();
+        // WARP is the default (first) outbound and the last rule sends everything to it.
+        assert_eq!(with["outbounds"][0]["tag"], "warp");
+        assert_eq!(with["outbounds"].as_array().unwrap().len(), 3);
+        assert_eq!(with["routing"]["rules"].as_array().unwrap().last().unwrap()["outboundTag"], "warp");
+        assert_eq!(with["routing"]["rules"][0]["protocol"][0], "bittorrent");
+        assert!(template_has_warp(&with));
+        // Applying twice does not duplicate anything.
+        assert_eq!(template_with_warp(&with, outbound).unwrap(), with);
+        assert_eq!(template_without_warp(&with), template);
+        assert!(!template_has_warp(&template));
+    }
+    #[test]
+    fn warp_outbound_rejects_incomplete_registration() {
+        let missing = serde_json::json!({"config":{"config":{"client_id":"mk9i","peers":[{}],"interface":{"addresses":{"v4":"172.16.0.2"}}}}});
+        assert!(warp_outbound("PRIV", &missing).is_err());
+        let bad_id = serde_json::json!({"config":{"config":{"client_id":"zz","peers":[{"public_key":"PUB"}],"interface":{"addresses":{"v4":"172.16.0.2"}}}}});
+        assert!(warp_outbound("PRIV", &bad_id).is_err());
+    }
+    #[test]
+    fn wireguard_keypair_is_valid_base64_of_32_bytes() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let (private, public) = wireguard_keypair().unwrap();
+        assert_eq!(STANDARD.decode(&private).unwrap().len(), 32);
+        assert_eq!(STANDARD.decode(&public).unwrap().len(), 32);
+        assert_ne!(private, public);
+    }
+
 }
 
 pub mod profile;
 
+#[cfg(unix)]
 pub mod xray;
 
+#[cfg(unix)]
 pub mod proxy;
 
 pub mod client_plan;
+
+pub mod probe;

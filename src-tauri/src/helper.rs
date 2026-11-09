@@ -129,7 +129,7 @@ pub fn ensure_installed() -> Result<(), String> {
 }
 fn request_value(request: Value) -> Result<Value, String> {
     let mut stream = UnixStream::connect(SOCKET).map_err(|e| format!("Системный компонент недоступен: {e}"))?;
-    let timeout = if request.get("action").and_then(Value::as_str) == Some("start") { 40 } else { 15 };
+    let timeout = if matches!(request.get("action").and_then(Value::as_str), Some("start" | "switch")) { 60 } else { 15 };
     stream.set_read_timeout(Some(Duration::from_secs(timeout))).map_err(|e| e.to_string())?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
     stream.write_all(request.to_string().as_bytes()).and_then(|_| stream.write_all(b"\n")).map_err(|e| e.to_string())?;
@@ -158,10 +158,11 @@ pub fn stats() -> Result<Value, String> {
     serde_json::from_str(text).map_err(|_| "Некорректный ответ статистики".to_owned())
 }
 pub fn status() -> Result<bool, String> { Ok(request("status", None, None)?.get("connected").and_then(Value::as_bool).unwrap_or(false)) }
+/// Connects, or — when a tunnel is already up — switches to this profile in place (DNS stays pinned; failure rolls back).
 pub fn start(link: &str, relay_link: Option<&str>) -> Result<String, String> {
     ensure_installed()?;
     let bypass = vpn_core::read_bypass()?;
-    Ok(request_value(json!({"action":"start","link":link,"relay_link":relay_link,"bypass":bypass}))?.get("message").and_then(Value::as_str).unwrap_or("TUN подключён").to_owned())
+    Ok(request_value(json!({"action":"switch","link":link,"relay_link":relay_link,"bypass":bypass}))?.get("message").and_then(Value::as_str).unwrap_or("TUN подключён").to_owned())
 }
 pub fn stop() -> Result<(), String> {
     if helper_status(Duration::from_secs(15)).is_none() { ensure_installed()?; }

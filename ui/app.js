@@ -37,16 +37,38 @@ function connectionState(value) {
   $('proxy-indicator').textContent = mode === 'tun' ? 'Глобальный TUN активен' : mode === 'proxy' ? 'Прокси активен' : 'Глобальный TUN выключен';
   document.querySelector('footer').dataset.connected = String(mode === 'tun'); renderProfiles();
 }
+let probes = {};
+// Server liveness (TCP handshake to the server, made outside the tunnel): a coloured mark plus the time.
+function probeBadge(p) {
+  const badge = document.createElement('span'); badge.className = 'probe';
+  const r = probes[key(p)];
+  let state = 'none', text = '—', title = 'Ещё не проверялось';
+  if (r) {
+    const when = new Date(r.ts * 1000).toLocaleTimeString('ru-RU');
+    if (r.udp) { text = 'UDP'; title = 'Hysteria 2 работает по UDP: проверка недоступна'; }
+    else if (r.ms != null) { state = r.ms < 150 ? 'ok' : r.ms < 400 ? 'mid' : 'slow'; text = `${r.ms} мс`; title = `Сервер отвечает, проверено в ${when}`; }
+    else { state = 'bad'; text = 'нет ответа'; title = `${r.error || 'нет ответа'} · проверено в ${when}`; }
+  }
+  badge.dataset.state = state; badge.textContent = text; badge.title = title;
+  return badge;
+}
+async function pollProbes() {
+  try {
+    const next = await invoke('get_probe_results');
+    if (JSON.stringify(next) !== JSON.stringify(probes)) { probes = next; renderProfiles(); }
+  } catch { /* older backend: no probes */ }
+}
+setInterval(pollProbes, 5000);
 function renderProfiles() {
   const list = $('profiles'); list.replaceChildren();
   if (!profiles.length) { const empty = document.createElement('p'); empty.className='empty-state'; empty.textContent='Отметьте конфигурации в Администрировании или импортируйте ссылку (кнопка «Импорт»).'; list.append(empty); }
   for (const p of profiles) {
-    const row = document.createElement('button'); row.type='button'; row.className='profile-row'; row.setAttribute('aria-pressed', String(key(p) === selectedProfileKey)); row.disabled = mode !== 'off';
+    const row = document.createElement('button'); row.type='button'; row.className='profile-row'; row.setAttribute('aria-pressed', String(key(p) === selectedProfileKey)); row.disabled = busy || mode === 'proxy'; row.dataset.active = String(mode === 'tun' && key(p) === connectedKey);
     const country = document.createElement('span'); country.className='profile-flag'; country.textContent=flag(p.country) || '🌐';
     const copy = document.createElement('span'); copy.className='profile-copy';
     const server = document.createElement('strong'); server.className='profile-server'; server.textContent=p.server_name || 'Сервер'; if (p.imported) { const tag=document.createElement('span'); tag.className='profile-tag'; tag.textContent=p.transport==='hysteria2'?'импорт · hy2':'импорт'; server.textContent=p.host || 'Импорт'; server.append(tag); }
     const client = document.createElement('span'); client.className='profile-client'; client.textContent=p.email;
-    copy.append(server,client); row.append(country,copy); row.addEventListener('click',()=>{ selectedProfileKey=key(p); localStorage.setItem('vpn.selectedProfile', selectedProfileKey); syncMcpSelection().catch(e=>{ $('connection-error').textContent=`Не удалось сохранить выбор для MCP: ${e}`; $('connection-error').hidden=false; }); renderProfiles(); connectionState(mode); }); list.append(p.imported ? importedItem(p, row, client) : row);
+    copy.append(server,client); row.append(country,copy,probeBadge(p)); row.addEventListener('click',()=>{ selectedProfileKey=key(p); localStorage.setItem('vpn.selectedProfile', selectedProfileKey); syncMcpSelection().catch(e=>{ $('connection-error').textContent=`Не удалось сохранить выбор для MCP: ${e}`; $('connection-error').hidden=false; }); renderProfiles(); connectionState(mode); if(mode==='tun' && key(p)!==connectedKey) switchProfile(); }); list.append(p.imported ? importedItem(p, row, client) : row);
   }
   const chosen = profiles.find(p=>key(p)===selectedProfileKey);
   $('active-profile-label').textContent = chosen ? `${chosen.imported ? '⬇' : flag(chosen.country)} ${chosen.imported ? (chosen.host || 'Импорт') : chosen.server_name} · ${chosen.email}` : 'Выберите конфигурацию';
@@ -72,17 +94,33 @@ async function loadProfiles() {
   catch(e) { $('profiles').innerHTML=''; const err=document.createElement('p'); err.className='empty-state'; err.textContent=`Не удалось загрузить конфигурации: ${e}`; $('profiles').append(err); }
   finally { $('refresh').disabled=false; }
 }
-$('refresh').addEventListener('click',loadProfiles);
+$('refresh').addEventListener('click',()=>{ loadProfiles(); invoke('probe_now').then(()=>setTimeout(pollProbes,4000)).catch(()=>{}); });
+if (/Windows/.test(navigator.userAgent)) $('open-admin').hidden = true; // administration is macOS-only
 $('open-admin').addEventListener('click',async()=>{ try { await invoke('open_admin'); } catch(e) { $('connection-error').textContent=`Не удалось открыть администрирование: ${e}`; $('connection-error').hidden=false; } });
+let connectedKey=null;
+async function connectSelected(p) {
+  $('connection-message').textContent = mode==='tun' ? 'Переключаем профиль…' : 'Подключаем TUN…';
+  const result=p.imported ? await invoke('connect_imported_profile',{id:p.imported_id}) : await invoke('connect_profile',{serverId:p.server_id,inboundId:p.inbound_id,email:p.email});
+  mode='tun'; connectedKey=key(p); $('connection-error').hidden=true; $('connection-message').textContent=result;
+}
+async function switchProfile() {
+  const p=profiles.find(item=>key(item)===selectedProfileKey);
+  if(busy || !canConnect(p)) return;
+  busy=true; connectionState(mode); $('connection-error').hidden=true;
+  try { await connectSelected(p); }
+  catch(e) { mode=await invoke('get_vpn_mode').catch(()=>'off'); if(mode==='off') connectedKey=null; $('connection-error').textContent=`Не удалось переключить профиль: ${e}`; $('connection-error').hidden=false; }
+  finally { busy=false; connectionState(mode); }
+}
 $('vpn-toggle').addEventListener('click',async()=>{
   if(busy)return; busy=true; connectionState(mode); $('connection-error').hidden=true;
-  try { if(mode!=='off') { await invoke('xray_stop'); mode='off'; $('connection-message').textContent='VPN отключён.'; } else { const p=profiles.find(item=>key(item)===selectedProfileKey); if(!canConnect(p)) return; $('connection-message').textContent='Подключаем TUN…'; const result=p.imported ? await invoke('connect_imported_profile',{id:p.imported_id}) : await invoke('connect_profile',{serverId:p.server_id,inboundId:p.inbound_id,email:p.email}); mode='tun'; $('connection-message').textContent=result; } }
-  catch(e) { mode=await invoke('get_vpn_mode').catch(()=>'off'); $('connection-error').textContent=`Не удалось выполнить действие: ${e}`; $('connection-error').hidden=false; }
+  try { if(mode!=='off') { await invoke('xray_stop'); mode='off'; connectedKey=null; $('connection-error').hidden=true; $('connection-message').textContent='VPN отключён.'; } else { const p=profiles.find(item=>key(item)===selectedProfileKey); if(!canConnect(p)) return; await connectSelected(p); } }
+  catch(e) { mode=await invoke('get_vpn_mode').catch(()=>'off'); if(mode==='off') connectedKey=null; $('connection-error').textContent=`Не удалось выполнить действие: ${e}`; $('connection-error').hidden=false; }
   finally { busy=false; connectionState(mode); }
 });
 invoke('build_info').then(value=>$('build-info').textContent=value).catch(()=>$('build-info').textContent='Версия неизвестна');
 invoke('get_vpn_mode').then(connectionState).catch(()=>connectionState('off'));
 loadProfiles();
+pollProbes();
 
 window.addEventListener('focus', loadProfiles);
 

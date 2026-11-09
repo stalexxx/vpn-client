@@ -10,6 +10,10 @@ pub struct Progress {
     username: Option<String>,
     password: Option<String>,
     token: Option<String>,
+    /// The panel was bound to 127.0.0.1 after install: it is reachable only through the SSH tunnel.
+    local_only: bool,
+    /// File name (in ~/.ssh) of the key the server was set up with, to be remembered for its tunnel; `None` = ssh defaults.
+    ssh_key: Option<String>,
 }
 #[derive(Default)]
 pub struct InstallState(Mutex<Progress>);
@@ -33,7 +37,8 @@ impl Drop for Askpass {
 }
 fn valid_password(password: &str) -> bool { !password.is_empty() && password.len() <= 256 && !password.chars().any(|c| c == '\0' || c == '\n' || c == '\r') }
 /// ssh command for `target`; with a password it authenticates through SSH_ASKPASS and remembers an unknown host key on first use only.
-fn ssh_command(password: Option<&str>, askpass: Option<&Askpass>, port: Option<u16>) -> Command {
+/// `key` is the chosen private key name in ~/.ssh; it only applies to key authentication.
+fn ssh_command(password: Option<&str>, askpass: Option<&Askpass>, port: Option<u16>, key: Option<&str>) -> Command {
     let mut ssh = Command::new("/usr/bin/ssh");
     ssh.args(["-T", "-o", "ConnectTimeout=10"]);
     if let Some(port) = port { ssh.args(["-p", &port.to_string()]); }
@@ -42,19 +47,49 @@ fn ssh_command(password: Option<&str>, askpass: Option<&Askpass>, port: Option<u
             ssh.args(["-o", "BatchMode=no", "-o", "StrictHostKeyChecking=accept-new", "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "NumberOfPasswordPrompts=1"])
                 .env("SSH_ASKPASS", &askpass.0).env("SSH_ASKPASS_REQUIRE", "force").env("DISPLAY", "vpnclient:0").env("VPN_SSH_PASSWORD", password);
         }
-        _ => { ssh.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]); }
+        _ => {
+            // The key was validated before the installation started; a failure here would only mean it vanished since.
+            let _ = vpn_core::apply_ssh_key(&mut ssh, key);
+            ssh.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]);
+        }
     }
     ssh
 }
-fn public_key_to_install() -> Option<String> {
+/// Remote script: make 3x-ui listen on 127.0.0.1 only, restart it and confirm the setting.
+/// Exit codes: 45 x-ui missing, 46 setting failed, 47 restart failed, 48 not confirmed.
+const BIND_LOCAL_SCRIPT: &str = "f=/usr/local/x-ui/x-ui; [ -x \"$f\" ] || exit 45; \"$f\" setting -listenIP 127.0.0.1 >/dev/null 2>&1 || exit 46; (systemctl restart x-ui || rc-service x-ui restart || x-ui restart) >/dev/null 2>&1 || exit 47; sleep 2; \"$f\" setting -getListen true 2>&1 | grep -q 'listenIP: 127.0.0.1' || exit 48";
+fn bind_local_message(code: Option<i32>) -> &'static str {
+    match code {
+        Some(0) => "✓ Панель закрыта от интернета: слушает только 127.0.0.1, приложение управляет ею через SSH-туннель.",
+        Some(45) => "Панель осталась открытой: не найден /usr/local/x-ui/x-ui. Закройте её вручную: x-ui setting -listenIP 127.0.0.1.",
+        Some(46) => "Панель осталась открытой: не удалось выставить listenIP 127.0.0.1. Закройте её вручную: x-ui setting -listenIP 127.0.0.1.",
+        Some(47) => "Адрес прослушивания изменён, но панель не перезапустилась: выполните на сервере systemctl restart x-ui.",
+        Some(48) => "Не удалось подтвердить, что панель слушает только 127.0.0.1; проверьте: x-ui setting -getListen true.",
+        _ => "Не удалось закрыть панель от интернета (ошибка SSH). Закройте её вручную: x-ui setting -listenIP 127.0.0.1.",
+    }
+}
+/// The same panel URL addressed through the tunnel (`http://127.0.0.1:port/...`); only plain-HTTP panels are tunnelled.
+fn tunnel_url(url: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "http" { return None; }
+    parsed.set_host(Some("127.0.0.1")).ok()?;
+    Some(parsed.to_string())
+}
+/// The key to authorize on the server (file name, public key line): the chosen one, else the app-wide default key,
+/// else the first usable default pair.
+fn key_to_install(key: Option<&str>) -> Option<(String, String)> {
+    if let Some(name) = key { return vpn_core::ssh_public_key_line(name).ok().map(|line| (name.to_owned(), line)); }
+    if let Some(name) = vpn_core::default_ssh_key() { if let Ok(line) = vpn_core::ssh_public_key_line(&name) { return Some((name, line)); } }
     let home = std::env::var_os("HOME")?;
-    let ssh_dir = std::path::PathBuf::from(home).join(".ssh");
-    for name in ["id_ed25519_vpn_client.pub", "id_ed25519.pub", "id_rsa.pub"] {
-        // Only a key whose private half exists locally is usable for the tunnel afterwards.
-        if !ssh_dir.join(name.trim_end_matches(".pub")).is_file() { continue; }
-        if let Ok(text) = std::fs::read_to_string(ssh_dir.join(name)) {
+    default_key_pair_in(&std::path::PathBuf::from(home).join(".ssh"))
+}
+/// First default key (app key, ed25519, rsa) that has both halves; a lone `.pub` is skipped because it could not log in later.
+fn default_key_pair_in(ssh_dir: &std::path::Path) -> Option<(String, String)> {
+    for name in [vpn_core::APP_SSH_KEY, "id_ed25519", "id_rsa"] {
+        if !ssh_dir.join(name).is_file() { continue; }
+        if let Ok(text) = std::fs::read_to_string(ssh_dir.join(format!("{name}.pub"))) {
             let line = text.lines().next().unwrap_or("").trim().to_owned();
-            if (line.starts_with("ssh-ed25519 ") || line.starts_with("ssh-rsa ") || line.starts_with("ecdsa-sha2-")) && line.len() < 2048 && !line.contains(['\'', '"', '\\', '`', '$']) { return Some(line); }
+            if (line.starts_with("ssh-ed25519 ") || line.starts_with("ssh-rsa ") || line.starts_with("ecdsa-sha2-")) && line.len() < 2048 && !line.contains(['\'', '"', '\\', '`', '$']) { return Some((name.to_owned(), line)); }
         }
     }
     None
@@ -151,11 +186,14 @@ pub fn install_progress(state: tauri::State<'_, InstallState>) -> Result<Progres
     state.0.lock().map(|p| p.clone()).map_err(|_| "Состояние установки недоступно".into())
 }
 #[tauri::command]
-pub async fn install_panel(app: tauri::AppHandle, target: String, password: Option<String>, install_key: Option<bool>) -> Result<(), String> {
+pub async fn install_panel(app: tauri::AppHandle, target: String, password: Option<String>, install_key: Option<bool>, ssh_key: Option<String>) -> Result<(), String> {
     use tauri::Manager;
     if !target.starts_with("root@") || !vpn_core::valid_ssh_target(&target) { return Err("Укажите SSH-цель в формате root@хост или root@хост:порт".into()); }
     let password = password.filter(|p| !p.is_empty());
     if let Some(p) = &password { if !valid_password(p) { return Err("Пароль не должен быть пустым, длиннее 256 символов или содержать переводы строк".into()); } }
+    let ssh_key = ssh_key.filter(|k| !k.is_empty());
+    // Fail before anything runs if the chosen key is not a usable pair inside ~/.ssh (the key itself is never read).
+    if let Some(name) = &ssh_key { vpn_core::resolve_ssh_key(name)?; }
     let install_key = password.is_some() && install_key.unwrap_or(false);
     {
         let state = app.state::<InstallState>(); let mut p = state.0.lock().map_err(|_| "Состояние установки недоступно")?;
@@ -169,7 +207,7 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
             Ok(a) => a,
             Err(e) => { if let Ok(mut p) = state.0.lock() { p.running = false; p.finished = true; p.log.push(e); } return; }
         };
-        let child = ssh_command(password.as_deref(), askpass.as_ref(), ssh_port).args(["--", dest,
+        let child = ssh_command(password.as_deref(), askpass.as_ref(), ssh_port, ssh_key.as_deref()).args(["--", dest,
             "bash -c 'set -o pipefail; curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh | XUI_NONINTERACTIVE=1 bash' 2>&1"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         match child {
@@ -179,7 +217,7 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
                 let status = child.wait();
                 let needs_result = status.as_ref().is_ok_and(|s| s.success()) && state.0.lock().map(|p| p.username.is_none() || p.password.is_none() || p.token.is_none() || p.url.is_none()).unwrap_or(false);
                 if needs_result {
-                    let result = ssh_command(password.as_deref(), askpass.as_ref(), ssh_port)
+                    let result = ssh_command(password.as_deref(), askpass.as_ref(), ssh_port, ssh_key.as_deref())
                         .args(["--", dest,
                             "if [ -f /etc/x-ui/install-result.env ]; then cat /etc/x-ui/install-result.env; else exit 44; fi"])
                         .stdin(Stdio::null()).stderr(Stdio::null()).output();
@@ -191,16 +229,18 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
                         }
                     }
                 }
+                // The key the panel will later be reached with: the chosen one, or the default pair that was just authorized.
+                let mut used_key = ssh_key.clone();
                 if install_key && status.as_ref().is_ok_and(|s| s.success()) {
-                    let message = match public_key_to_install() {
-                        None => "Публичный SSH-ключ не найден в ~/.ssh: добавьте ключ на сервер вручную, иначе управление панелью будет недоступно.".to_owned(),
-                        Some(key) => {
+                    let message = match key_to_install(ssh_key.as_deref()) {
+                        None => "Подходящий публичный SSH-ключ не найден в ~/.ssh: добавьте ключ на сервер вручную, иначе управление панелью будет недоступно.".to_owned(),
+                        Some((key_name, key)) => {
                             let script = "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; IFS= read -r k; grep -qxF \"$k\" ~/.ssh/authorized_keys || printf '%s\\n' \"$k\" >> ~/.ssh/authorized_keys";
-                            let spawned = ssh_command(password.as_deref(), askpass.as_ref(), ssh_port).args(["--", dest, script]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+                            let spawned = ssh_command(password.as_deref(), askpass.as_ref(), ssh_port, ssh_key.as_deref()).args(["--", dest, script]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
                             match spawned {
                                 Ok(mut child) => {
                                     if let Some(mut stdin) = child.stdin.take() { use std::io::Write; let _ = writeln!(stdin, "{key}"); }
-                                    if child.wait().is_ok_and(|s| s.success()) { "Ваш публичный SSH-ключ добавлен на сервер.".to_owned() }
+                                    if child.wait().is_ok_and(|s| s.success()) { used_key = Some(key_name); if ssh_key.is_some() { "Выбранный публичный SSH-ключ добавлен на сервер." } else { "Ваш публичный SSH-ключ добавлен на сервер." }.to_owned() }
                                     else { "Не удалось добавить SSH-ключ на сервер: управление панелью по SSH-туннелю может не работать.".to_owned() }
                                 }
                                 Err(_) => "Не удалось запустить системный SSH для добавления ключа.".to_owned(),
@@ -209,7 +249,24 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
                     };
                     if let Ok(mut p) = state.0.lock() { p.log.push(message); }
                 }
-                if let Ok(mut p) = state.0.lock() { p.running = false; p.finished = true; p.success = status.as_ref().map(|s| s.success()).unwrap_or(false); let message = match status { Ok(s) if s.success() => "Установка завершена.".to_owned(), Ok(s) => format!("Установка завершилась с ошибкой: код {}.", s.code().map(|c| c.to_string()).unwrap_or_else(|| "нет".into())), Err(_) => "Не удалось получить результат установки.".into() }; p.log.push(message); }
+                // Close the panel to the internet, but only if the tunnel will work: it needs key authentication.
+                if status.as_ref().is_ok_and(|s| s.success()) {
+                    let plain_http = state.0.lock().ok().and_then(|p| p.url.clone()).and_then(|u| tunnel_url(&u)).is_some();
+                    if plain_http {
+                        let key_works = ssh_command(None, None, ssh_port, ssh_key.as_deref()).args(["--", dest, "true"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+                        if !key_works {
+                            if let Ok(mut p) = state.0.lock() { p.log.push("Панель оставлена доступной из интернета: вход по SSH-ключу не настроен, без него приложение не сможет управлять закрытой панелью. Добавьте ключ и закройте панель: x-ui setting -listenIP 127.0.0.1.".into()); }
+                        } else {
+                            let result = ssh_command(None, None, ssh_port, ssh_key.as_deref()).args(["--", dest, BIND_LOCAL_SCRIPT]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+                            let code = result.as_ref().ok().and_then(|s| s.code());
+                            if let Ok(mut p) = state.0.lock() {
+                                p.log.push(bind_local_message(code).into());
+                                if code == Some(0) { p.local_only = true; if let Some(url) = p.url.as_deref().and_then(tunnel_url) { p.url = Some(url); } }
+                            }
+                        }
+                    }
+                }
+                if let Ok(mut p) = state.0.lock() { p.running = false; p.finished = true; p.success = status.as_ref().map(|s| s.success()).unwrap_or(false); if p.success { p.ssh_key = used_key; } let message = match status { Ok(s) if s.success() => "Установка завершена.".to_owned(), Ok(s) => format!("Установка завершилась с ошибкой: код {}.", s.code().map(|c| c.to_string()).unwrap_or_else(|| "нет".into())), Err(_) => "Не удалось получить результат установки.".into() }; p.log.push(message); }
             }
             Err(_) => { if let Ok(mut p) = state.0.lock() { p.running = false; p.finished = true; p.log.push("Не удалось запустить системный SSH.".into()); } }
         }
@@ -225,6 +282,17 @@ pub fn clear_install(state: tauri::State<'_, InstallState>) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_key_pair_skips_a_lone_public_key_and_reports_the_name_that_was_used() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("id_ed25519_vpn_client.pub"), "ssh-ed25519 AAAA app\n").unwrap(); // no private half
+        assert_eq!(default_key_pair_in(dir.path()), None);
+        std::fs::write(dir.path().join("id_ed25519"), "PRIVATE").unwrap();
+        std::fs::write(dir.path().join("id_ed25519.pub"), "ssh-ed25519 AAAA me\n").unwrap();
+        assert_eq!(default_key_pair_in(dir.path()), Some(("id_ed25519".into(), "ssh-ed25519 AAAA me".into())));
+        std::fs::write(dir.path().join("id_ed25519_vpn_client"), "PRIVATE").unwrap();
+        assert_eq!(default_key_pair_in(dir.path()).unwrap().0, "id_ed25519_vpn_client", "the app key wins once complete");
+    }
     #[test]
     fn askpass_prints_password_from_environment_and_cleans_up() {
         use std::os::unix::fs::PermissionsExt;
@@ -258,6 +326,33 @@ mod tests {
         assert_eq!(p.token.as_deref(), Some("secrettoken"));
         assert_eq!(p.url.as_deref(), Some("http://example.com:2053/base/"));
         let log = p.log.join(" "); for secret in ["secretuser", "secretpass", "secrettoken"] { assert!(!log.contains(secret)); }
+    }
+    #[test]
+    fn panel_is_bound_to_localhost_with_a_valid_confirmed_script() {
+        let status = Command::new("/bin/sh").args(["-n", "-c", BIND_LOCAL_SCRIPT]).status().unwrap();
+        assert!(status.success(), "bind script is not valid shell");
+        assert!(BIND_LOCAL_SCRIPT.contains("setting -listenIP 127.0.0.1"));
+        assert!(BIND_LOCAL_SCRIPT.contains("-getListen") && BIND_LOCAL_SCRIPT.contains("exit 48"));
+        assert!(bind_local_message(Some(0)).starts_with('✓'));
+        for code in [Some(45), Some(46), Some(47), Some(48), None, Some(255)] { assert!(!bind_local_message(code).starts_with('✓')); }
+    }
+    #[test]
+    fn password_login_never_offers_the_chosen_key_and_key_login_is_batch_only() {
+        let askpass = Askpass::create().unwrap();
+        let args = |c: &Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let with_password = args(&ssh_command(Some("pw"), Some(&askpass), None, Some("work")));
+        assert!(!with_password.iter().any(|a| a == "-i" || a == "IdentitiesOnly=yes"));
+        assert!(with_password.iter().any(|a| a.starts_with("PreferredAuthentications=password")));
+        // An unusable key name adds no identity (it was rejected before the install started) but stays non-interactive.
+        let by_key = args(&ssh_command(None, None, Some(2222), Some("../evil")));
+        assert!(!by_key.iter().any(|a| a == "-i") && by_key.iter().any(|a| a == "BatchMode=yes") && by_key.windows(2).any(|w| w == ["-p", "2222"]));
+    }
+    #[test]
+    fn only_plain_http_panel_urls_are_rewritten_to_the_tunnel() {
+        assert_eq!(tunnel_url("http://203.0.113.5:2053/abc/").as_deref(), Some("http://127.0.0.1:2053/abc/"));
+        assert_eq!(tunnel_url("http://127.0.0.1:2053/").as_deref(), Some("http://127.0.0.1:2053/"));
+        assert_eq!(tunnel_url("https://panel.example.com:2053/abc/"), None);
+        assert_eq!(tunnel_url("not a url"), None);
     }
     #[test]
     fn reads_result_file_without_exposing_secrets_or_overwriting_output() {

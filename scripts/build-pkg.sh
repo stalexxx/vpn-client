@@ -48,6 +48,8 @@ cp "$APP_BIN" "$APP/Contents/MacOS/VPNClient"
 cp "$HELPER_BIN" "$APP/Contents/Helpers/vpn-tun-helper"
 cp "$MCP_BIN" "$APP/Contents/Helpers/vpn-mcp"
 cp "$XRAY_OUT" "$APP/Contents/Helpers/xray"
+mkdir -p "$APP/Contents/Resources"
+cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # Domain/IP lists for geosite:/geoip: exclusions (from the official Xray release archive).
 if [ -n "${GEO_DIR:-}" ]; then
   mkdir -p "$APP/Contents/Resources"
@@ -61,6 +63,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
 <dict>
 	<key>CFBundleExecutable</key>
 	<string>VPNClient</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.vpn-client.app</string>
 	<key>CFBundleName</key>

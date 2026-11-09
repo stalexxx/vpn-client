@@ -72,6 +72,8 @@ fn vless_reality_config(link: &str, socks_port: u16) -> Result<Value, String> {
 
 /// Translate a VLESS TLS XHTTP share URL into an Xray client configuration.
 /// The returned configuration contains credentials and must be handled as secret.
+const TLS_FINGERPRINTS: &[&str] = &["chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized"];
+
 pub fn vless_xhttp_config(link: &str, socks_port: u16) -> Result<Value, String> {
     let url = Url::parse(link).map_err(|_| "Invalid VLESS link")?;
     if url.scheme() != "vless" || url.host_str().is_none() || url.password().is_some() {
@@ -139,6 +141,15 @@ pub fn vless_xhttp_config(link: &str, socks_port: u16) -> Result<Value, String> 
     } else {
         // 3x-ui share links omit the mode; "auto" proved unreliable against this server, stream-one works.
         xhttp["mode"] = json!("stream-one");
+    }
+    // Explicit ranges instead of the core's defaults: fixed values (and defaults that change between Xray versions)
+    // give the connection a recognisable pattern. Padding equals the server default, so any server accepts it;
+    // xmux is client-only and spreads connection lifetime/reuse and caps parallel streams per connection.
+    xhttp["xPaddingBytes"] = json!("100-1000");
+    xhttp["xmux"] = json!({"maxConcurrency": "16-32", "maxConnections": 0, "cMaxReuseTimes": 0, "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3000", "hKeepAlivePeriod": 0});
+    if let Some(fp) = fingerprint.as_deref() {
+        // A Go-default TLS fingerprint identifies a proxy; only browser (uTLS) profiles are accepted.
+        if !TLS_FINGERPRINTS.contains(&fp) { return Err("Unsupported TLS fingerprint".into()); }
     }
     if socks_port == 0 {
         return Err("Invalid local SOCKS port".into());
@@ -268,11 +279,19 @@ pub fn vless_tun_config_with_relay(link: &str, interface: &str, relay_link: Opti
     vless_tun_config_with_options(link, interface, relay_link, false, None, &Bypass::default())
 }
 
+/// The final routing rule of the TUN config: all remaining traffic goes to the VPN outbound.
+pub fn tail_rule() -> Value { json!({"type": "field", "network": "tcp,udp", "outboundTag": "vpn-out", "ruleTag": "tail"}) }
+/// Parked behind `tail` during a profile switch; becomes effective once `tail` is removed and drops everything.
+pub fn kill_rule() -> Value { json!({"type": "field", "network": "tcp,udp", "outboundTag": "block", "ruleTag": "kill"}) }
+
 /// Same as `vless_tun_config_with_relay`; `verbose` turns on the info level and the
 /// access log (it records destination addresses, so it is opt-in and diagnostic only).
 pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Option<&str>, verbose: bool, api_port: Option<u16>, bypass: &Bypass) -> Result<Value, String> {
-    if !interface.starts_with("utun") || !interface[4..].chars().all(|c| c.is_ascii_digit()) {
-        return Err("Invalid macOS TUN interface name".into());
+    let macos_name = interface.starts_with("utun") && interface[4..].chars().all(|c| c.is_ascii_digit());
+    // Windows (wintun) adapters have a free-form name; accept a short alphanumeric one.
+    let named = !interface.is_empty() && interface.len() <= 32 && interface.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !macos_name && !(cfg!(windows) && named) {
+        return Err("Invalid TUN interface name".into());
     }
     let mut config = vless_config(link, 10808)?;
     // Helper keeps Xray's stdout in a root-only xray.log; an empty access path sends the access log there.
@@ -280,7 +299,8 @@ pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Op
     if let Some(port) = api_port {
         config["stats"] = json!({});
         config["policy"] = json!({"system": {"statsOutboundUplink": true, "statsOutboundDownlink": true}});
-        config["api"] = json!({"tag": "api", "listen": format!("127.0.0.1:{port}"), "services": ["StatsService"]});
+        // HandlerService/RoutingService let the helper swap the VPN outbound in place (profile switch without restarting Xray).
+        config["api"] = json!({"tag": "api", "listen": format!("127.0.0.1:{port}"), "services": ["StatsService", "HandlerService", "RoutingService"]});
     }
     if verbose { config["log"] = json!({"loglevel": "info", "access": ""}); }
     if let Some(relay_link) = relay_link {
@@ -332,6 +352,11 @@ pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Op
     let ips: Vec<&String> = bypass.entries.iter().filter(|e| is_ip_entry(e)).collect();
     if !domains.is_empty() { rules.push(json!({"type": "field", "domain": domains, "outboundTag": "direct"})); }
     if !ips.is_empty() { rules.push(json!({"type": "field", "ip": ips, "outboundTag": "direct"})); }
+    // Everything else goes to the VPN via an explicit tail rule. A profile switch replaces the VPN outbound in place:
+    // the helper first parks a "kill" rule behind it, removes the tail rule (so everything is blackholed), swaps the
+    // outbound and restores the tail rule, so no step of the switch can send traffic around the tunnel.
+    config["outbounds"].as_array_mut().ok_or("Invalid outbound config")?.push(json!({"tag": "block", "protocol": "blackhole"}));
+    rules.push(tail_rule());
     config["routing"] = json!({"domainStrategy": "AsIs", "rules": rules});
     Ok(config)
 }
@@ -361,6 +386,10 @@ mod tests {
         assert_eq!(stream["tlsSettings"]["alpn"], json!(["h2"]));
         assert_eq!(stream["tlsSettings"]["fingerprint"], "firefox");
         assert_eq!(stream["xhttpSettings"]["mode"], "stream-one");
+        assert_eq!(stream["xhttpSettings"]["xPaddingBytes"], "100-1000");
+        assert_eq!(stream["xhttpSettings"]["xmux"]["maxConcurrency"], "16-32");
+        assert!(vless_xhttp_config(&format!("{link}&fp=golang"), 10808).is_err());
+        assert!(vless_xhttp_config(&format!("{link}&fp=chrome"), 10808).is_ok());
         let explicit = format!("{link}&mode=packet-up");
         let stream = &vless_xhttp_config(&explicit, 10808).unwrap()["outbounds"][0]["streamSettings"];
         assert_eq!(stream["xhttpSettings"]["mode"], "packet-up");
@@ -383,20 +412,26 @@ mod tests {
         assert_eq!(verbose["log"]["loglevel"], "info");
         assert_eq!(verbose["log"]["access"], "");
         assert_eq!(verbose["api"]["listen"], "127.0.0.1:18085");
-        assert_eq!(verbose["api"]["services"], json!(["StatsService"]));
+        assert_eq!(verbose["api"]["services"], json!(["StatsService", "HandlerService", "RoutingService"]));
         assert_eq!(verbose["policy"]["system"]["statsOutboundDownlink"], true);
         assert!(config.get("api").is_none());
         let custom=Bypass{bittorrent:false,entries:vec!["*.Example.org".into()," 10.1.0.0/16 ".into(),"2001:db8::/32".into(),"example.org".into()]};
         let routed=vless_tun_config_with_options(link,"utun10",None,false,None,&custom).unwrap();
         let rules=routed["routing"]["rules"].as_array().unwrap();
-        assert_eq!(rules.len(),3);
+        assert_eq!(rules.len(),4);
+        // The last rule sends the rest to the VPN; a blackhole outbound exists for the switch procedure.
+        assert_eq!(rules[3]["ruleTag"],"tail");
+        assert_eq!(rules[3]["outboundTag"],"vpn-out");
+        assert!(routed["routing"].get("balancers").is_none());
+        assert_eq!(kill_rule()["outboundTag"],"block");
+        assert!(routed["outbounds"].as_array().unwrap().iter().any(|o| o["tag"]=="block" && o["protocol"]=="blackhole"));
         assert_eq!(rules[0]["ip"],json!(["1.1.1.1","1.0.0.1"]));
         assert_eq!(rules[1]["domain"],json!(["domain:example.org"]));
         assert_eq!(rules[2]["ip"],json!(["10.1.0.0/16","2001:db8::/32"]));
         assert!(config["routing"]["rules"][0]["protocol"]==json!(["bittorrent"]));
         // Domain exclusions switch sniffing to destination override and the direct outbound to IPv4.
         assert_eq!(routed["inbounds"][0]["sniffing"]["routeOnly"], false);
-        assert_eq!(routed["outbounds"].as_array().unwrap().last().unwrap()["settings"]["domainStrategy"], "UseIPv4");
+        assert_eq!(routed["outbounds"].as_array().unwrap().iter().find(|o| o["tag"]=="direct").unwrap()["settings"]["domainStrategy"], "UseIPv4");
         assert_eq!(config["inbounds"][0]["sniffing"]["routeOnly"], true);
         assert_eq!(routed["dns"]["servers"], json!(["tcp://1.1.1.1","tcp://1.0.0.1"]));
         assert_eq!(routed["routing"]["rules"][0]["network"], "tcp");
