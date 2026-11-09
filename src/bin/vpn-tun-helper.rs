@@ -184,7 +184,7 @@ fn parse_stats(json_text: &str) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({"direct":{"up":totals[0][0],"down":totals[0][1]},"vpn":{"up":totals[1][0],"down":totals[1][1]},"ts_ms":ts_ms}))
 }
 fn tail_log(text: &str, lines: usize, filter: Option<&str>) -> String {
-    let mut picked: Vec<&str> = text.lines().filter(|l| filter.map_or(true, |f| l.contains(f))).collect();
+    let mut picked: Vec<&str> = text.lines().filter(|l| filter.is_none_or(|f| l.contains(f))).collect();
     if picked.len() > lines { picked.drain(..picked.len() - lines); }
     let mut out = picked.join("\n");
     if out.len() > 8000 {
@@ -638,7 +638,7 @@ fn connected(state: &HelperState) -> bool { tunnel_running(state) }
 fn handle(state: &mut HelperState, req: Request) -> Response {
     match req.action.as_str() {
         "status" => { let is_connected = connected(state); response(true, is_connected, if is_connected { "TUN подключён" } else { "TUN отключён" }) },
-        "start" => match req.link.as_deref() { Some(link) => match { let was = connected(state); start(state, link, req.relay_link.as_deref(), &req.bypass.clone().unwrap_or_default(), false).map(|m| (was, m)) } { Ok((was, m)) => { if !was { state.last = Some((link.to_owned(), req.relay_link.clone(), req.bypass.clone().unwrap_or_default())); } response(true, true, m) }, Err(e) => response(false, connected(state), e) }, None => response(false, connected(state), "Не передан профиль клиента") },
+        "start" => match req.link.as_deref() { Some(link) => { let was = connected(state); match start(state, link, req.relay_link.as_deref(), &req.bypass.clone().unwrap_or_default(), false) { Ok(m) => { if !was { state.last = Some((link.to_owned(), req.relay_link.clone(), req.bypass.clone().unwrap_or_default())); } response(true, true, m) }, Err(e) => response(false, connected(state), e) } }, None => response(false, connected(state), "Не передан профиль клиента") },
         "switch" => match req.link.as_deref() { Some(link) => switch(state, link, req.relay_link.as_deref(), &req.bypass.clone().unwrap_or_default()), None => response(false, connected(state), "Не передан профиль клиента") },
         "stop" => match stop(state, false) { Ok(()) => response(true, false, "VPN отключён; DNS восстановлен"), Err(e) => response(false, connected(state), e) },
         "log" => {

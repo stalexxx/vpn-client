@@ -16,7 +16,7 @@ fn token_store_at<F, T>(path: &std::path::Path, f: F) -> Result<T, String>
 where F: FnOnce(&mut std::collections::BTreeMap<String, String>) -> Result<(T, bool), String> {
     let dir = path.parent().ok_or("Некорректный путь хранилища токенов")?;
     fs::create_dir_all(dir).map_err(|_| "Не удалось создать каталог токенов")?;
-    let lock = fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+    let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600)
         .open(dir.join("panel-tokens.lock")).map_err(|_| "Не удалось открыть хранилище токенов")?;
     #[cfg(unix)] { use std::os::fd::AsRawFd; if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 { return Err("Не удалось заблокировать хранилище токенов".into()); } }
     #[cfg(not(unix))] let _ = &lock;
@@ -609,13 +609,13 @@ fn enable_warp_on(server: &Server) -> Result<String, String> {
     let answer = panel_send(&server.panel, &token, "xray/warp/reg", PanelBody::Form(vec![("privateKey", private_key.clone()), ("publicKey", public_key)]))?;
     let registration: serde_json::Value = serde_json::from_str(answer["obj"].as_str().ok_or("Панель не зарегистрировала WARP")?).map_err(|_| "Некорректный ответ регистрации WARP")?;
     let updated = template_with_warp(&template, warp_outbound(&private_key, &registration)?)?;
-    write_private(&warp_backup_path(&server)?, template.to_string().as_bytes())?;
+    write_private(&warp_backup_path(server)?, template.to_string().as_bytes())?;
     apply_xray_template(&server.panel, &token, &updated, &test_url)?;
     if !xray_running_after_restart(&server.panel, &token) {
         apply_xray_template(&server.panel, &token, &template, &test_url)?;
-        return Err(format!("Xray не запустился с WARP; прежний шаблон восстановлен (копия: {})", warp_backup_path(&server)?.display()));
+        return Err(format!("Xray не запустился с WARP; прежний шаблон восстановлен (копия: {})", warp_backup_path(server)?.display()));
     }
-    Ok(format!("WARP включён на сервере {}: весь трафик пользователей выходит через Cloudflare. Копия прежнего шаблона: {}", server.panel.name, warp_backup_path(&server)?.display()))
+    Ok(format!("WARP включён на сервере {}: весь трафик пользователей выходит через Cloudflare. Копия прежнего шаблона: {}", server.panel.name, warp_backup_path(server)?.display()))
 }
 /// Removes the WARP outbound and its rules; the rest of the template is left as it is on the server.
 pub fn disable_warp_for_host(host: &str) -> Result<String, String> { disable_warp_on(&server_by_host(host)?) }
