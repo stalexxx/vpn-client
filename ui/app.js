@@ -66,7 +66,7 @@ function renderProfiles() {
     const row = document.createElement('button'); row.type='button'; row.className='profile-row'; row.setAttribute('aria-pressed', String(key(p) === selectedProfileKey)); row.disabled = busy || mode === 'proxy'; row.dataset.active = String(mode === 'tun' && key(p) === connectedKey);
     const country = document.createElement('span'); country.className='profile-flag'; country.textContent=flag(p.country) || '🌐';
     const copy = document.createElement('span'); copy.className='profile-copy';
-    const server = document.createElement('strong'); server.className='profile-server'; server.textContent=p.server_name || 'Сервер'; if (p.imported) { const tag=document.createElement('span'); tag.className='profile-tag'; tag.textContent=p.transport==='hysteria2'?'импорт · hy2':'импорт'; server.textContent=p.host || 'Импорт'; server.append(tag); }
+    const server = document.createElement('strong'); server.className='profile-server'; server.textContent=p.server_name || 'Сервер'; if (p.imported) { const tag=document.createElement('span'); tag.className='profile-tag'; tag.textContent=p.transport==='hysteria2'?'импорт · hy2':p.transport==='awg'?'импорт · awg':'импорт'; server.textContent=p.host || 'Импорт'; server.append(tag); }
     const client = document.createElement('span'); client.className='profile-client'; client.textContent=p.email;
     copy.append(server,client); row.append(country,copy,probeBadge(p)); row.addEventListener('click',()=>{ selectedProfileKey=key(p); localStorage.setItem('vpn.selectedProfile', selectedProfileKey); syncMcpSelection().catch(e=>{ $('connection-error').textContent=`Не удалось сохранить выбор для MCP: ${e}`; $('connection-error').hidden=false; }); renderProfiles(); connectionState(mode); if(mode==='tun' && key(p)!==connectedKey) switchProfile(); }); list.append(p.imported ? importedItem(p, row, client) : row);
   }
@@ -181,7 +181,7 @@ document.addEventListener('keydown',e=>{ if(e.key==='Escape' && !importModal.hid
 $('import-paste').addEventListener('click',async()=>{ try{ const text=await navigator.clipboard.readText(); if(!text.trim()){ importMessage('Буфер обмена пуст.'); return; } $('import-text').value=text; importMessage(''); }catch{ importMessage('Нет доступа к буферу. Вставьте ссылку в поле вручную (⌘V).'); $('import-text').focus(); } });
 $('import-submit').addEventListener('click',async()=>{
   const text=$('import-text').value, name=$('import-name').value.trim();
-  if(!text.trim()){ importMessage('Вставьте ссылку vless:// или hysteria2://'); return; }
+  if(!text.trim()){ importMessage('Вставьте ссылку vless://, hysteria2://, vpn:// или конфиг AmneziaWG'); return; }
   $('import-submit').disabled=true; importMessage('Проверяем…',true);
   try{ const added=await invoke('import_profiles',{text,name:name||null}); await loadProfiles(); const first=profiles.find(p=>p.imported && p.imported_id===added[0].id); if(first && mode==='off'){ selectedProfileKey=key(first); localStorage.setItem('vpn.selectedProfile',selectedProfileKey); await syncMcpSelection(); renderProfiles(); connectionState(mode); } closeImport(); $('connection-message').textContent=added.length>1 ? `Импортировано конфигураций: ${added.length}.` : `Импортирована конфигурация «${added[0].name}».`; }
   catch(e){ importMessage(String(e)); }

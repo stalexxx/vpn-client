@@ -7,7 +7,9 @@ pub fn connect_imported_inner(
 ) -> Result<String, String> {
     prepare_tun(state, tray)?.map_or_else(|| {
         let link = vpn_core::imported_share_link(id)?;
-        let relay = if link.starts_with("hysteria2://") {
+        let relay = if link.starts_with(vpn_core::awglink::SCHEME) {
+            None
+        } else if link.starts_with("hysteria2://") {
             Some(vpn_core::imported_relay_link(id)?.ok_or("Для Hysteria 2 в этой сети нужен доступный VLESS/XHTTP relay: добавьте клиента VLESS/XHTTP на сервере или импортируйте vless-ссылку")?)
         } else if vpn_core::profile::vless_config(&link, 10808)?["outbounds"][0]["streamSettings"]["security"] == "reality" {
             vpn_core::reality_relay_link()?

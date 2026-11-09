@@ -48,6 +48,15 @@ cp "$APP_BIN" "$APP/Contents/MacOS/VPNClient"
 cp "$HELPER_BIN" "$APP/Contents/Helpers/vpn-tun-helper"
 cp "$MCP_BIN" "$APP/Contents/Helpers/vpn-mcp"
 cp "$XRAY_OUT" "$APP/Contents/Helpers/xray"
+# Embedded AmneziaWG client (tools/awgsocks/build.sh puts both architectures into assets/).
+if [ "${UNIVERSAL:-0}" = 1 ]; then
+  lipo -create -output "$APP/Contents/Helpers/awgsocks" "$ROOT/assets/awgsocks-darwin-arm64" "$ROOT/assets/awgsocks-darwin-amd64"
+elif [ "${TARGET:-}" = x86_64-apple-darwin ] || [ -z "${TARGET:-}" ] && [ "$(uname -m)" = x86_64 ]; then
+  cp "$ROOT/assets/awgsocks-darwin-amd64" "$APP/Contents/Helpers/awgsocks"
+else
+  cp "$ROOT/assets/awgsocks-darwin-arm64" "$APP/Contents/Helpers/awgsocks"
+fi
+chmod 755 "$APP/Contents/Helpers/awgsocks"
 mkdir -p "$APP/Contents/Resources"
 cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # Domain/IP lists for geosite:/geoip: exclusions (from the official Xray release archive).
@@ -83,7 +92,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-codesign --force --sign - "$APP/Contents/Helpers/xray" "$APP/Contents/Helpers/vpn-tun-helper" "$APP/Contents/Helpers/vpn-mcp"
+codesign --force --sign - "$APP/Contents/Helpers/xray" "$APP/Contents/Helpers/awgsocks" "$APP/Contents/Helpers/vpn-tun-helper" "$APP/Contents/Helpers/vpn-mcp"
 codesign --force --sign - "$APP"
 
 PKG="$OUT/VPNClient-$VERSION.pkg"

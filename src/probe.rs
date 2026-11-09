@@ -52,10 +52,10 @@ fn random_between(lo: u64, hi: u64) -> u64 {
     lo + u64::from_le_bytes(bytes) % (hi - lo + 1)
 }
 
-/// Host and port a share link connects to. Hysteria 2 (QUIC over UDP) is flagged `udp`.
+/// Host and port a share link connects to. Hysteria 2 (QUIC) and AmneziaWG are UDP and flagged `udp`.
 pub fn target_from_link(key: &str, link: &str) -> Option<Target> {
     let url = url::Url::parse(link).ok()?;
-    let udp = url.scheme() == "hysteria2" || url.scheme() == "hy2";
+    let udp = matches!(url.scheme(), "hysteria2" | "hy2" | "awg");
     let host = url.host_str()?.trim_start_matches('[').trim_end_matches(']').to_owned();
     let port = url.port().or(if udp { Some(443) } else { None })?;
     if host.is_empty() || port == 0 { return None; }

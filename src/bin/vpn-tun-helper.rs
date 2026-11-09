@@ -14,12 +14,13 @@ use std::{
 const SOCKET: &str = "/var/run/vpnclient-tun.sock";
 const HELPER_DIR: &str = "/Library/Application Support/VpnClientHelper";
 const ASSET_DIR: &str = "/Library/PrivilegedHelperTools/vpnclient-assets";
+const AWG_BIN: &str = "/Library/PrivilegedHelperTools/local.vpn-client.awgsocks";
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Deserialize)]
 struct Request { action: String, #[serde(default)] link: Option<String>, #[serde(default)] relay_link: Option<String>, #[serde(default)] lines: Option<usize>, #[serde(default)] filter: Option<String>, #[serde(default)] level: Option<String>, #[serde(default)] bypass: Option<vpn_core::profile::Bypass> }
 #[derive(Serialize)]
-struct Response { ok: bool, connected: bool, message: String, version: &'static str, connectivity_check: bool, reality_support: bool, hysteria2_support: bool, hysteria_chain_support: bool }
+struct Response { ok: bool, connected: bool, message: String, version: &'static str, connectivity_check: bool, reality_support: bool, hysteria2_support: bool, hysteria_chain_support: bool, awg_support: bool }
 #[derive(Clone, Serialize, Deserialize)]
 struct ProcessRecord { pid: u32, config_path: String, xray_path: String, tun_name: String, #[serde(default)] start_time: String }
 #[derive(Serialize, Deserialize)]
@@ -31,7 +32,7 @@ struct HelperState { uid: u32, xray: PathBuf, active: Option<Tunnel>, last: Opti
 enum DnsRestoreAction { RestoreOriginal, AlreadyRestored, Conflict }
 
 fn root_path(name: &str) -> PathBuf { Path::new(HELPER_DIR).join(name) }
-fn response(ok: bool, connected: bool, message: impl Into<String>) -> Response { Response { ok, connected, message: message.into(), version: HELPER_VERSION, connectivity_check: true, reality_support: true, hysteria2_support: true, hysteria_chain_support: true } }
+fn response(ok: bool, connected: bool, message: impl Into<String>) -> Response { Response { ok, connected, message: message.into(), version: HELPER_VERSION, connectivity_check: true, reality_support: true, hysteria2_support: true, hysteria_chain_support: true, awg_support: true } }
 fn process_info(pid: u32) -> Result<Option<(String, String)>, String> {
     let command = Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "command="]).output().map_err(|e| e.to_string())?;
     if !command.status.success() { return Ok(None); }
@@ -189,6 +190,7 @@ fn terminate_child(child: &mut Child) -> Result<(), String> {
 }
 fn rollback_start(child: Option<&mut Child>, config_path: &Path) -> Result<(), String> {
     if let Some(child) = child { terminate_child(child)?; }
+    kill_awg();
     let _ = fs::remove_file(root_path("process.json"));
     let _ = fs::remove_file(config_path);
     restore_dns()
@@ -273,8 +275,64 @@ fn verify_tunnel_connectivity(tun: &str) -> Result<(), String> {
         }
     }
 }
-/// `hot`: DNS is already pinned by the previous tunnel (kept by `stop(.., true)`), so it is neither restored nor re-journaled.
+static AWG_CHILD: Mutex<Option<Child>> = Mutex::new(None);
+/// Stops the embedded AmneziaWG client (and removes its config), also one left over by a previous helper process.
+fn kill_awg() {
+    let child = AWG_CHILD.lock().ok().and_then(|mut g| g.take());
+    if let Some(mut child) = child { let _ = terminate_child(&mut child); }
+    else if let Some(pid) = fs::read_to_string(root_path("awg.pid")).ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+        if process_info(pid).ok().flatten().is_some_and(|(command, _)| command.contains(AWG_BIN)) {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            thread::sleep(Duration::from_millis(300));
+            if process_info(pid).ok().flatten().is_some_and(|(command, _)| command.contains(AWG_BIN)) { unsafe { libc::kill(pid as i32, libc::SIGKILL); } }
+        }
+    }
+    let _ = fs::remove_file(root_path("awg.pid")); let _ = fs::remove_file(root_path("awg.conf"));
+}
+/// Runs the AmneziaWG client of an `awg://` profile as a loopback SOCKS5 proxy whose UDP sockets are pinned to the
+/// physical interface (so the tunnel to the server never enters our own TUN) and returns the `socks5://` link for Xray.
+fn start_awg(link: &str) -> Result<String, String> {
+    kill_awg();
+    let conf = vpn_core::awglink::link_to_conf(link)?;
+    let route = Command::new("/sbin/route").args(["-n", "get", "default"]).output().map_err(|e| e.to_string())?;
+    let iface = default_route_interface(&String::from_utf8_lossy(&route.stdout))?;
+    if iface.starts_with("utun") { return Err("Маршрут по умолчанию ведёт в другой туннель: отключите его перед подключением AmneziaWG.".into()); }
+    let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).map_err(|e| e.to_string())?;
+    let conf_path = root_path("awg.conf");
+    write_secure(&conf_path, conf.as_bytes())?;
+    let log = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(root_path("awg.log")).map_err(|e| e.to_string())?;
+    let log_err = log.try_clone().map_err(|e| e.to_string())?;
+    let child = Command::new(AWG_BIN).arg(&conf_path).arg(format!("127.0.0.1:{port}")).env("AWG_BIND_IFACE", &iface)
+        .stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log_err)).spawn().map_err(|e| format!("Не удалось запустить клиент AmneziaWG: {e}"))?;
+    let pid = child.id();
+    if let Ok(mut g) = AWG_CHILD.lock() { *g = Some(child); }
+    let _ = write_secure(&root_path("awg.pid"), pid.to_string().as_bytes());
+    for _ in 0..100 {
+        if let Ok(mut g) = AWG_CHILD.lock() {
+            if let Some(status) = g.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+                drop(g);
+                let log = fs::read_to_string(root_path("awg.log")).unwrap_or_default();
+                kill_awg();
+                return Err(format!("Клиент AmneziaWG завершился ({status}): {}", log.lines().last().unwrap_or("нет сообщения")));
+            }
+        }
+        if TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(100)).is_ok() { return Ok(format!("socks5://127.0.0.1:{port}")); }
+        thread::sleep(Duration::from_millis(100));
+    }
+    kill_awg();
+    Err("Клиент AmneziaWG не запустился за 10 секунд".into())
+}
+fn tunnel_running(state: &HelperState) -> bool {
+    state.active.as_ref().is_some_and(|t| process_matches(&t.record)) || read_record().ok().flatten().is_some_and(|r| process_matches(&r))
+}
 fn start(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: &vpn_core::profile::Bypass, hot: bool) -> Result<String, String> {
+    if !link.starts_with(vpn_core::awglink::SCHEME) { return start_tunnel(state, link, relay_link, bypass, hot); }
+    if tunnel_running(state) { return Ok("VPN уже подключён через TUN.".into()); }
+    let socks = start_awg(link)?;
+    match start_tunnel(state, &socks, None, bypass, hot) { Ok(m) => Ok(m), Err(e) => { kill_awg(); Err(e) } }
+}
+/// `hot`: DNS is already pinned by the previous tunnel (kept by `stop(.., true)`), so it is neither restored nor re-journaled.
+fn start_tunnel(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: &vpn_core::profile::Bypass, hot: bool) -> Result<String, String> {
     if let Some(t) = state.active.as_ref() { if process_matches(&t.record) { return Ok("VPN уже подключён через TUN.".into()); } }
     if let Some(mut old) = state.active.take() { if let Some(child) = old.child.as_mut() { let _ = child.try_wait(); } }
     if let Some(record) = read_record()? {
@@ -359,6 +417,7 @@ fn stop(state: &mut HelperState, keep_dns: bool) -> Result<(), String> {
     let mut tunnel = state.active.take();
     let record = match tunnel.as_ref() { Some(t) => Some(t.record.clone()), None => read_record()? };
     let Some(record) = record else {
+        kill_awg();
         if !keep_dns { restore_dns()?; }
         let _ = fs::remove_file(root_path("config.json"));
         return Ok(());
@@ -374,6 +433,7 @@ fn stop(state: &mut HelperState, keep_dns: bool) -> Result<(), String> {
         if process_matches(&record) { unsafe { libc::kill(record.pid as i32, libc::SIGKILL); } return Err("Xray не завершился; журнал сохранён.".into()); }
     }
     if let Some(mut t) = tunnel { if let Some(child) = t.child.as_mut() { let _ = child.wait(); } }
+    kill_awg();
     let _ = fs::remove_file(root_path("process.json")); let _ = fs::remove_file(root_path("config.json"));
     if !keep_dns { restore_dns()?; }
     Ok(())
@@ -483,9 +543,7 @@ fn hot_switch(state: &HelperState, link: &str, relay_link: Option<&str>, bypass:
         Err(e) => HotSwitch::Failed(format!("Не удалось переключить профиль: {error}; не удалось вернуть прежний ({e}). Трафик заблокирован: отключите и подключите VPN заново")),
     }
 }
-fn connected(state: &HelperState) -> bool {
-    state.active.as_ref().is_some_and(|t| process_matches(&t.record)) || read_record().ok().flatten().is_some_and(|r| process_matches(&r))
-}
+fn connected(state: &HelperState) -> bool { tunnel_running(state) }
 fn handle(state: &mut HelperState, req: Request) -> Response {
     match req.action.as_str() {
         "status" => { let is_connected = connected(state); response(true, is_connected, if is_connected { "TUN подключён" } else { "TUN отключён" }) },
@@ -549,6 +607,7 @@ fn serve(uid: u32, xray: PathBuf) -> Result<(), String> {
             if let Err(e) = restore_dns() { eprintln!("vpn-tun-helper: startup recovery: {e}"); }
         }
     } else if let Err(e) = restore_dns() { eprintln!("vpn-tun-helper: startup DNS recovery: {e}"); }
+    if state.active.is_none() { kill_awg(); }
     let state = Arc::new(Mutex::new(state));
     let monitor_state = Arc::clone(&state);
     thread::spawn(move || loop {
@@ -595,6 +654,7 @@ fn reap_exited_process(state: &mut HelperState) {
     if let Some(mut tunnel) = state.active.take() {
         if let Some(child) = tunnel.child.as_mut() { let _ = child.try_wait(); }
     }
+    kill_awg();
     let _ = fs::remove_file(root_path("process.json"));
     let _ = fs::remove_file(root_path("config.json"));
     if let Err(e) = restore_dns() { eprintln!("vpn-tun-helper: failed to restore DNS after Xray exit: {e}"); }

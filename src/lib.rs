@@ -1430,12 +1430,13 @@ fn write_imported(path: &std::path::Path, items: &[ImportedProfile]) -> Result<(
 fn imported_summary(item: &ImportedProfile) -> serde_json::Value {
     let url = url::Url::parse(&item.share_link).ok();
     let hysteria = url.as_ref().is_some_and(|u| u.scheme() == "hysteria2");
+    let awg = url.as_ref().is_some_and(|u| u.scheme() == "awg");
     let query = |name: &str| url.as_ref().and_then(|u| u.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()));
     serde_json::json!({
         "id": item.id, "name": item.name,
         "host": url.as_ref().and_then(|u| u.host_str()).unwrap_or(""),
         "port": url.as_ref().and_then(|u| u.port()).unwrap_or(443),
-        "transport": if hysteria { "hysteria2".into() } else { query("type").unwrap_or_else(|| "tcp".into()) },
+        "transport": if awg { "awg".into() } else if hysteria { "hysteria2".into() } else { query("type").unwrap_or_else(|| "tcp".into()) },
         "security": query("security").unwrap_or_default(),
     })
 }
@@ -1450,20 +1451,25 @@ fn extract_share_links(text: &str) -> Vec<String> {
         .map(str::to_owned).collect()
 }
 fn import_profiles_at(path: &std::path::Path, text: &str, name: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
-    let links = extract_share_links(text);
-    if links.is_empty() { return Err("В тексте нет ссылки vless:// или hysteria2://".into()); }
-    if name.is_some() && links.len() > 1 { return Err("Название можно задать только для одной ссылки".into()); }
+    // (link, suggested name): vless/hysteria2 links plus AmneziaWG (awg://, vpn://, a whole .conf).
+    let mut candidates: Vec<Result<(String, Option<String>), String>> = extract_share_links(text).into_iter().map(|l| Ok((l, None))).collect();
+    candidates.extend(crate::awglink::extract_awg(text));
+    if candidates.is_empty() { return Err("В тексте нет ссылки vless://, hysteria2://, vpn:// или конфигурации AmneziaWG".into()); }
+    if name.is_some() && candidates.len() > 1 { return Err("Название можно задать только для одной ссылки".into()); }
     let _guard = IMPORT_LOCK.lock().map_err(|_| "Не удалось заблокировать список импортированных конфигураций")?;
     let mut items = read_imported(path)?;
     let mut added = Vec::new();
     let mut last_error = None;
-    for link in links {
+    for candidate in candidates {
+        let (link, suggested) = match candidate { Ok(v) => v, Err(e) => { last_error = Some(format!("Некорректная ссылка: {e}")); continue; } };
         let link = match link.strip_prefix("hy2://") { Some(rest) => format!("hysteria2://{rest}"), None => link };
-        if let Err(e) = crate::profile::vless_config(&link, 10808) { last_error = Some(format!("Некорректная ссылка: {e}")); continue; }
+        let is_awg = link.starts_with(crate::awglink::SCHEME);
+        if !is_awg { if let Err(e) = crate::profile::vless_config(&link, 10808) { last_error = Some(format!("Некорректная ссылка: {e}")); continue; } }
         if items.iter().any(|item| item.share_link == link) { last_error = Some("Эта конфигурация уже импортирована".into()); continue; }
         let parsed = url::Url::parse(&link).map_err(|_| "Некорректная ссылка")?;
         let fragment: String = url::form_urlencoded::parse(parsed.fragment().unwrap_or("").replace('+', "%2B").as_bytes()).map(|(k, v)| if v.is_empty() { k.into_owned() } else { format!("{k}={v}") }).collect();
-        let chosen = match name { Some(n) => valid_import_name(n)?, None => valid_import_name(&fragment).or_else(|_| valid_import_name(parsed.host_str().unwrap_or("Импорт")))? };
+        let fallback = suggested.as_deref().map(valid_import_name).and_then(Result::ok);
+        let chosen = match name { Some(n) => valid_import_name(n)?, None => valid_import_name(&fragment).ok().or(fallback).map(Ok).unwrap_or_else(|| valid_import_name(parsed.host_str().unwrap_or("Импорт")))? };
         let item = ImportedProfile { id: new_server_id()?, name: chosen, share_link: link, added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) };
         added.push(imported_summary(&item));
         items.push(item);
@@ -1590,6 +1596,20 @@ mod tests {
         assert_eq!(lists["geosite"], serde_json::json!([]));
         fs::write(dir.path().join("geoip.dat"), [0x0a, 0x7f]).unwrap();
         assert!(geo_codes(&dir.path().join("geoip.dat")).is_err());
+    }
+
+    #[test]
+    fn imports_amneziawg_conf_and_vpn_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("imported.json");
+        let conf = "[Interface]\nPrivateKey = cGxlYXNlLWRvLW5vdC11c2UtdGhpcy1rZXktMDAwMDA=\nAddress = 10.8.1.2/32\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = cGxlYXNlLWRvLW5vdC11c2UtdGhpcy1rZXktMDAwMDA=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.5:47821\n";
+        let added = import_profiles_at(&path, conf, Some("silicon")).unwrap();
+        assert_eq!((added[0]["transport"].as_str(), added[0]["host"].as_str(), added[0]["port"].as_u64()), (Some("awg"), Some("203.0.113.5"), Some(47821)));
+        assert!(import_profiles_at(&path, conf, None).is_err(), "the same config is not imported twice");
+        assert!(import_profiles_at(&path, "[Interface]\n[Peer]\n", None).is_err());
+        let stored = read_imported(&path).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(crate::awglink::link_to_conf(&stored[0].share_link).unwrap(), conf);
     }
 
     #[test]
@@ -1923,6 +1943,7 @@ pub mod proxy;
 pub mod client_plan;
 
 pub mod probe;
+pub mod awglink;
 
 #[cfg(unix)]
 pub mod amnezia;

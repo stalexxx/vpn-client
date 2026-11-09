@@ -12,6 +12,7 @@ const SOCKET: &str = "/var/run/vpnclient-tun.sock";
 const LABEL: &str = "local.vpn-client.tun-helper";
 const HELPER_DEST: &str = "/Library/PrivilegedHelperTools/local.vpn-client.tun-helper";
 const XRAY_DEST: &str = "/Library/PrivilegedHelperTools/local.vpn-client.xray";
+const AWG_DEST: &str = "/Library/PrivilegedHelperTools/local.vpn-client.awgsocks";
 const ASSET_DIR: &str = "/Library/PrivilegedHelperTools/vpnclient-assets";
 const PLIST_DEST: &str = "/Library/LaunchDaemons/local.vpn-client.tun-helper.plist";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,6 +39,7 @@ fn helper_is_compatible(status: &Value) -> bool {
         && status.get("reality_support").and_then(Value::as_bool) == Some(true)
         && status.get("hysteria2_support").and_then(Value::as_bool) == Some(true)
         && status.get("hysteria_chain_support").and_then(Value::as_bool) == Some(true)
+        && status.get("awg_support").and_then(Value::as_bool) == Some(true)
 }
 fn osascript_admin(command: &str) -> Result<(), String> {
     let script = format!("do shell script \"{}\" with administrator privileges", command.replace('\\', "\\\\").replace('"', "\\\""));
@@ -78,7 +80,7 @@ fn verify_bundle_path(path: &Path, executable: bool) -> Result<(), String> {
     }
     Ok(())
 }
-fn install_command(helper: &std::path::Path, xray: &std::path::Path, geo: &[std::path::PathBuf], plist: &str) -> String {
+fn install_command(helper: &std::path::Path, xray: &std::path::Path, awg: &std::path::Path, geo: &[std::path::PathBuf], plist: &str) -> String {
     let (mut geo_verify, mut geo_stage, mut geo_install) = (String::new(), String::new(), String::new());
     if geo.len() == 2 {
         for (i, path) in geo.iter().enumerate() {
@@ -91,8 +93,8 @@ fn install_command(helper: &std::path::Path, xray: &std::path::Path, geo: &[std:
         geo_install = format!("/usr/bin/install -d -o root -g wheel -m 755 {}; {geo_install}", shell_quote(ASSET_DIR));
     }
     format!(
-        "set -e; verify_source() {{ p=\"$1\"; /bin/test -f \"$p\"; while :; do /bin/test ! -L \"$p\"; /bin/test \"$(/usr/bin/stat -f %u \"$p\")\" = 0; mode=$(/usr/bin/stat -f %Lp \"$p\"); if /bin/test \"$p\" = /Applications; then /bin/test $((0$mode & 02)) -eq 0; /bin/test \"$(/usr/bin/stat -f %g \"$p\")\" = 80; else /bin/test $((0$mode & 022)) -eq 0; fi; /bin/test \"$p\" != / || break; p=$(/usr/bin/dirname \"$p\"); done; }}; verify_source {helper}; verify_source {xray}; {geo_verify}/bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons; stage=/Library/PrivilegedHelperTools/.vpnclient-stage-$$; /bin/mkdir -m 700 \"$stage\"; trap '/bin/rm -rf \"$stage\"' EXIT; /usr/bin/install -o root -g wheel -m 755 {helper} \"$stage/helper\"; /usr/bin/install -o root -g wheel -m 755 {xray} \"$stage/xray\"; {geo_stage}/bin/test \"$(/usr/bin/stat -f %u \"$stage/helper\")\" = 0; /bin/test \"$(/usr/bin/stat -f %u \"$stage/xray\")\" = 0; /bin/launchctl bootout system/{label} >/dev/null 2>&1 || true; /usr/bin/install -o root -g wheel -m 755 \"$stage/helper\" {helper_dest}; /usr/bin/install -o root -g wheel -m 755 \"$stage/xray\" {xray_dest}; {geo_install}/usr/bin/printf %s {plist} > {plist_dest}; /usr/sbin/chown root:wheel {plist_dest}; /bin/chmod 644 {plist_dest}; /bin/launchctl bootstrap system {plist_dest}; /bin/launchctl enable system/{label}",
-        helper = shell_quote(&helper.to_string_lossy()), xray = shell_quote(&xray.to_string_lossy()),
+        "set -e; verify_source() {{ p=\"$1\"; /bin/test -f \"$p\"; while :; do /bin/test ! -L \"$p\"; /bin/test \"$(/usr/bin/stat -f %u \"$p\")\" = 0; mode=$(/usr/bin/stat -f %Lp \"$p\"); if /bin/test \"$p\" = /Applications; then /bin/test $((0$mode & 02)) -eq 0; /bin/test \"$(/usr/bin/stat -f %g \"$p\")\" = 80; else /bin/test $((0$mode & 022)) -eq 0; fi; /bin/test \"$p\" != / || break; p=$(/usr/bin/dirname \"$p\"); done; }}; verify_source {helper}; verify_source {xray}; verify_source {awg}; {geo_verify}/bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons; stage=/Library/PrivilegedHelperTools/.vpnclient-stage-$$; /bin/mkdir -m 700 \"$stage\"; trap '/bin/rm -rf \"$stage\"' EXIT; /usr/bin/install -o root -g wheel -m 755 {helper} \"$stage/helper\"; /usr/bin/install -o root -g wheel -m 755 {xray} \"$stage/xray\"; /usr/bin/install -o root -g wheel -m 755 {awg} \"$stage/awg\"; {geo_stage}/bin/test \"$(/usr/bin/stat -f %u \"$stage/helper\")\" = 0; /bin/test \"$(/usr/bin/stat -f %u \"$stage/xray\")\" = 0; /bin/test \"$(/usr/bin/stat -f %u \"$stage/awg\")\" = 0; /bin/launchctl bootout system/{label} >/dev/null 2>&1 || true; /usr/bin/install -o root -g wheel -m 755 \"$stage/helper\" {helper_dest}; /usr/bin/install -o root -g wheel -m 755 \"$stage/xray\" {xray_dest}; /usr/bin/install -o root -g wheel -m 755 \"$stage/awg\" {awg_dest}; {geo_install}/usr/bin/printf %s {plist} > {plist_dest}; /usr/sbin/chown root:wheel {plist_dest}; /bin/chmod 644 {plist_dest}; /bin/launchctl bootstrap system {plist_dest}; /bin/launchctl enable system/{label}",
+        helper = shell_quote(&helper.to_string_lossy()), xray = shell_quote(&xray.to_string_lossy()), awg = shell_quote(&awg.to_string_lossy()), awg_dest = shell_quote(AWG_DEST),
         geo_verify = geo_verify, geo_stage = geo_stage, geo_install = geo_install,
         label = LABEL, helper_dest = shell_quote(HELPER_DEST), xray_dest = shell_quote(XRAY_DEST),
         plist = shell_quote(&plist), plist_dest = shell_quote(PLIST_DEST),
@@ -109,7 +111,8 @@ pub fn ensure_installed() -> Result<(), String> {
     let helpers = bundle_helpers()?;
     let helper = helpers.join("vpn-tun-helper");
     let xray = helpers.join("xray");
-    for path in [&helper, &xray] { verify_bundle_source(path)?; }
+    let awg = helpers.join("awgsocks");
+    for path in [&helper, &xray, &awg] { verify_bundle_source(path)?; }
     // Xray's geoip.dat / geosite.dat travel with it (installed root-owned into ASSET_DIR) when the bundle has them.
     let geo: Vec<std::path::PathBuf> = ["geoip.dat", "geosite.dat"].iter().filter_map(|n| helpers.parent().map(|contents| contents.join("Resources").join(n))).filter(|p| p.exists()).collect();
     for path in &geo { verify_bundle_data(path)?; }
@@ -118,7 +121,7 @@ pub fn ensure_installed() -> Result<(), String> {
     let uid = meta.uid();
     let xray_dest = XRAY_DEST.to_owned();
     let plist = launchd_plist(uid, &xray_dest);
-    let command = install_command(&helper, &xray, &geo, &plist);
+    let command = install_command(&helper, &xray, &awg, &geo, &plist);
     osascript_admin(&command)?;
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
@@ -177,7 +180,8 @@ mod tests {
         assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true})));
         assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true})));
         assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true})));
-        assert!(helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true})));
+        assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true})));
+        assert!(helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true,"awg_support":true})));
     }
     #[test]
     fn only_applications_may_be_admin_group_writable() {
@@ -195,16 +199,18 @@ mod tests {
         use std::path::PathBuf;
         let helper = PathBuf::from("/Applications/VPNClient.app/Contents/Helpers/vpn-tun-helper");
         let xray = PathBuf::from("/Applications/VPNClient.app/Contents/Helpers/xray");
+        let awg = PathBuf::from("/Applications/VPNClient.app/Contents/Helpers/awgsocks");
         let geo: Vec<PathBuf> = ["geoip.dat", "geosite.dat"].iter().map(|n| PathBuf::from("/Applications/VPNClient.app/Contents/Resources").join(n)).collect();
         for (files, expect) in [(&geo[..], true), (&[][..], false)] {
-            let script = install_command(&helper, &xray, files, "<plist/>");
+            let script = install_command(&helper, &xray, &awg, files, "<plist/>");
             let status = std::process::Command::new("/bin/sh").args(["-n", "-c", &script]).status().unwrap();
             assert!(status.success(), "generated installer is not valid shell");
             assert_eq!(script.contains("vpnclient-assets"), expect);
             assert_eq!(script.contains("geosite.dat"), expect);
             assert!(script.contains("local.vpn-client.xray"));
+            assert!(script.contains("local.vpn-client.awgsocks") && script.contains("verify_source '/Applications/VPNClient.app/Contents/Helpers/awgsocks'"));
         }
-        let script = install_command(&helper, &xray, &geo, "<plist/>");
+        let script = install_command(&helper, &xray, &awg, &geo, "<plist/>");
         // Both databases are verified as root-owned bundle files, staged under the root-only stage dir, then installed 0644.
         assert_eq!(script.matches("verify_source '/Applications/VPNClient.app/Contents/Resources/geo").count(), 2);
         assert!(script.contains("install -d -o root -g wheel -m 755 '/Library/PrivilegedHelperTools/vpnclient-assets'"));

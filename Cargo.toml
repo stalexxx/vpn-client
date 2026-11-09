@@ -1,6 +1,6 @@
 [package]
 name = "vpn-core"
-version = "0.3.31"
+version = "0.3.32"
 edition = "2021"
 
 [dependencies]
@@ -12,6 +12,7 @@ percent-encoding = "2"
 tempfile = "3"
 getrandom = "0.3"
 base64 = "0.22"
+flate2 = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 socket2 = { version = "0.5", features = ["all"] }
 
@@ -21,7 +22,6 @@ security-framework = "3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-flate2 = "1"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]

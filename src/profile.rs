@@ -7,10 +7,20 @@ pub fn vless_config(link: &str, socks_port: u16) -> Result<Value, String> {
     if url.scheme() == "hysteria2" {
         return hysteria2_config(link, socks_port);
     }
+    if url.scheme() == "socks5" { return socks5_config(&url, socks_port); }
     if url.query_pairs().any(|(k,v)| k == "security" && v == "reality") {
         return vless_reality_config(link, socks_port);
     }
     vless_xhttp_config(link, socks_port)
+}
+
+/// A loopback SOCKS5 proxy as the VPN outbound. The helper runs the embedded AmneziaWG client (`awgsocks`) on that
+/// address and hands Xray this link instead of the `awg://` one.
+pub fn socks5_config(url: &Url, socks_port: u16) -> Result<Value, String> {
+    let host = url.host_str().ok_or("Missing SOCKS address")?;
+    let port = url.port().ok_or("Missing SOCKS port")?;
+    if host != "127.0.0.1" || port == 0 || socks_port == 0 { return Err("Only a loopback SOCKS proxy is supported".into()); }
+    Ok(json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":socks_port,"protocol":"socks","settings":{"udp":true}}],"outbounds":[{"protocol":"socks","settings":{"address":host,"port":port}}]}))
 }
 
 /// Translate a Hysteria 2 share link into an Xray client configuration.
@@ -504,5 +514,18 @@ mod tests {
         assert_eq!(config["outbounds"][1]["protocol"], "vless");
         assert_eq!(config["outbounds"][1]["streamSettings"]["network"], "xhttp");
         assert!(vless_tun_config_with_relay(h, "utun10", Some("hysteria2://bad@relay:443")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod socks_tests {
+    use super::*;
+    #[test]
+    fn loopback_socks_link_becomes_the_vpn_outbound_of_the_tun_config() {
+        let config = vless_tun_config_with_options("socks5://127.0.0.1:19999", "utun10", None, false, Some(18000), &Bypass::default()).unwrap();
+        let out = &config["outbounds"][0];
+        assert_eq!((out["tag"].as_str(), out["protocol"].as_str(), out["settings"]["port"].as_u64()), (Some("vpn-out"), Some("socks"), Some(19999)));
+        assert!(vless_config("socks5://10.0.0.1:1080", 10808).is_err(), "only loopback is allowed");
+        assert!(vless_config("socks5://127.0.0.1", 10808).is_err());
     }
 }
