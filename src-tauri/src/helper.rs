@@ -40,6 +40,7 @@ fn helper_is_compatible(status: &Value) -> bool {
         && status.get("hysteria2_support").and_then(Value::as_bool) == Some(true)
         && status.get("hysteria_chain_support").and_then(Value::as_bool) == Some(true)
         && status.get("awg_support").and_then(Value::as_bool) == Some(true)
+        && status.get("api_socket").and_then(Value::as_bool) == Some(true)
 }
 fn osascript_admin(command: &str) -> Result<(), String> {
     let script = format!("do shell script \"{}\" with administrator privileges", command.replace('\\', "\\\\").replace('"', "\\\""));
@@ -181,7 +182,10 @@ mod tests {
         assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true})));
         assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true})));
         assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true})));
-        assert!(helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true,"awg_support":true})));
+        // A helper whose Xray API still listens on a loopback TCP port must be reinstalled.
+        assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true,"awg_support":true})));
+        assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true,"awg_support":true,"api_socket":false})));
+        assert!(helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true,"awg_support":true,"api_socket":true})));
     }
     #[test]
     fn only_applications_may_be_admin_group_writable() {
