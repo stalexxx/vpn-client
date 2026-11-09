@@ -18,4 +18,5 @@ print(pub)
 PY
 )
 awg set awg0 peer "$PUB" remove
+rm -f "$D/clients/$N.conf"
 echo removed

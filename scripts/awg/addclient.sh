@@ -9,7 +9,8 @@ IP=10.8.1.$(( ${USED:-1} + 1 ))
 PORT=$(grep ListenPort $D/awg0.conf | awk '{print $3}'); HOST=$(curl -fsS -m5 https://api.ipify.org --interface "$(ip route show default | awk '{print $5; exit}')")
 printf '\n# client %s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n' "$N" "$PUB" "$PSK" "$IP" >> $D/awg0.conf
 echo "$PSK" > /run/awg-psk.$$; awg set awg0 peer "$PUB" preshared-key /run/awg-psk.$$ allowed-ips "$IP/32"; rm -f /run/awg-psk.$$
-cat <<C
+mkdir -p $D/clients
+cat > $D/clients/$N.conf <<C
 [Interface]
 PrivateKey = $KEY
 Address = $IP/32
@@ -31,3 +32,4 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = $HOST:$PORT
 PersistentKeepalive = 25
 C
+cat $D/clients/$N.conf

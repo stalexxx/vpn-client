@@ -9,6 +9,7 @@ const BINARY_SHA256: &str = include_str!("../assets/amneziawg-go-linux-amd64.sha
 const SETUP: &str = include_str!("../scripts/awg/setup.sh");
 const ADD_CLIENT: &str = include_str!("../scripts/awg/addclient.sh");
 const DEL_CLIENT: &str = include_str!("../scripts/awg/delclient.sh");
+const VIEW_CLIENT: &str = include_str!("../scripts/awg/viewclient.sh");
 const LIST_CLIENTS: &str = include_str!("../scripts/awg/listclients.sh");
 const UNINSTALL: &str = include_str!("../scripts/awg/uninstall.sh");
 
@@ -107,6 +108,12 @@ pub fn add_client(server: &AwgServer, name: &str) -> Result<String, String> {
     if !valid_client_name(name) { return Err("Имя клиента: латиница, цифры, - и _ (до 32 символов)".into()); }
     if list_clients(server)?.iter().any(|c| c.name == name) { return Err("Клиент с таким именем уже есть".into()); }
     ssh_run(&server.ssh_target, server.ssh_key.as_deref(), &[], ADD_CLIENT, &[name], None)
+}
+
+/// Saved config of an existing client (only clients created since configs are stored have one).
+pub fn client_config(server: &AwgServer, name: &str) -> Result<String, String> {
+    if !valid_client_name(name) { return Err("Некорректное имя клиента".into()); }
+    ssh_run(&server.ssh_target, server.ssh_key.as_deref(), &[], VIEW_CLIENT, &[name], None).map_err(|e| if e.contains("(5)") { "Конфиг этого клиента не сохранён на сервере (клиент создан старой версией). Удалите клиента и создайте заново.".to_string() } else { e })
 }
 
 pub fn list_clients(server: &AwgServer) -> Result<Vec<AwgClient>, String> {

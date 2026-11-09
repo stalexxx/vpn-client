@@ -2,6 +2,11 @@
 (() => {
   let awgServers = [], current = null, savedPath = null, uninstallArmed = false, busyAwg = false;
   const status = text => { $('awg-status').textContent = text || ''; };
+  async function copy(text, what) {
+    try { await navigator.clipboard.writeText(text); }
+    catch { const t = document.createElement('textarea'); t.value = text; document.body.append(t); t.select(); const ok = document.execCommand('copy'); t.remove(); if (!ok) { status('Не удалось скопировать — выделите текст вручную.'); return; } }
+    status(`${what} скопирован${what.endsWith('а') ? 'а' : ''} в буфер обмена.`);
+  }
   const hostOfTarget = t => t.split('@').pop().replace(/:\d+$/, '');
   function fillKeys(select, keys) {
     select.replaceChildren();
@@ -29,7 +34,13 @@
         try { await invoke('awg_delete_client', { id: current.id, client: c.name }); status(`Клиент ${c.name} удалён.`); await loadDetail(); }
         catch (e) { status(`Не удалось удалить клиента: ${e}`); del.disabled = false; } finally { busyAwg = false; }
       });
-      row.append(name, del); root.append(row);
+      const view = document.createElement('button'); view.type = 'button'; view.className = 'secondary small'; view.textContent = 'Показать';
+      view.addEventListener('click', async () => {
+        if (busyAwg) return; busyAwg = true; view.disabled = true; status('Загружаем конфиг…');
+        try { showResult(await invoke('awg_client_config', { id: current.id, client: c.name })); status(`Конфиг клиента ${c.name}. Он также сохранён в ${savedPath}.`); }
+        catch (e) { status(`${e}`); } finally { busyAwg = false; view.disabled = false; }
+      });
+      row.append(name, view, del); root.append(row);
     });
   }
   async function loadDetail() {
@@ -40,7 +51,11 @@
     const warp = /latest handshake: ([^\n]+)/.exec(st);
     $('awg-state').textContent = warp ? `WARP: рукопожатие ${warp[1]}.` : 'WARP: рукопожатия ещё не было — проверьте сервер.';
   }
-  function hideResult() { ['awg-conf-label', 'awg-link-label', 'awg-qr'].forEach(id => { $(id).hidden = true; }); $('awg-qr').replaceChildren(); }
+  function showResult(r) {
+    savedPath = r.path; $('awg-conf').value = r.conf; $('awg-link').value = r.link; $('awg-qr').innerHTML = r.qr_svg;
+    ['awg-conf-label', 'awg-link-label', 'awg-qr', 'awg-copy-link', 'awg-copy-conf', 'awg-reveal'].forEach(id => { $(id).hidden = false; });
+  }
+  function hideResult() { ['awg-conf-label', 'awg-link-label', 'awg-qr', 'awg-copy-link', 'awg-copy-conf'].forEach(id => { $(id).hidden = true; }); $('awg-qr').replaceChildren(); }
   async function openServer(s) {
     current = s; savedPath = null; uninstallArmed = false; $('awg-uninstall').textContent = 'Удалить AmneziaWG с сервера';
     $('awg-detail').hidden = false; $('awg-detail-title').textContent = `${s.name} · UDP ${s.port}`; hideResult(); $('awg-reveal').hidden = true; $('awg-state').textContent = 'Загружаем…'; renderServers();
@@ -68,10 +83,13 @@
     busyAwg = true; status('Создаём клиента…');
     try {
       const r = await invoke('awg_add_client', { id: current.id, client });
-      savedPath = r.path; $('awg-conf').value = r.conf; $('awg-conf-label').hidden = false; $('awg-link').value = r.link; $('awg-link-label').hidden = false; $('awg-qr').innerHTML = r.qr_svg; $('awg-qr').hidden = false; $('awg-reveal').hidden = false; $('awg-client-name').value = '';
+      showResult(r); $('awg-client-name').value = '';
       status(`Конфиг сохранён: ${r.path}. Отсканируйте QR или импортируйте ссылку/файл в приложение Amnezia; ключи секретные.`); await loadDetail();
     } catch (e) { status(`Не удалось создать клиента: ${e}`); } finally { busyAwg = false; }
   });
+  $('awg-copy-link').addEventListener('click', () => copy($('awg-link').value, 'Ссылка'));
+  $('awg-copy-conf').addEventListener('click', () => copy($('awg-conf').value, 'Конфиг'));
+  $('awg-copy-addr').addEventListener('click', () => current && copy(`${hostOfTarget(current.ssh_target)}:${current.port}`, 'Адрес'));
   $('awg-reveal').addEventListener('click', () => { if (savedPath) invoke('awg_reveal', { path: savedPath }).catch(e => status(`${e}`)); });
   $('awg-uninstall').addEventListener('click', async () => {
     if (busyAwg || !current) return;

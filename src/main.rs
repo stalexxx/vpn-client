@@ -165,6 +165,7 @@ fn reply<F: Fn(&str) -> Result<String, String>>(request: Value, call: F) -> Opti
             {"name":"install_amneziawg","description":"Установить на сервер AmneziaWG с выходом через Cloudflare WARP (по SSH, Ubuntu/Debian x86_64). Возвращает порт и публичный ключ; клиентов добавляйте через add_awg_client.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"ssh_target":{"type":"string","description":"user@host[:port]"},"ssh_key":{"type":"string","description":"имя ключа в ~/.ssh"},"port":{"type":"integer","minimum":1024,"maximum":65535}},"required":["name","ssh_target"],"additionalProperties":false}},
             {"name":"add_awg_client","description":"Создать клиента AmneziaWG и вернуть его .conf и ссылку vpn:// (импортируются в официальный клиент Amnezia).","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"client":{"type":"string"}},"required":["host","client"],"additionalProperties":false}},
             {"name":"list_awg_clients","description":"Клиенты AmneziaWG-сервера и состояние WARP (рукопожатие, трафик).","inputSchema":{"type":"object","properties":{"host":{"type":"string"}},"required":["host"],"additionalProperties":false}},
+            {"name":"get_awg_client","description":"Показать сохранённый конфиг и ссылку vpn:// существующего клиента AmneziaWG.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"client":{"type":"string"}},"required":["host","client"],"additionalProperties":false}},
             {"name":"delete_awg_client","description":"Удалить клиента AmneziaWG.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"client":{"type":"string"}},"required":["host","client"],"additionalProperties":false}},
             {"name":"uninstall_amneziawg","description":"Удалить AmneziaWG и WARP-интерфейс с сервера вместе с ключами и клиентами.","inputSchema":{"type":"object","properties":{"host":{"type":"string"}},"required":["host"],"additionalProperties":false}}
         ]}),
@@ -231,11 +232,11 @@ fn reply<F: Fn(&str) -> Result<String, String>>(request: Value, call: F) -> Opti
                             .map(|s| format!("AmneziaWG установлен на {}: UDP-порт {}, публичный ключ {}. WARP — выход для всех клиентов.", vpn_core::ssh_host(&s.ssh_target), s.port, s.server_public_key))
                     }
                 }
-                "add_awg_client" | "delete_awg_client" => {
+                "add_awg_client" | "delete_awg_client" | "get_awg_client" => {
                     if !args.as_object().is_some_and(|o| o.len() == 2 && o.get("host").is_some_and(Value::is_string) && o.get("client").is_some_and(Value::is_string)) { Err("Требуются host и client".into()) }
                     else {
                         let client = args["client"].as_str().unwrap_or_default();
-                        vpn_core::amnezia::find_server(args["host"].as_str().unwrap_or_default()).and_then(|s| if name == "add_awg_client" { vpn_core::amnezia::add_client(&s, client).and_then(|conf| { let link = vpn_core::amnezia::vpn_link(&format!("{} · {}", s.name, client), &conf)?; Ok(format!("{conf}\n\nСсылка для приложения Amnezia:\n{link}")) }) } else { vpn_core::amnezia::delete_client(&s, client).map(|_| format!("Клиент {client} удалён")) })
+                        vpn_core::amnezia::find_server(args["host"].as_str().unwrap_or_default()).and_then(|s| if name == "add_awg_client" || name == "get_awg_client" { (if name == "add_awg_client" { vpn_core::amnezia::add_client(&s, client) } else { vpn_core::amnezia::client_config(&s, client) }).and_then(|conf| { let link = vpn_core::amnezia::vpn_link(&format!("{} · {}", s.name, client), &conf)?; Ok(format!("{conf}\n\nСсылка для приложения Amnezia:\n{link}")) }) } else { vpn_core::amnezia::delete_client(&s, client).map(|_| format!("Клиент {client} удалён")) })
                     }
                 }
                 "list_awg_clients" | "uninstall_amneziawg" => {
@@ -295,7 +296,7 @@ mod tests {
     fn exposes_vpn_controls_and_panel_installer() {
         let list=reply(json!({"id":1,"method":"tools/list"}), |_| panic!()).unwrap();
         let tools=list["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(),20); assert_eq!(tools[0]["name"],"vpn_connect"); assert_eq!(tools[1]["name"],"vpn_disconnect"); assert_eq!(tools[2]["name"],"install_3x_ui"); assert_eq!(tools[3]["name"],"uninstall_3x_ui"); assert_eq!(tools[4]["name"],"create_reality_client"); assert_eq!(tools[5]["name"],"create_xhttp_relay_client"); assert_eq!(tools[6]["name"],"list_server_inbounds"); assert_eq!(tools[7]["name"],"delete_server_inbound"); assert_eq!(tools[8]["name"],"delete_reality_inbound"); assert_eq!(tools[9]["name"],"enable_server_warp"); assert_eq!(tools[10]["name"],"disable_server_warp"); assert_eq!(tools[11]["name"],"vpn_get_stats"); assert_eq!(tools[12]["name"],"vpn_get_log"); assert_eq!(tools[13]["name"],"vpn_set_log_level"); assert_eq!(tools[14]["name"],"create_hysteria2_client");
+        assert_eq!(tools.len(),21); assert_eq!(tools[0]["name"],"vpn_connect"); assert_eq!(tools[1]["name"],"vpn_disconnect"); assert_eq!(tools[2]["name"],"install_3x_ui"); assert_eq!(tools[3]["name"],"uninstall_3x_ui"); assert_eq!(tools[4]["name"],"create_reality_client"); assert_eq!(tools[5]["name"],"create_xhttp_relay_client"); assert_eq!(tools[6]["name"],"list_server_inbounds"); assert_eq!(tools[7]["name"],"delete_server_inbound"); assert_eq!(tools[8]["name"],"delete_reality_inbound"); assert_eq!(tools[9]["name"],"enable_server_warp"); assert_eq!(tools[10]["name"],"disable_server_warp"); assert_eq!(tools[11]["name"],"vpn_get_stats"); assert_eq!(tools[12]["name"],"vpn_get_log"); assert_eq!(tools[13]["name"],"vpn_set_log_level"); assert_eq!(tools[14]["name"],"create_hysteria2_client");
         let bad=reply(json!({"id":9,"method":"tools/call","params":{"name":"vpn_set_log_level","arguments":{"level":"debug"}}}), |_| panic!()).unwrap();
         assert_eq!(bad["result"]["isError"],true);
         let bad=reply(json!({"id":9,"method":"tools/call","params":{"name":"vpn_get_log","arguments":{"lines":0}}}), |_| panic!()).unwrap();
