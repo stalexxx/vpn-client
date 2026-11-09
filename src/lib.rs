@@ -1908,3 +1908,6 @@ pub mod proxy;
 pub mod client_plan;
 
 pub mod probe;
+
+#[cfg(unix)]
+pub mod amnezia;
