@@ -57,6 +57,12 @@ let mode = 'off';
     set_bypass_settings: ({ bittorrent, entries }) => { if (entries.some(e => /\s/.test(e))) throw 'Не похоже на домен, IP или подсеть: ' + entries[0]; bypassState = { bittorrent, entries }; return bypassState; },
     // Latency marks for every visible profile, cycling through fast / medium / slow / no answer / UDP.
     get_probe_results: () => { const all = [...handlers.list_connectable_profiles().map(p => `${p.server_id}:${p.inbound_id}:${p.email}`), ...imported.map(i => `imported:${i.id}`)]; const ts = Math.floor(Date.now()/1000) - 42; const out = {}; all.forEach((k, i) => { const v = [{ms:38},{ms:212},{ms:530},{ms:null,error:'таймаут'},{udp:true}][i % 5]; out[k] = { ms: v.ms ?? null, error: v.error ?? null, ts, udp: !!v.udp }; }); return out; },
+    awg_list_servers: () => [{id:'a1', name:'silicon-awg', ssh_target:'root@95.182.101.33', port:47821, server_public_key:'k'}],
+    awg_clients: () => [{name:'mac', address:'10.8.1.2'}],
+    awg_status: () => 'active\nactive\n---\n  latest handshake: 12 seconds ago\n',
+    awg_install: ({name}) => ({id:'a2', name, ssh_target:'root@x', port:41000, server_public_key:'k'}),
+    awg_add_client: ({client}) => ({path:'/Users/me/Downloads/'+client+'.conf', conf:'[Interface]\nPrivateKey = …'}),
+    awg_delete_client: () => null, awg_uninstall: () => null, awg_reveal: () => null,
     probe_now: () => null,
     get_exit_ip: () => '203.0.113.7',
     get_vpn_mode: () => mode,

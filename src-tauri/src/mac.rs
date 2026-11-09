@@ -243,7 +243,9 @@ pub fn main() {
             open_admin,
             crate::probes::get_probe_results,
             crate::probes::probe_now,
-            crate::probes::get_exit_ip
+            crate::probes::get_exit_ip,
+            crate::awg::awg_list_servers, crate::awg::awg_install, crate::awg::awg_clients, crate::awg::awg_status,
+            crate::awg::awg_add_client, crate::awg::awg_delete_client, crate::awg::awg_uninstall, crate::awg::awg_reveal
             ,control::select_mcp_profile
             ,control::get_mcp_profile
         ])
