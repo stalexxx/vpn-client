@@ -24,7 +24,7 @@ async function pollStats() {
 }
 setInterval(pollStats, 1500);
 function key(p) { return p.imported ? `imported:${p.imported_id}` : `${p.server_id}:${p.inbound_id}:${p.email}`; }
-const importedRow = i => ({imported:true, imported_id:i.id, server_id:'imported', inbound_id:0, email:i.name, host:i.host, transport:i.transport, server_name:'Импорт', country:null, protocol:'vless', enabled:true, inbound_enabled:true, has_local_config:true});
+const importedRow = i => ({imported:true, imported_id:i.id, server_id:'imported', inbound_id:0, email:i.name, host:i.host, transport:i.transport, insecure:i.insecure, server_name:'Импорт', country:null, protocol:'vless', enabled:true, inbound_enabled:true, has_local_config:true});
 async function syncMcpSelection() { const p=profiles.find(p=>key(p)===selectedProfileKey); await invoke('select_mcp_profile',{profile:p && !p.imported ? {server_id:p.server_id,inbound_id:p.inbound_id,email:p.email} : null}); }
 function connectionState(value) {
   mode = value; const connected = mode !== 'off';
@@ -67,6 +67,7 @@ function renderProfiles() {
     const country = document.createElement('span'); country.className='profile-flag'; country.textContent=flag(p.country) || '🌐';
     const copy = document.createElement('span'); copy.className='profile-copy';
     const server = document.createElement('strong'); server.className='profile-server'; server.textContent=p.server_name || 'Сервер'; if (p.imported) { const tag=document.createElement('span'); tag.className='profile-tag'; tag.textContent=p.transport==='hysteria2'?'импорт · hy2':p.transport==='awg'?'импорт · awg':'импорт'; server.textContent=p.host || 'Импорт'; server.append(tag); }
+    if (p.insecure) { const warning=document.createElement('span'); warning.className='profile-tag profile-tag-warning'; warning.textContent='без проверки TLS'; server.append(warning); }
     const client = document.createElement('span'); client.className='profile-client'; client.textContent=p.email;
     copy.append(server,client); row.append(country,copy,probeBadge(p)); row.addEventListener('click',()=>{ selectedProfileKey=key(p); localStorage.setItem('vpn.selectedProfile', selectedProfileKey); syncMcpSelection().catch(e=>{ $('connection-error').textContent=`Не удалось сохранить выбор для MCP: ${e}`; $('connection-error').hidden=false; }); renderProfiles(); connectionState(mode); if(mode==='tun' && key(p)!==connectedKey) switchProfile(); }); list.append(p.imported ? importedItem(p, row, client) : row);
   }
@@ -183,7 +184,7 @@ $('import-submit').addEventListener('click',async()=>{
   const text=$('import-text').value, name=$('import-name').value.trim();
   if(!text.trim()){ importMessage('Вставьте ссылку vless://, hysteria2://, vpn:// или конфиг AmneziaWG'); return; }
   $('import-submit').disabled=true; importMessage('Проверяем…',true);
-  try{ const added=await invoke('import_profiles',{text,name:name||null}); await loadProfiles(); const first=profiles.find(p=>p.imported && p.imported_id===added[0].id); if(first && mode==='off'){ selectedProfileKey=key(first); localStorage.setItem('vpn.selectedProfile',selectedProfileKey); await syncMcpSelection(); renderProfiles(); connectionState(mode); } closeImport(); $('connection-message').textContent=added.length>1 ? `Импортировано конфигураций: ${added.length}.` : `Импортирована конфигурация «${added[0].name}».`; }
+  try{ const added=await invoke('import_profiles',{text,name:name||null}); await loadProfiles(); const first=profiles.find(p=>p.imported && p.imported_id===added[0].id); if(first && mode==='off'){ selectedProfileKey=key(first); localStorage.setItem('vpn.selectedProfile',selectedProfileKey); await syncMcpSelection(); renderProfiles(); connectionState(mode); } closeImport(); $('connection-message').textContent=added.length>1 ? `Импортировано конфигураций: ${added.length}.` : `Импортирована конфигурация «${added[0].name}».`; if(added.some(p=>p.insecure)) $('connection-message').textContent+=' Внимание: проверка сертификата TLS отключена.'; }
   catch(e){ importMessage(String(e)); }
   finally{ $('import-submit').disabled=false; }
 });

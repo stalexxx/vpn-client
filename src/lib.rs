@@ -1438,6 +1438,7 @@ fn imported_summary(item: &ImportedProfile) -> serde_json::Value {
         "port": url.as_ref().and_then(|u| u.port()).unwrap_or(443),
         "transport": if awg { "awg".into() } else if hysteria { "hysteria2".into() } else { query("type").unwrap_or_else(|| "tcp".into()) },
         "security": query("security").unwrap_or_default(),
+        "insecure": hysteria && url.as_ref().and_then(|u| u.query_pairs().filter(|(k, _)| k == "insecure").map(|(_, v)| matches!(v.as_ref(), "1" | "true")).last()).unwrap_or(false),
     })
 }
 fn valid_import_name(name: &str) -> Result<String, String> {
@@ -1610,6 +1611,17 @@ mod tests {
         let stored = read_imported(&path).unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(crate::awglink::link_to_conf(&stored[0].share_link).unwrap(), conf);
+    }
+
+    #[test]
+    fn imported_summary_reports_hysteria_tls_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("imported.json");
+        for (query, expected) in [("", false), ("?insecure=1", true), ("?insecure=true", true), ("?insecure=1&insecure=0", false), ("?insecure=0&insecure=1", true)] {
+            let link = format!("hy2://secret@example.com:443/{query}");
+            let added = import_profiles_at(&path, &link, None).unwrap();
+            assert_eq!(added[0]["insecure"], expected);
+        }
     }
 
     #[test]

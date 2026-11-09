@@ -38,3 +38,5 @@
 .geo-chip:hover{background:#e6efe9}.geo-chip.added{background:#dff0e6;border-color:#9ac5a7;color:#17613b;cursor:default}
 .profile-row[data-active="true"]::after{content:"подключено";margin-left:auto;font-size:10px;font-weight:650;color:#17613b;background:#e3f4e9;border-radius:100px;padding:3px 8px;flex:none}
 .probe{margin-left:auto;flex:none;font-size:10px;font-weight:650;color:#718076;background:#eef1ee;border-radius:100px;padding:3px 8px;white-space:nowrap}.probe::before{content:"●";margin-right:5px;color:#a3aea6}.probe[data-state="ok"]{color:#17613b;background:#e3f4e9}.probe[data-state="ok"]::before{color:#269657}.probe[data-state="mid"]{color:#7a5a00;background:#fbf1d3}.probe[data-state="mid"]::before{color:#d9a400}.probe[data-state="slow"]{color:#8a4300;background:#fbe6d3}.probe[data-state="slow"]::before{color:#e07b00}.probe[data-state="bad"]{color:#8e2b2b;background:#f9dede}.probe[data-state="bad"]::before{color:#d23b3b}.profile-row[data-active="true"]::after{margin-left:8px}.profile-row[data-active="true"] .probe{margin-left:auto}
+
+.profile-tag-warning{color:#7d3013;background:#fff0dc}
