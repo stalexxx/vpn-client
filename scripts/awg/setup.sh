@@ -48,6 +48,7 @@ cat > $DIR/awg0.conf <<C
 [Interface]
 PrivateKey = $(cat $DIR/server.key)
 Address = $SUBNET.1/24
+MTU = 1280
 ListenPort = $PORT
 Jc = $Jc
 Jmin = $Jmin

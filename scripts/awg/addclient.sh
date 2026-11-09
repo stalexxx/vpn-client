@@ -15,6 +15,7 @@ cat > $D/clients/$N.conf <<C
 PrivateKey = $KEY
 Address = $IP/32
 DNS = 1.1.1.1
+MTU = 1280
 Jc = $Jc
 Jmin = $Jmin
 Jmax = $Jmax
