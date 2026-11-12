@@ -1,0 +1,126 @@
+#!/bin/bash
+# Build an installable VPNClient-<version>.pkg.
+#
+#   scripts/build-pkg.sh [output-dir]      # default: ./dist, host architecture
+#   TARGET=x86_64-apple-darwin XRAY_BIN=/path/to/xray scripts/build-pkg.sh
+#   UNIVERSAL=1 XRAY_X86_64=/path/to/xray-x86_64 scripts/build-pkg.sh
+#
+# The helper only trusts a root-owned bundle, so the app must be installed from
+# this .pkg (payload is owned by root:wheel), never run from target/.
+# Xray is taken from $XRAY_BIN (default: ~/Applications/Xray/xray).
+# GEO_DIR=/dir/with/geoip.dat+geosite.dat adds the databases that geoip:/geosite: exclusions need.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="${1:-$ROOT/dist}"
+XRAY_BIN="${XRAY_BIN:-$HOME/Applications/Xray/xray}"
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/src-tauri/Cargo.toml" | head -1)"
+[ -n "$VERSION" ] || { echo "cannot read version from src-tauri/Cargo.toml" >&2; exit 1; }
+[ -x "$XRAY_BIN" ] || { echo "xray not found: $XRAY_BIN (set XRAY_BIN)" >&2; exit 1; }
+
+echo "== building $VERSION"
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+if [ "${UNIVERSAL:-0}" = 1 ]; then
+  [ -x "${XRAY_X86_64:-}" ] || { echo "UNIVERSAL=1 needs XRAY_X86_64" >&2; exit 1; }
+  for t in aarch64-apple-darwin x86_64-apple-darwin; do
+    (cd "$ROOT" && cargo build --release --target "$t" --bin vpn-tun-helper --bin vpn-core)
+    (cd "$ROOT/src-tauri" && cargo build --release --target "$t" --features tauri/custom-protocol,admin-only)
+    (cd "$ROOT/gpui-client" && cargo build --release --target "$t")
+  done
+  mkdir -p "$STAGE/bin"
+  lipo -create -output "$STAGE/bin/admin" "$ROOT/src-tauri/target/aarch64-apple-darwin/release/vpn-desktop" "$ROOT/src-tauri/target/x86_64-apple-darwin/release/vpn-desktop"
+  lipo -create -output "$STAGE/bin/app" "$ROOT/gpui-client/target/aarch64-apple-darwin/release/vpn-gpui" "$ROOT/gpui-client/target/x86_64-apple-darwin/release/vpn-gpui"
+  lipo -create -output "$STAGE/bin/helper" "$ROOT/target/aarch64-apple-darwin/release/vpn-tun-helper" "$ROOT/target/x86_64-apple-darwin/release/vpn-tun-helper"
+  lipo -create -output "$STAGE/bin/mcp" "$ROOT/target/aarch64-apple-darwin/release/vpn-core" "$ROOT/target/x86_64-apple-darwin/release/vpn-core"
+  lipo -create -output "$STAGE/bin/xray" "$XRAY_BIN" "$XRAY_X86_64"
+  ADMIN_BIN="$STAGE/bin/admin"; APP_BIN="$STAGE/bin/app"; HELPER_BIN="$STAGE/bin/helper"; MCP_BIN="$STAGE/bin/mcp"; XRAY_OUT="$STAGE/bin/xray"
+else
+  TARGET="${TARGET:-}"
+  TARGET_ARGS=(); [ -z "$TARGET" ] || TARGET_ARGS=(--target "$TARGET")
+  # ${arr[@]+...} keeps an empty array from tripping `set -u` on bash 3.2 (macOS /bin/bash).
+  (cd "$ROOT" && cargo build --release ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} --bin vpn-tun-helper --bin vpn-core)
+  (cd "$ROOT/src-tauri" && cargo build --release ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} --features tauri/custom-protocol,admin-only)
+  (cd "$ROOT/gpui-client" && cargo build --release ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"})
+  TARGET_DIR="${TARGET:+$TARGET/}"
+  ADMIN_BIN="$ROOT/src-tauri/target/${TARGET_DIR}release/vpn-desktop"; APP_BIN="$ROOT/gpui-client/target/${TARGET_DIR}release/vpn-gpui"; HELPER_BIN="$ROOT/target/${TARGET_DIR}release/vpn-tun-helper"; MCP_BIN="$ROOT/target/${TARGET_DIR}release/vpn-core"; XRAY_OUT="$XRAY_BIN"
+fi
+
+APP="$STAGE/root/Applications/VPNClientGPUI.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$OUT"
+cp "$APP_BIN" "$APP/Contents/MacOS/VPNClient"
+cp "$HELPER_BIN" "$APP/Contents/Helpers/vpn-tun-helper"
+cp "$MCP_BIN" "$APP/Contents/Helpers/vpn-mcp"
+cp "$XRAY_OUT" "$APP/Contents/Helpers/xray"
+# Embedded AmneziaWG client (tools/awgsocks/build.sh puts both architectures into assets/).
+if [ "${UNIVERSAL:-0}" = 1 ]; then
+  lipo -create -output "$APP/Contents/Helpers/awgsocks" "$ROOT/assets/awgsocks-darwin-arm64" "$ROOT/assets/awgsocks-darwin-amd64"
+elif [ "${TARGET:-}" = x86_64-apple-darwin ] || [ -z "${TARGET:-}" ] && [ "$(uname -m)" = x86_64 ]; then
+  cp "$ROOT/assets/awgsocks-darwin-amd64" "$APP/Contents/Helpers/awgsocks"
+else
+  cp "$ROOT/assets/awgsocks-darwin-arm64" "$APP/Contents/Helpers/awgsocks"
+fi
+chmod 755 "$APP/Contents/Helpers/awgsocks"
+mkdir -p "$APP/Contents/Resources"
+cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+# Domain/IP lists for geosite:/geoip: exclusions (from the official Xray release archive).
+if [ -n "${GEO_DIR:-}" ]; then
+  mkdir -p "$APP/Contents/Resources"
+  cp "$GEO_DIR/geoip.dat" "$GEO_DIR/geosite.dat" "$APP/Contents/Resources/"
+fi
+
+cat > "$APP/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>VPNClient</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.vpn-client.gpui</string>
+	<key>CFBundleName</key>
+	<string>VPN Client</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$VERSION</string>
+	<key>CFBundleVersion</key>
+	<string>$VERSION</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
+EOF
+
+ADMIN="$STAGE/root/Applications/VPNAdmin.app"
+mkdir -p "$ADMIN/Contents/MacOS" "$ADMIN/Contents/Resources"
+cp "$ADMIN_BIN" "$ADMIN/Contents/MacOS/VPNAdmin"
+cp "$ROOT/assets/AppIcon.icns" "$ADMIN/Contents/Resources/AppIcon.icns"
+cat > "$ADMIN/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>VPNAdmin</string>
+<key>CFBundleIdentifier</key><string>local.vpn-client.admin</string>
+<key>CFBundleName</key><string>VPN Admin</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>$VERSION</string>
+<key>CFBundleVersion</key><string>$VERSION</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>
+EOF
+codesign --force --sign - "$ADMIN"
+
+codesign --force --sign - "$APP/Contents/Helpers/xray" "$APP/Contents/Helpers/awgsocks" "$APP/Contents/Helpers/vpn-tun-helper" "$APP/Contents/Helpers/vpn-mcp"
+codesign --force --sign - "$APP"
+
+PKG="$OUT/VPNClient-GPUI-$VERSION.pkg"
+pkgbuild --root "$STAGE/root" --identifier local.vpn-client.gpui-package --version "$VERSION" \
+  --install-location / --ownership recommended "$PKG"
+echo "== $PKG"
+shasum -a 256 "$PKG"

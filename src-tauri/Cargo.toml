@@ -1,7 +1,10 @@
 [package]
 name = "vpn-desktop"
-version = "0.3.34"
+version = "0.3.35"
 edition = "2021"
+
+[features]
+admin-only = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

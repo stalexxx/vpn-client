@@ -187,11 +187,19 @@ pub(crate) fn open_admin_window(app: &tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn open_admin(app: tauri::AppHandle) -> Result<(), String> { open_admin_window(&app) }
 
+
+#[cfg(feature = "admin-only")]
+fn app_context() -> tauri::Context<tauri::Wry> { tauri::generate_context!("tauri.admin.conf.json") }
+#[cfg(not(feature = "admin-only"))]
+fn app_context() -> tauri::Context<tauri::Wry> { tauri::generate_context!() }
+
 pub fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            tray::install(app)?;
-            control::start(app.handle().clone()).map_err(std::io::Error::other)?;
+            #[cfg(not(feature = "admin-only"))]
+            { tray::install(app)?; control::start(app.handle().clone()).map_err(std::io::Error::other)?; }
+            #[cfg(feature = "admin-only")]
+            { tauri::Manager::manage(app, tray::TrayStatus(std::sync::Mutex::new(None))); }
             Ok(())
         })
         .manage(vpn_core::probe::start())
@@ -255,6 +263,6 @@ pub fn main() {
             ,control::select_mcp_profile
             ,control::get_mcp_profile
         ])
-        .run(tauri::generate_context!())
+        .run(app_context())
         .expect("failed to start VPN Client");
 }

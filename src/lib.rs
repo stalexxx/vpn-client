@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+pub mod vpn_control;
+#[cfg(unix)]
+pub mod helper;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, time::Duration};
 pub mod compat;

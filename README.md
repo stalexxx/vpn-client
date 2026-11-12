@@ -1,6 +1,6 @@
 # VPN Client
 
-macOS-клиент для подключения к готовым профилям 3x-ui. Панель 3x-ui работает на Linux; клиент получает из неё список профилей и запускает Xray на Mac. Клиент поддерживает VLESS с TLS/XHTTP, TCP Reality и Hysteria 2. Клиент не устанавливает и не разворачивает саму панель.
+macOS-клиент для подключения к готовым профилям 3x-ui. Доступен отдельный экспериментальный клиент на GPUI с Tauri-админкой; исходный Tauri-клиент сохраняется. Панель 3x-ui работает на Linux; клиент получает из неё список профилей и запускает Xray на Mac. Клиент поддерживает VLESS с TLS/XHTTP, TCP Reality и Hysteria 2. Клиент не устанавливает и не разворачивает саму панель.
 
 ## Режим подключения
 
@@ -19,7 +19,9 @@ Helper ведёт root-журналы процесса и DNS в `/Library/Appli
 Запуск интерфейса для разработки:
 
 ```sh
-cargo run --manifest-path src-tauri/Cargo.toml
+cargo run --manifest-path gpui-client/Cargo.toml  # клиент
+cargo run --manifest-path src-tauri/Cargo.toml --features admin-only  # новая админка
+cargo run --manifest-path src-tauri/Cargo.toml  # исходный клиент
 ```
 
 Сборка основного бинарного файла и привилегированного helper-а:
@@ -27,7 +29,10 @@ cargo run --manifest-path src-tauri/Cargo.toml
 ```sh
 cargo build --release --bin vpn-core --bin vpn-tun-helper
 cargo build --release --manifest-path src-tauri/Cargo.toml
+cargo build --release --manifest-path gpui-client/Cargo.toml
 ```
+
+Для сборки GPUI на macOS необходим Xcode с установленным Metal Toolchain. При необходимости задайте `DEVELOPER_DIR` и `TOOLCHAINS` для выбора Xcode и Metal. Установочный пакет создаётся скриптом `scripts/build-gpui-pkg.sh` и содержит VPNClientGPUI.app и VPNAdmin.app. Исходный пакет по-прежнему собирается скриптом `scripts/build-pkg.sh`.
 
 Для полноценного TUN-запуска соберите app bundle и разместите в `Contents/Helpers/` исполняемые файлы `vpn-tun-helper` и Xray той же архитектуры, что и приложение. Оба файла и все каталоги на пути к ним должны принадлежать root и не разрешать запись группе или другим пользователям; символические ссылки запрещены. Иначе установка и обновление helper-а будут отклонены. Bundle должен включать корректный `Info.plist` и быть подписан в соответствии с выбранным способом распространения.
 
@@ -35,7 +40,7 @@ cargo build --release --manifest-path src-tauri/Cargo.toml
 
 ## MCP
 
-Пакет приложения включает MCP-сервер `/Applications/VPNClient.app/Contents/Helpers/vpn-mcp` с транспортом stdio. `vpn_connect` подключает выбранную конфигурацию либо профиль, указанный через `server_id`, `inbound_id` и `email`; `vpn_disconnect` отключает VPN. `install_3x_ui` устанавливает официальный 3x-ui через SSH и регистрирует панель в приложении; `uninstall_3x_ui` удаляет панель, её данные и соответствующую запись приложения. Эти команды принимают `host` и необязательный `username` (по умолчанию `root`), используют ключ `~/.ssh/id_ed25519_vpn_client` и проверенный `known_hosts`. `create_reality_client` создаёт inbound VLESS/TCP/Reality на порту 443 и клиента: параметры `host`, необязательные `email` и `sni`. Установочный вывод скрывается, так как может содержать пароль и API-токен. Для VPN-команд приложение должно быть запущено под тем же пользователем, что и MCP-сервер: связь идёт через локальный защищённый Unix-сокет. При первом подключении VPN может потребоваться системное подтверждение установки TUN-helper-а.
+Пакет приложения включает MCP-сервер `/Applications/VPNClient.app/Contents/Helpers/vpn-mcp` (в новом клиенте — `/Applications/VPNClientGPUI.app/Contents/Helpers/vpn-mcp`) с транспортом stdio. `vpn_connect` подключает выбранную конфигурацию либо профиль, указанный через `server_id`, `inbound_id` и `email`; `vpn_disconnect` отключает VPN. `install_3x_ui` устанавливает официальный 3x-ui через SSH и регистрирует панель в приложении; `uninstall_3x_ui` удаляет панель, её данные и соответствующую запись приложения. Эти команды принимают `host` и необязательный `username` (по умолчанию `root`), используют ключ `~/.ssh/id_ed25519_vpn_client` и проверенный `known_hosts`. `create_reality_client` создаёт inbound VLESS/TCP/Reality на порту 443 и клиента: параметры `host`, необязательные `email` и `sni`. Установочный вывод скрывается, так как может содержать пароль и API-токен. Для VPN-команд приложение должно быть запущено под тем же пользователем, что и MCP-сервер: связь идёт через локальный защищённый Unix-сокет. При первом подключении VPN может потребоваться системное подтверждение установки TUN-helper-а.
 
 При проверке на тестовой машине сравните внешний IP до подключения, после `vpn_connect` и после `vpn_disconnect`. Для безопасного восстановления удалённого управления используйте отдельный канал доступа, который останется доступен при смене маршрутов. Смена IP проверяет внешний адрес конкретного запроса и не заменяет проверки DNS и IPv6.
 
