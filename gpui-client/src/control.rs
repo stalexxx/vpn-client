@@ -4,7 +4,7 @@ use vpn_core::PinnedProfile;
 #[derive(Default)]
 pub struct State { pub selected: Mutex<Option<PinnedProfile>>, pub operation: Mutex<()> }
 pub fn start(state: Arc<State>) -> Result<(), String> {
- let path = if cfg!(debug_assertions) { std::env::var_os("VPN_CLIENT_TEST_SOCKET").map(std::path::PathBuf::from).unwrap_or(vpn_core::mcp_control_socket_path()?) } else { vpn_core::mcp_control_socket_path()? }; let dir=path.parent().ok_or("Некорректный путь MCP")?;
+ let path = if cfg!(debug_assertions) { std::env::var_os("VPN_CLIENT_DEV_SOCKET").or_else(|| std::env::var_os("VPN_CLIENT_TEST_SOCKET")).map(std::path::PathBuf::from).unwrap_or(vpn_core::mcp_control_socket_path()?) } else { vpn_core::mcp_control_socket_path()? }; let dir=path.parent().ok_or("Некорректный путь MCP")?;
  fs::create_dir_all(dir).map_err(|e| e.to_string())?;
  let meta=fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
  if !meta.file_type().is_dir() || meta.uid()!=unsafe { libc::geteuid() } { return Err("Каталог MCP должен принадлежать текущему пользователю".into()); }

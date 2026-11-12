@@ -11,8 +11,13 @@ impl Profile {
  fn key(&self) -> String { match self { Self::Server(p) => format!("{}:{}:{}",p["server_id"].as_str().unwrap_or(""),p["inbound_id"].as_u64().unwrap_or(0),p["email"].as_str().unwrap_or("")), Self::Imported(p) => format!("imported:{}",p["id"].as_str().unwrap_or("")) } }
  fn connect(&self) -> Result<String,String> { match self { Self::Server(p) => vpn_core::vpn_control::connect_profile_inner(&Default::default(),p["server_id"].as_str().unwrap_or(""),p["inbound_id"].as_u64().unwrap_or(0),p["email"].as_str().unwrap_or("")), Self::Imported(p) => vpn_core::vpn_control::connect_imported_inner(&Default::default(),p["id"].as_str().unwrap_or("")) } }
 }
-fn profiles() -> Result<Vec<Profile>,String> { let mut p: Vec<_>=vpn_core::list_connectable_profiles()?.into_iter().map(Profile::Server).collect(); p.extend(vpn_core::list_imported_profiles()?.into_iter().map(Profile::Imported)); Ok(p) }
-struct Client { profiles: Vec<Profile>, selected: Option<String>, message: Arc<Mutex<String>>, busy: Arc<Mutex<Option<&'static str>>>, control: Arc<control::State>, status: Arc<Mutex<Option<bool>>>, probes: vpn_core::probe::ProbeHandle, stats: Arc<Mutex<stats::Display>>, generation: Arc<AtomicU64>, parked: BTreeSet<String> }
+fn profiles() -> Result<Vec<Profile>,String> {
+ let mut p: Vec<_>=vpn_core::list_connectable_profiles()?.into_iter().map(Profile::Server).collect();
+ let host_countries: std::collections::HashMap<String, Option<String>> = vpn_core::hosts::list_hosts()?.into_iter().map(|host|(host.ssh_target,host.country)).collect();
+ let awg_countries: std::collections::HashMap<String, Option<String>> = vpn_core::amnezia::list_servers()?.into_iter().map(|server| { let country=server.country.or_else(||host_countries.get(&server.ssh_target).cloned().flatten()); (server.id,country) }).collect();
+ p.extend(vpn_core::list_imported_profiles()?.into_iter().map(|mut item| { if let Some(source)=item["awg_source"].as_str() { if let Some((server_id,_))=source.split_once(':') { if let Some(country)=awg_countries.get(server_id).and_then(Option::as_ref) { item["country"]=serde_json::json!(country); } } } Profile::Imported(item) })); Ok(p)
+}
+struct Client { profiles: Vec<Profile>, selected: Option<String>, message: Arc<Mutex<String>>, busy: Arc<Mutex<Option<&'static str>>>, control: Arc<control::State>, status: Arc<Mutex<Option<bool>>>, probes: vpn_core::probe::ProbeHandle, stats: Arc<Mutex<stats::Display>>, generation: Arc<AtomicU64>, parked: BTreeSet<String>, armed_delete: Option<String> }
 impl Client {
  fn new(control: Arc<control::State>, cx: &mut Context<Self>) -> Self {
   cx.spawn(async move |view, cx| { loop { cx.background_executor().timer(Duration::from_secs(1)).await; if view.update(cx, |this, cx| { if let Ok(p)=profiles() { this.profiles=p; } cx.notify(); }).is_err() { break; } } }).detach();
@@ -21,7 +26,7 @@ impl Client {
   let parked=load_parked(); let profiles=profiles().unwrap_or_default(); let first=profiles.iter().find(|p|!parked.contains(&p.key())); let selected=first.map(Profile::key);
   if let Some(Profile::Server(p))=first { *control.selected.lock().unwrap()=serde_json::from_value(p.clone()).ok(); }
   let generation=Arc::new(AtomicU64::new(0)); let stats=stats::start(status.clone(),generation.clone());
-  Self { profiles, selected, parked, message:Arc::new(Mutex::new(String::new())), busy:Arc::new(Mutex::new(None)), control, status, probes:vpn_core::probe::start(), stats, generation }
+  Self { profiles, selected, parked, message:Arc::new(Mutex::new(String::new())), busy:Arc::new(Mutex::new(None)), control, status, probes:vpn_core::probe::start(), stats, generation, armed_delete:None }
  }
  fn run(&mut self, profile: Option<Profile>) {
   let mut busy=self.busy.lock().unwrap(); if busy.is_some() { return; } let action=if profile.is_none() { "Отключение…" } else if *self.status.lock().unwrap()==Some(true) { "Переподключение…" } else { "Подключение…" }; *busy=Some(action); drop(busy);
@@ -36,6 +41,12 @@ fn load_parked() -> BTreeSet<String> { parked_path().ok().and_then(|p|std::fs::r
 fn save_parked(parked: &BTreeSet<String>) -> Result<(),String> { let path=parked_path()?; let tmp=path.with_extension("json.tmp"); std::fs::write(&tmp,serde_json::to_vec(parked).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?; std::fs::rename(tmp,path).map_err(|e|e.to_string()) }
 impl Client {
  fn choose(&mut self, profile: Option<Profile>) { self.selected=profile.as_ref().map(Profile::key); *self.control.selected.lock().unwrap()=match profile { Some(Profile::Server(p))=>serde_json::from_value(p).ok(), _=>None }; }
+ fn delete_imported(&mut self, id: String) {
+  if self.armed_delete.as_deref()!=Some(id.as_str()) { self.armed_delete=Some(id); *self.message.lock().unwrap()="Нажмите ещё раз, чтобы удалить конфигурацию".into(); return; }
+  self.armed_delete=None;
+  if self.busy.lock().unwrap().is_some() { return; }
+  match vpn_core::delete_imported_profile(&id) { Ok(())=> { self.profiles.retain(|profile| !matches!(profile,Profile::Imported(item) if item["id"].as_str()==Some(id.as_str()))); if self.selected.as_ref().is_some_and(|key|key==&format!("imported:{id}")) { let next=self.profiles.iter().find(|p|!self.parked.contains(&p.key())).cloned(); self.choose(next); } *self.message.lock().unwrap()="Конфигурация удалена".into(); }, Err(error)=>*self.message.lock().unwrap()=format!("Ошибка: {error}") }
+ }
  fn park(&mut self, key: String, parked: bool) {
   if self.busy.lock().unwrap().is_some() { return; }
   if parked && self.selected.as_ref()==Some(&key) {
@@ -64,6 +75,7 @@ const ERR: u32 = 0xff8080;
 impl Profile {
  fn title(&self) -> String { match self { Self::Server(p) => p["server_name"].as_str().unwrap_or("Сервер"), Self::Imported(p) => p["host"].as_str().unwrap_or("Импорт") }.to_string() }
  fn subtitle(&self) -> String { match self { Self::Server(p) => p["email"].as_str().unwrap_or(""), Self::Imported(p) => p["name"].as_str().unwrap_or("") }.to_string() }
+ fn flag(&self) -> Option<String> { let code=match self { Self::Server(p)=>p["country"].as_str(), Self::Imported(_)=>None }?; let mut chars=code.chars(); let a=chars.next()?; let b=chars.next()?; if chars.next().is_some() || !a.is_ascii_alphabetic() || !b.is_ascii_alphabetic() { return None; } Some(char::from_u32(127397+a.to_ascii_uppercase() as u32)?.to_string()+&char::from_u32(127397+b.to_ascii_uppercase() as u32)?.to_string()) }
 }
 
 /// Значок питания из примитивов: глиф «⏻» есть не во всех системных шрифтах.
@@ -109,19 +121,20 @@ impl Render for Client {
   for pass in [false, true] {
    if pass && parked_count>0 { list=list.child(div().flex().items_center().gap_2().pt_3().pb_1().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).text_color(rgb(MUTED)).child("Временно не используются").child(div().text_xs().font_weight(gpui::FontWeight::NORMAL).child(parked_count.to_string()))); }
    for (i,p) in self.profiles.iter().enumerate() { let key=p.key(); let parked=self.parked.contains(&key); if parked!=pass { continue; }
-    let chosen=!parked && self.selected.as_ref()==Some(&key); let profile=p.clone(); let subtitle=p.subtitle(); let park_key=key.clone();
+    let chosen=!parked && self.selected.as_ref()==Some(&key); let profile=p.clone(); let subtitle=p.subtitle(); let flag=p.flag(); let park_key=key.clone(); let imported_id=if let Profile::Imported(item)=p { item["id"].as_str().map(str::to_owned) } else { None }; let armed=self.armed_delete.as_deref().is_some_and(|id|Some(id)==imported_id.as_deref());
     let (ping, ping_tone)=match results.get(&key) { Some(r) if r.udp => ("UDP".to_string(), MUTED), Some(r) if r.ms.is_some() => { let ms=r.ms.unwrap(); (format!("{ms} мс"), if ms<150 { OK } else if ms<400 { WARN } else { ERR }) }, Some(_) => ("Недоступен".to_string(), ERR), None => ("Проверка…".to_string(), MUTED) };
     let mut row=div().id(i).flex().items_center().gap_3().pl_3().pr_1p5().py_2().rounded_lg().border_1().border_color(rgb(if chosen { ACCENT } else if parked { BG } else { SURFACE })).bg(rgb(if chosen { SELECTED } else if parked { BG } else { SURFACE }))
      .when(!chosen && !parked, |row| row.hover(|s| s.bg(rgb(SURFACE_HOVER)).border_color(rgb(SURFACE_HOVER))))
      .when(parked, |row| row.border_color(rgb(SURFACE)))
      .when(!parked, |row| row.child(div().flex().items_center().justify_center().flex_shrink_0().size(px(16.)).rounded_full().border_2().border_color(rgb(if chosen { ACCENT } else { LINE })).when(chosen, |radio| radio.child(div().size(px(6.)).rounded_full().bg(rgb(ACCENT))))))
      .child(div().flex().flex_col().flex_1().min_w_0()
-      .child(div().text_sm().text_color(rgb(if parked { MUTED } else { TEXT })).truncate().child(p.title()))
+      .child(div().flex().items_center().gap_2().child(if let Some(flag)=flag { div().text_sm().flex_shrink_0().child(flag) } else { div() }).child(div().text_sm().text_color(rgb(if parked { MUTED } else { TEXT })).truncate().child(p.title())))
       .when(!subtitle.is_empty(), |text| text.child(div().text_xs().text_color(rgb(MUTED)).truncate().child(subtitle))))
      .child(div().flex().items_center().gap_1p5().flex_shrink_0()
       .child(div().size(px(6.)).rounded_full().bg(rgb(ping_tone)))
       .child(div().text_xs().text_color(rgb(if parked || ping_tone==MUTED { MUTED } else { TEXT })).child(ping)))
-     .child(ghost(("park", i), if parked { "Вернуть" } else { "Отложить" }).flex_shrink_0().on_click(cx.listener(move |this,_,_,cx| { cx.stop_propagation(); this.park(park_key.clone(), !parked); cx.notify(); })));
+     .child(ghost(("park", i), if parked { "↑" } else { "↓" }).flex_shrink_0().on_click(cx.listener(move |this,_,_,cx| { cx.stop_propagation(); this.park(park_key.clone(), !parked); cx.notify(); })))
+     .when_some(imported_id, |row,id| row.child(ghost(("delete", i), if armed { "Точно?" } else { "×" }).text_color(rgb(ERR)).on_click(cx.listener(move |this,_,_,cx| { cx.stop_propagation(); this.delete_imported(id.clone()); cx.notify(); }))));
     if !parked { row=row.cursor_pointer().on_click(cx.listener(move |this,_,_,cx| { if this.busy.lock().unwrap().is_some() { return; } let changed=this.selected.as_ref()!=Some(&key); this.selected=Some(key.clone()); *this.control.selected.lock().unwrap()=match &profile { Profile::Server(p)=>serde_json::from_value(p.clone()).ok(), Profile::Imported(_)=>None }; let connected_now=*this.status.lock().unwrap()==Some(true); if changed && connected_now { this.run(Some(profile.clone())); } cx.notify(); })); }
     list=list.child(row);
    }
@@ -146,7 +159,7 @@ impl Render for Client {
     .child(div().flex().items_center().gap_2().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child("В работе").child(div().text_xs().font_weight(gpui::FontWeight::NORMAL).text_color(rgb(MUTED)).child(active_count.to_string())))
     .child(ghost("probe-now", "Обновить пинги").on_click(cx.listener(|this,_,_,_|this.probes.probe_now()))))
    .child(list)
-   .child(div().flex().justify_end().w_full().child(ghost("admin", "Администрирование").on_click(|_,_,_| { let _=std::process::Command::new("open").arg("/Applications/VPNAdmin.app").spawn(); })))
+   .child(div().flex().justify_between().items_center().w_full().child(div().text_xs().text_color(rgb(MUTED)).child(concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("VPN_BUILD_NUMBER")))).child(ghost("admin", "Администрирование").on_click(|_,_,_| { let _=std::process::Command::new("open").arg("/Applications/VPNAdmin.app").spawn(); })))
  }
 }
 

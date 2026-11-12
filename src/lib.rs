@@ -1457,7 +1457,7 @@ fn imported_summary(item: &ImportedProfile) -> serde_json::Value {
     let awg = url.as_ref().is_some_and(|u| u.scheme() == "awg");
     let query = |name: &str| url.as_ref().and_then(|u| u.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()));
     serde_json::json!({
-        "id": item.id, "name": item.name,
+        "id": item.id, "name": item.name, "awg_source": item.awg_source,
         "host": url.as_ref().and_then(|u| u.host_str()).unwrap_or(""),
         "port": url.as_ref().and_then(|u| u.port()).unwrap_or(443),
         "transport": if awg { "awg".into() } else if hysteria { "hysteria2".into() } else { query("type").unwrap_or_else(|| "tcp".into()) },
