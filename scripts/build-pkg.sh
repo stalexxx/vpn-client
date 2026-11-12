@@ -36,8 +36,9 @@ if [ "${UNIVERSAL:-0}" = 1 ]; then
 else
   TARGET="${TARGET:-}"
   TARGET_ARGS=(); [ -z "$TARGET" ] || TARGET_ARGS=(--target "$TARGET")
-  (cd "$ROOT" && cargo build --release "${TARGET_ARGS[@]}" --bin vpn-tun-helper --bin vpn-core)
-  (cd "$ROOT/src-tauri" && cargo build --release "${TARGET_ARGS[@]}" --features tauri/custom-protocol)
+  # ${arr[@]+...} keeps an empty array from tripping `set -u` on bash 3.2 (macOS /bin/bash).
+  (cd "$ROOT" && cargo build --release ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} --bin vpn-tun-helper --bin vpn-core)
+  (cd "$ROOT/src-tauri" && cargo build --release ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} --features tauri/custom-protocol)
   TARGET_DIR="${TARGET:+$TARGET/}"
   APP_BIN="$ROOT/src-tauri/target/${TARGET_DIR}release/vpn-desktop"; HELPER_BIN="$ROOT/target/${TARGET_DIR}release/vpn-tun-helper"; MCP_BIN="$ROOT/target/${TARGET_DIR}release/vpn-core"; XRAY_OUT="$XRAY_BIN"
 fi

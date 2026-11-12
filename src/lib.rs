@@ -56,7 +56,13 @@ fn keychain_token(_account: &str) -> Result<Vec<u8>, String> {
     Err("Токен не найден; при необходимости укажите его в настройках сервера".to_owned())
 }
 fn token_delete(account: &str) -> Result<(), String> {
-    token_store(|tokens| { let changed = tokens.remove(account).is_some(); Ok(((), changed)) })
+    token_store(|tokens| {
+        let changed = tokens.remove(account).is_some();
+        // token_get falls back to Keychain, so a leftover item would bring the token back.
+        #[cfg(target_os = "macos")]
+        let _ = security_framework::passwords::delete_generic_password(SERVICE, account);
+        Ok(((), changed))
+    })
 }
 
 pub fn mcp_control_socket_path() -> Result<PathBuf, String> {
@@ -368,6 +374,8 @@ pub fn load_panel() -> Result<Option<Panel>, String> {
 }
 
 const COUNTRY_CODES: &str = "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW";
+
+pub fn is_country_code(code: &str) -> bool { COUNTRY_CODES.split_whitespace().any(|v| v == code) }
 
 pub fn panel_hostname(raw: &str) -> Result<String, String> {
     url::Url::parse(raw).map_err(|_| "Некорректный адрес панели".to_owned())?.host_str().map(str::to_owned).ok_or_else(|| "В адресе панели отсутствует хост".into())
@@ -1119,6 +1127,16 @@ fn create_client_with_token(panel: &Panel, token: &str, inbound_id: u64, email: 
     Ok(())
 }
 
+/// Deletes the client (by email) from every inbound of the panel and refreshes the local cache.
+pub fn delete_client(id: &str, email: &str) -> Result<(), String> {
+    if email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Некорректное имя клиента".into()); }
+    let panel = server_for(id)?.panel;
+    let token = server_token(id)?;
+    panel_request(&panel, &token, &format!("clients/del/{email}"), Some(serde_json::json!({})))?;
+    let _ = refresh_client_profiles(id);
+    Ok(())
+}
+
 pub fn create_xhttp_relay_client(host: &str, email: &str, sni: &str, port: u16) -> Result<(String, u64), String> {
     if !valid_http_host(host) || !valid_domain_name(sni) || port == 0 { return Err("Некорректный хост, SNI или порт".into()); }
     if email.is_empty() || email.len() > 128 || !email.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c)) { return Err("Некорректное имя клиента".into()); }
@@ -1407,7 +1425,9 @@ pub fn approve_pending_client(inbound_id: u64, email: &str) -> Result<String, St
 
 // Connections imported from a share link, not tied to any saved server.
 #[derive(Clone, Serialize, Deserialize)]
-struct ImportedProfile { id: String, name: String, share_link: String, added_at: u64 }
+struct ImportedProfile { id: String, name: String, share_link: String, added_at: u64,
+    /// `<amnezia server id>:<client>` when this entry was made by pinning an AmneziaWG client from the admin window.
+    #[serde(default, skip_serializing_if = "Option::is_none")] awg_source: Option<String> }
 static IMPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn imported_path() -> Result<PathBuf, String> { Ok(config_path()?.with_file_name("imported-profiles.json")) }
 fn read_imported(path: &std::path::Path) -> Result<Vec<ImportedProfile>, String> {
@@ -1471,7 +1491,7 @@ fn import_profiles_at(path: &std::path::Path, text: &str, name: Option<&str>) ->
         let fragment: String = url::form_urlencoded::parse(parsed.fragment().unwrap_or("").replace('+', "%2B").as_bytes()).map(|(k, v)| if v.is_empty() { k.into_owned() } else { format!("{k}={v}") }).collect();
         let fallback = suggested.as_deref().map(valid_import_name).and_then(Result::ok);
         let chosen = match name { Some(n) => valid_import_name(n)?, None => valid_import_name(&fragment).ok().or(fallback).map(Ok).unwrap_or_else(|| valid_import_name(parsed.host_str().unwrap_or("Импорт")))? };
-        let item = ImportedProfile { id: new_server_id()?, name: chosen, share_link: link, added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) };
+        let item = ImportedProfile { id: new_server_id()?, name: chosen, share_link: link, added_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) , awg_source: None};
         added.push(imported_summary(&item));
         items.push(item);
     }
@@ -1495,6 +1515,29 @@ fn update_imported(path: &std::path::Path, id: &str, change: impl FnOnce(&mut Ve
 pub fn rename_imported_profile(id: &str, name: &str) -> Result<(), String> {
     let name = valid_import_name(name)?;
     update_imported(&imported_path()?, id, |items, i| { items[i].name = name; Ok(()) })
+}
+/// Pins an AmneziaWG client to the main screen by importing its config; `source` identifies the client so it can be unpinned.
+pub fn pin_awg_client(source: &str, link: &str, name: &str) -> Result<(), String> {
+    let path = imported_path()?;
+    { let _guard = IMPORT_LOCK.lock().map_err(|_| "Не удалось заблокировать список импортированных конфигураций")?;
+      if read_imported(&path)?.iter().any(|i| i.awg_source.as_deref() == Some(source)) { return Ok(()); } }
+    let added = import_profiles_at(&path, link, Some(name)).or_else(|e| if e.contains("уже импортирована") { Ok(vec![]) } else { Err(e) })?;
+    let Some(id) = added.first().and_then(|a| a["id"].as_str()).map(str::to_owned) else { return Ok(()) };
+    update_imported(&path, &id, |items, i| { items[i].awg_source = Some(source.to_owned()); Ok(()) })
+}
+/// Removes the pinned copies whose source starts with `prefix` (`<server id>:<client>` for one client, `<server id>:` for all).
+pub fn unpin_awg(prefix: &str) -> Result<(), String> {
+    let path = imported_path()?;
+    let _guard = IMPORT_LOCK.lock().map_err(|_| "Не удалось заблокировать список импортированных конфигураций")?;
+    let mut items = read_imported(&path)?;
+    let before = items.len();
+    items.retain(|i| !i.awg_source.as_deref().is_some_and(|s| s == prefix || (prefix.ends_with(':') && s.starts_with(prefix))));
+    if items.len() != before { write_imported(&path, &items)?; }
+    Ok(())
+}
+pub fn pinned_awg_sources() -> Result<Vec<String>, String> {
+    let _guard = IMPORT_LOCK.lock().map_err(|_| "Не удалось заблокировать список импортированных конфигураций")?;
+    Ok(read_imported(&imported_path()?)?.into_iter().filter_map(|i| i.awg_source).collect())
 }
 pub fn delete_imported_profile(id: &str) -> Result<(), String> {
     update_imported(&imported_path()?, id, |items, i| { items.remove(i); Ok(()) })
@@ -1959,3 +2002,6 @@ pub mod awglink;
 
 #[cfg(unix)]
 pub mod amnezia;
+pub mod hosts;
+
+pub mod groups;

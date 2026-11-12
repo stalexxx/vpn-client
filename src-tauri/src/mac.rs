@@ -93,6 +93,10 @@ fn wizard_client_qr(wizard_id: String, panel: vpn_core::Panel, inbound_id: u64, 
     Ok(serde_json::json!({"link": link, "size": size, "pixels": pixels}))
 }
 #[tauri::command]
+async fn delete_client(server_id: String, email: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || vpn_core::delete_client(&server_id, &email)).await.map_err(|e| e.to_string())?
+}
+#[tauri::command]
 fn delete_server(server_id: String) -> Result<(), String> { vpn_core::delete_server(&server_id) }
 #[tauri::command]
 async fn list_client_profiles(server_id: String) -> Result<serde_json::Value, String> {
@@ -240,12 +244,14 @@ pub fn main() {
             import_profiles, list_imported_profiles, rename_imported_profile, delete_imported_profile, connect_imported_profile,
             list_pinned_profiles,
             set_profile_pinned,
+            crate::groups::list_profile_groups, crate::groups::create_profile_group, crate::groups::rename_profile_group,
+            crate::groups::delete_profile_group, crate::groups::move_profile_to_group,
             open_admin,
             crate::probes::get_probe_results,
             crate::probes::probe_now,
             crate::probes::get_exit_ip,
-            crate::awg::awg_list_servers, crate::awg::awg_install, crate::awg::awg_clients, crate::awg::awg_status,
-            crate::awg::awg_add_client, crate::awg::awg_client_config, crate::awg::awg_delete_client, crate::awg::awg_uninstall, crate::awg::awg_reveal
+            crate::awg::awg_list_servers, crate::awg::awg_install, crate::awg::awg_install_log,crate::awg::awg_clients, crate::awg::awg_status,
+            crate::awg::awg_add_client, crate::awg::awg_client_config, crate::awg::awg_delete_client, crate::awg::awg_uninstall, crate::awg::awg_reveal, crate::awg::list_hosts, crate::awg::save_host, crate::awg::delete_host, crate::awg::awg_pinned, crate::awg::awg_set_pinned, delete_client
             ,control::select_mcp_profile
             ,control::get_mcp_profile
         ])

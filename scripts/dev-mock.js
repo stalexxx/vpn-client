@@ -38,6 +38,10 @@
   const allKeys = () => servers.flatMap(s => profilesFor(s.id).filter(usable).map(p => ({server_id:s.id,inbound_id:p.inbound_id,email:p.email})));
   const sameKey = (a,b) => a.server_id===b.server_id && a.inbound_id===b.inbound_id && a.email===b.email;
   const imported = []; let importedSeq = 1;
+  const groups = []; let groupSeq = 1;
+  let probeAt = 0;
+  let awgLog = [];
+  const groupNamed = id => groups.find(g => g.id === id) || (() => { throw 'Группа не найдена'; })();
   let statsTick = 0;
   let logLevel = 'warning';
   let bypassState = { bittorrent: true, entries: [] };
@@ -48,6 +52,8 @@ let mode = 'off';
     'Генерирую учётные данные панели…', 'Запускаю x-ui.service…', 'Установка завершена.',
   ];
 
+  const awgPins = new Set(), deletedClients = [];
+  let hostsMock = [], hostSeq = 1, awgServers = [{id:'a1', name:'silicon-awg', ssh_target:'root@95.182.101.33', port:47821, server_public_key:'k'}];
   const handlers = {
     build_info: () => 'v0.0.0-dev · mock',
     vpn_stats: () => { statsTick += 1; const t = Date.now(); return { ts_ms: t, vpn: { up: statsTick * 40000, down: statsTick * 900000 }, direct: { up: statsTick * 300000, down: statsTick * 2500000 } }; },
@@ -56,15 +62,35 @@ let mode = 'off';
     get_bypass_settings: () => bypassState,
     set_bypass_settings: ({ bittorrent, entries }) => { if (entries.some(e => /\s/.test(e))) throw 'Не похоже на домен, IP или подсеть: ' + entries[0]; bypassState = { bittorrent, entries }; return bypassState; },
     // Latency marks for every visible profile, cycling through fast / medium / slow / no answer / UDP.
-    get_probe_results: () => { const all = [...handlers.list_connectable_profiles().map(p => `${p.server_id}:${p.inbound_id}:${p.email}`), ...imported.map(i => `imported:${i.id}`)]; const ts = Math.floor(Date.now()/1000) - 42; const out = {}; all.forEach((k, i) => { const v = [{ms:38},{ms:212},{ms:530},{ms:null,error:'таймаут'},{udp:true}][i % 5]; out[k] = { ms: v.ms ?? null, error: v.error ?? null, ts, udp: !!v.udp }; }); return out; },
-    awg_list_servers: () => [{id:'a1', name:'silicon-awg', ssh_target:'root@95.182.101.33', port:47821, server_public_key:'k'}],
+    get_probe_results: () => { const all = [...handlers.list_connectable_profiles().map(p => `${p.server_id}:${p.inbound_id}:${p.email}`), ...imported.map(i => `imported:${i.id}`)]; const ts = probeAt || Math.floor(Date.now()/1000) - 42; const out = {}; all.forEach((k, i) => { const v = [{ms:38},{ms:212},{ms:530},{ms:null,error:'таймаут'},{udp:true}][i % 5]; out[k] = { ms: v.ms ?? null, error: v.error ?? null, ts, udp: !!v.udp }; }); return out; },
+    awg_list_servers: () => awgServers.map(x => ({...x})),
+    list_hosts: () => {
+      const hostOf = t => t.split('@').pop().replace(/:\d+$/, '');
+      const known = [...servers.filter(x => x.ssh_target), ...awgServers];
+      for (const x of known) if (!hostsMock.some(h => hostOf(h.ssh_target) === hostOf(x.ssh_target))) hostsMock.push({id: 'h' + (hostSeq++), name: x.name, ssh_target: x.ssh_target, ssh_key: x.ssh_key || null, country: x.country || null});
+      return hostsMock.map(h => ({...h}));
+    },
+    save_host: ({id, name, sshTarget, sshKey, country}) => {
+      if (!/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+(:\d+)?$/.test(sshTarget)) throw 'SSH-цель в формате root@хост или root@хост:порт';
+      if (id) { const h = hostsMock.find(x => x.id === id); Object.assign(h, {name, ssh_target: sshTarget, ssh_key: sshKey, country}); return {...h}; }
+      const h = {id: 'h' + (hostSeq++), name, ssh_target: sshTarget, ssh_key: sshKey, country}; hostsMock.push(h); return {...h};
+    },
+    delete_host: ({id}) => { const h = hostsMock.find(x => x.id === id); hostsMock = hostsMock.filter(x => x !== h); awgServers = awgServers.filter(x => x.ssh_target !== h.ssh_target); },
+    awg_pinned: () => [...awgPins],
+    awg_set_pinned: ({client, pinned}) => { pinned ? awgPins.add(client) : awgPins.delete(client); },
+    delete_client: ({serverId, email}) => { deletedClients.push(email); },
     awg_clients: () => [{name:'mac', address:'10.8.1.2'}],
     awg_status: () => 'active\nactive\n---\n  latest handshake: 12 seconds ago\n',
-    awg_install: ({name}) => ({id:'a2', name, ssh_target:'root@x', port:41000, server_public_key:'k'}),
+    awg_install: async ({name, sshTarget}) => {
+      awgLog.length = 0;
+      for (const line of ['Устанавливаем на x…', 'Checking uname…', 'x86_64', 'Installing amneziawg-tools…', 'Adding PPA ppa:amnezia/ppa', 'PORT=41000 SERVER_PUB=k']) { awgLog.push(line); await delay(500); }
+      const rec = {id:'a' + (hostSeq++), name, ssh_target: sshTarget, port:41000, server_public_key:'k'}; awgServers.push(rec); return rec;
+    },
+    awg_install_log: () => awgLog.slice(),
     awg_add_client: ({client}) => ({path:'/Users/me/Downloads/'+client+'.conf', conf:'[Interface]\nPrivateKey = …', link:'vpn://AAAA…', qr_svg:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><rect width="2" height="2"/><rect x="2" y="2" width="2" height="2"/></svg>'}),
     awg_client_config: ({client}) => ({path:'/Users/me/Downloads/'+client+'.conf', conf:'[Interface]\nPrivateKey = …', link:'vpn://AAAA…', qr_svg:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><rect width="2" height="2"/></svg>'}),
-    awg_delete_client: () => null, awg_uninstall: () => null, awg_reveal: () => null,
-    probe_now: () => null,
+    awg_delete_client: () => null, awg_uninstall: ({id}) => { awgServers = awgServers.filter(x => x.id !== id); }, awg_reveal: () => null,
+    probe_now: () => { setTimeout(() => { probeAt = Math.floor(Date.now()/1000); }, 2500); return null; },
     get_exit_ip: () => '203.0.113.7',
     get_vpn_mode: () => mode,
     list_servers: () => servers,
@@ -88,6 +114,11 @@ let mode = 'off';
       if (!added.length) throw 'Некорректная ссылка или конфигурация уже импортирована';
       return added;
     },
+    list_profile_groups: () => groups.map(g => ({...g, members: [...g.members]})),
+    create_profile_group: ({name}) => { if (!name || !name.trim()) throw 'Название группы: от 1 до 40 символов'; const g = {id: String(groupSeq++).padStart(32, '0'), name: name.trim(), members: []}; groups.push(g); return g; },
+    rename_profile_group: ({id, name}) => { groupNamed(id).name = name.trim(); return null; },
+    delete_profile_group: ({id}) => { groups.splice(groups.indexOf(groupNamed(id)), 1); return null; },
+    move_profile_to_group: ({member, group}) => { groups.forEach(g => { g.members = g.members.filter(m => m !== member); }); if (group) groupNamed(group).members.push(member); return null; },
     list_imported_profiles: () => imported.map(({link, ...rest}) => rest),
     rename_imported_profile: ({id, name}) => { const i = imported.find(i => i.id === id); if (!i) throw 'Конфигурация не найдена'; i.name = name; return null; },
     delete_imported_profile: ({id}) => { const k = imported.findIndex(i => i.id === id); if (k < 0) throw 'Конфигурация не найдена'; imported.splice(k, 1); return null; },

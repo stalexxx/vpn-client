@@ -5,6 +5,7 @@ function flag(code) { return code && /^[A-Z]{2}$/.test(code) ? String.fromCodePo
 const canConnect = p => !!p && (p.imported || p.enabled && p.inbound_enabled && ['vless', 'hysteria'].includes(p.protocol) && p.has_local_config);
 let profiles = [], selectedProfileKey = localStorage.getItem('vpn.selectedProfile') || null;
 let mode = 'off', busy = false;
+let groups = [];
 let lastStats = null;
 const fmtRate = b => b >= 1048576 ? `${(b / 1048576).toFixed(1)} МБ/с` : b >= 1024 ? `${Math.round(b / 1024)} КБ/с` : `${Math.round(b)} Б/с`;
 const fmtTotal = b => b >= 1073741824 ? `${(b / 1073741824).toFixed(2)} ГБ` : b >= 1048576 ? `${(b / 1048576).toFixed(1)} МБ` : `${Math.round(b / 1024)} КБ`;
@@ -59,17 +60,122 @@ async function pollProbes() {
   } catch { /* older backend: no probes */ }
 }
 setInterval(pollProbes, 5000);
-function renderProfiles() {
-  const list = $('profiles'); list.replaceChildren();
-  if (!profiles.length) { const empty = document.createElement('p'); empty.className='empty-state'; empty.textContent='Отметьте конфигурации в Администрировании или импортируйте ссылку (кнопка «Импорт»).'; list.append(empty); }
-  for (const p of profiles) {
+// User-defined groups of connection configs: a config is in one group or in none ("Без группы").
+// Which sections are collapsed is remembered per viewer; if storage is unavailable it lasts until the window reloads.
+const collapsedKey = 'vpn.collapsedGroups';
+function collapsedGroups() { try { return new Set(JSON.parse(localStorage.getItem(collapsedKey) || '[]')); } catch { return new Set(); } }
+function setGroupCollapsed(id, collapsed) {
+  const ids = collapsedGroups(); if (collapsed) ids.add(id); else ids.delete(id);
+  try { localStorage.setItem(collapsedKey, JSON.stringify([...ids])); } catch { /* no storage: nothing to keep */ }
+}
+let armedGroup = null;
+function showError(text) { $('connection-error').textContent = text; $('connection-error').hidden = false; }
+function groupHead(section, items, collapsed) {
+  const head = document.createElement('div'); head.className = 'group-head';
+  const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = 'group-toggle'; toggle.setAttribute('aria-expanded', String(!collapsed));
+  const chevron = document.createElement('span'); chevron.className = 'group-chevron'; chevron.setAttribute('aria-hidden', 'true'); chevron.textContent = '▾';
+  const title = document.createElement('span'); title.className = 'group-title'; title.textContent = section.name;
+  const count = document.createElement('span'); count.className = 'group-count'; count.textContent = String(items.length);
+  toggle.append(chevron, title, count);
+  if (collapsed && items.some(p => mode === 'tun' && key(p) === connectedKey)) {
+    const live = document.createElement('span'); live.className = 'group-live'; live.textContent = 'подключено'; live.title = 'В свёрнутой группе есть активное подключение';
+    toggle.append(live);
+  }
+  toggle.addEventListener('click', () => { setGroupCollapsed(section.id, !collapsed); renderProfiles(); });
+  head.append(toggle);
+  if (section.group) head.append(groupActions(section.group, head));
+  return head;
+}
+function groupActions(group, head) {
+  const actions = document.createElement('span'); actions.className = 'group-actions';
+  const rename = document.createElement('button'); rename.type = 'button'; rename.textContent = 'Имя'; rename.title = 'Переименовать группу';
+  rename.addEventListener('click', () => renameGroup(head, group));
+  const del = document.createElement('button'); del.type = 'button';
+  const armed = armedGroup === group.id; del.textContent = armed ? 'Точно?' : 'Удалить'; del.dataset.armed = String(armed);
+  del.title = 'Удалить группу. Её конфигурации останутся в списке без группы';
+  del.addEventListener('click', async () => {
+    if (armedGroup !== group.id) { armedGroup = group.id; renderProfiles(); setTimeout(() => { if (armedGroup === group.id) { armedGroup = null; renderProfiles(); } }, 4000); return; }
+    armedGroup = null;
+    try { await invoke('delete_profile_group', { id: group.id }); } catch (e) { showError(`Не удалось удалить группу: ${e}`); }
+    await loadProfiles();
+  });
+  actions.append(rename, del); return actions;
+}
+function renameGroup(head, group) {
+  const input = document.createElement('input'); input.className = 'profile-rename'; input.value = group.name; input.maxLength = 40;
+  head.replaceChildren(input); input.focus(); input.select();
+  let done = false;
+  const finish = async save => {
+    if (done) return; done = true; const name = input.value.trim();
+    if (save && name && name !== group.name) { try { await invoke('rename_profile_group', { id: group.id, name }); } catch (e) { showError(`Не удалось переименовать группу: ${e}`); } }
+    await loadProfiles();
+  };
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') finish(true); if (e.key === 'Escape') finish(false); });
+  input.addEventListener('blur', () => finish(true));
+}
+// Creating a group: the name field sits outside #profiles, so refreshes of the list do not wipe it.
+function startNewGroup() {
+  const slot = $('new-group-slot'); if (slot.childElementCount) { slot.querySelector('input').focus(); return; }
+  const input = document.createElement('input'); input.className = 'profile-rename'; input.placeholder = 'Название группы'; input.maxLength = 40;
+  slot.append(input); input.focus();
+  let done = false;
+  const finish = async save => {
+    if (done) return; done = true; const name = input.value.trim(); input.remove();
+    if (save && name) { try { await invoke('create_profile_group', { name }); } catch (e) { showError(`Не удалось создать группу: ${e}`); } await loadProfiles(); }
+  };
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') finish(true); if (e.key === 'Escape') finish(false); });
+  input.addEventListener('blur', () => finish(true));
+}
+// The group selector of a config row; shown only once at least one group exists.
+function moveControl(p) {
+  const select = document.createElement('select'); select.className = 'group-select'; select.title = 'Группа'; select.setAttribute('aria-label', 'Группа конфигурации');
+  select.add(new Option('Без группы', ''));
+  for (const g of groups) select.add(new Option(g.name, g.id));
+  select.value = groups.find(g => g.members.includes(key(p)))?.id ?? '';
+  select.addEventListener('change', async () => {
+    select.disabled = true;
+    try { await invoke('move_profile_to_group', { member: key(p), group: select.value || null }); } catch (e) { showError(`Не удалось переместить конфигурацию: ${e}`); }
+    await loadProfiles();
+  });
+  return select;
+}
+function withMove(p, row) {
+  const item = document.createElement('div'); item.className = 'profile-item';
+  const actions = document.createElement('div'); actions.className = 'profile-actions'; actions.append(moveControl(p));
+  item.append(row, actions); return item;
+}
+function renderSection(list, section, items, collapsed) {
+  const isCollapsed = collapsed.has(section.id);
+  const wrap = document.createElement('section'); wrap.className = 'profile-group';
+  wrap.append(groupHead(section, items, isCollapsed));
+  if (!isCollapsed) {
+    const body = document.createElement('div'); body.className = 'profile-group-items';
+    if (items.length) body.append(...items.map(p => profileRow(p)));
+    else { const hint = document.createElement('p'); hint.className = 'group-empty'; hint.textContent = 'Пусто. Чтобы добавить сюда конфигурацию, выберите группу в её строке.'; body.append(hint); }
+    wrap.append(body);
+  }
+  list.append(wrap);
+}
+function profileRow(p) {
     const row = document.createElement('button'); row.type='button'; row.className='profile-row'; row.setAttribute('aria-pressed', String(key(p) === selectedProfileKey)); row.disabled = busy || mode === 'proxy'; row.dataset.active = String(mode === 'tun' && key(p) === connectedKey);
     const country = document.createElement('span'); country.className='profile-flag'; country.textContent=flag(p.country) || '🌐';
     const copy = document.createElement('span'); copy.className='profile-copy';
     const server = document.createElement('strong'); server.className='profile-server'; server.textContent=p.server_name || 'Сервер'; if (p.imported) { const tag=document.createElement('span'); tag.className='profile-tag'; tag.textContent=p.transport==='hysteria2'?'импорт · hy2':p.transport==='awg'?'импорт · awg':'импорт'; server.textContent=p.host || 'Импорт'; server.append(tag); }
     if (p.insecure) { const warning=document.createElement('span'); warning.className='profile-tag profile-tag-warning'; warning.textContent='без проверки TLS'; server.append(warning); }
     const client = document.createElement('span'); client.className='profile-client'; client.textContent=p.email;
-    copy.append(server,client); row.append(country,copy,probeBadge(p)); row.addEventListener('click',()=>{ selectedProfileKey=key(p); localStorage.setItem('vpn.selectedProfile', selectedProfileKey); syncMcpSelection().catch(e=>{ $('connection-error').textContent=`Не удалось сохранить выбор для MCP: ${e}`; $('connection-error').hidden=false; }); renderProfiles(); connectionState(mode); if(mode==='tun' && key(p)!==connectedKey) switchProfile(); }); list.append(p.imported ? importedItem(p, row, client) : row);
+    copy.append(server,client); row.append(country,copy,probeBadge(p)); row.addEventListener('click',()=>{ selectedProfileKey=key(p); localStorage.setItem('vpn.selectedProfile', selectedProfileKey); syncMcpSelection().catch(e=>{ $('connection-error').textContent=`Не удалось сохранить выбор для MCP: ${e}`; $('connection-error').hidden=false; }); renderProfiles(); connectionState(mode); if(mode==='tun' && key(p)!==connectedKey) switchProfile(); }); if (p.imported) return importedItem(p, row, client);
+    return groups.length ? withMove(p, row) : row;
+}
+function renderProfiles() {
+  const list = $('profiles'); list.replaceChildren();
+  if (!profiles.length) { const empty = document.createElement('p'); empty.className='empty-state'; empty.textContent='Отметьте конфигурации в Администрировании или импортируйте ссылку (кнопка «Импорт»).'; list.append(empty); }
+  if (!groups.length) { for (const p of profiles) list.append(profileRow(p)); }
+  else {
+    const collapsed = collapsedGroups(), home = new Map();
+    for (const g of groups) for (const m of g.members) home.set(m, g.id);
+    for (const g of groups) renderSection(list, { id: g.id, name: g.name, group: g }, profiles.filter(p => home.get(key(p)) === g.id), collapsed);
+    const loose = profiles.filter(p => !home.has(key(p)));
+    if (loose.length) renderSection(list, { id: 'ungrouped', name: 'Без группы' }, loose, collapsed);
   }
   const chosen = profiles.find(p=>key(p)===selectedProfileKey);
   $('active-profile-label').textContent = chosen ? `${chosen.imported ? '⬇' : flag(chosen.country)} ${chosen.imported ? (chosen.host || 'Импорт') : chosen.server_name} · ${chosen.email}` : 'Выберите конфигурацию';
@@ -87,14 +193,42 @@ function importedItem(p, row, client) {
     input.addEventListener('keydown',e=>{ if(e.key==='Enter')finish(true); if(e.key==='Escape')finish(false); }); input.addEventListener('blur',()=>finish(true)); });
   del.addEventListener('click',async()=>{ if(armedDelete!==p.imported_id){ armedDelete=p.imported_id; renderProfiles(); setTimeout(()=>{ if(armedDelete===p.imported_id){ armedDelete=null; renderProfiles(); } },4000); return; } armedDelete=null;
     try{ await invoke('delete_imported_profile',{id:p.imported_id}); }catch(e){ $('connection-error').textContent=`Не удалось удалить: ${e}`; $('connection-error').hidden=false; } await loadProfiles(); });
+  if (groups.length) actions.append(moveControl(p));
   actions.append(edit,del); item.append(row,actions); return item;
 }
 async function loadProfiles() {
   $('refresh').disabled=true;
-  try { const [servers,imported]=await Promise.all([invoke('list_connectable_profiles'),invoke('list_imported_profiles')]); profiles=[...servers,...imported.map(importedRow)]; if (!profiles.some(p=>key(p)===selectedProfileKey)) selectedProfileKey=profiles[0] ? key(profiles[0]) : null; if (selectedProfileKey) localStorage.setItem('vpn.selectedProfile',selectedProfileKey); else localStorage.removeItem('vpn.selectedProfile'); await syncMcpSelection(); renderProfiles(); }
+  try { const [servers,imported,userGroups]=await Promise.all([invoke('list_connectable_profiles'),invoke('list_imported_profiles'),invoke('list_profile_groups')]); groups=userGroups; profiles=[...servers,...imported.map(importedRow)]; if (!profiles.some(p=>key(p)===selectedProfileKey)) selectedProfileKey=profiles[0] ? key(profiles[0]) : null; if (selectedProfileKey) localStorage.setItem('vpn.selectedProfile',selectedProfileKey); else localStorage.removeItem('vpn.selectedProfile'); await syncMcpSelection(); renderProfiles(); }
   catch(e) { $('profiles').innerHTML=''; const err=document.createElement('p'); err.className='empty-state'; err.textContent=`Не удалось загрузить конфигурации: ${e}`; $('profiles').append(err); }
   finally { $('refresh').disabled=false; }
 }
+// "Замерить пинги": starts a probe round now and waits (at most 60 s) until every configuration has a result newer than the click.
+let measuring = false;
+async function measurePings() {
+  if (measuring) return;
+  const button = $('measure-pings');
+  if (!profiles.length) { button.textContent = 'Нет конфигураций'; setTimeout(() => { button.textContent = 'Замерить пинги'; }, 2000); return; }
+  measuring = true; button.disabled = true; button.textContent = 'Замеряем…';
+  const from = Math.floor(Date.now() / 1000);
+  const missing = () => profiles.filter(p => !(probes[key(p)] && probes[key(p)].ts >= from)).length;
+  let pending = profiles.length, label = 'Готово';
+  try {
+    await invoke('probe_now');
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 1000));
+      probes = await invoke('get_probe_results'); renderProfiles();
+      pending = missing();
+      button.textContent = pending ? `Замеряем… ${profiles.length - pending}/${profiles.length}` : 'Замеряем…';
+      if (!pending) break;
+    }
+    if (pending) label = 'Не все замерены';
+  } catch (e) { label = 'Ошибка'; showError(`Не удалось замерить пинги: ${e}`); }
+  button.textContent = label;
+  setTimeout(() => { button.textContent = 'Замерить пинги'; button.disabled = false; measuring = false; }, 2500);
+}
+$('measure-pings').addEventListener('click', measurePings);
+$('new-group').addEventListener('click', startNewGroup);
 $('refresh').addEventListener('click',()=>{ loadProfiles(); invoke('probe_now').then(()=>setTimeout(pollProbes,4000)).catch(()=>{}); });
 if (/Windows/.test(navigator.userAgent)) $('open-admin').hidden = true; // administration is macOS-only
 $('open-admin').addEventListener('click',async()=>{ try { await invoke('open_admin'); } catch(e) { $('connection-error').textContent=`Не удалось открыть администрирование: ${e}`; $('connection-error').hidden=false; } });

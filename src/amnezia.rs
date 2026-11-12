@@ -1,7 +1,7 @@
 //! AmneziaWG servers with Cloudflare WARP as the exit. Installed and managed over SSH (no panel): the userspace
 //! `amneziawg-go` binary shipped with the app is uploaded, `awg-quick` comes from Amnezia's PPA.
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 const BINARY: &[u8] = include_bytes!("../assets/amneziawg-go-linux-amd64");
@@ -57,7 +57,44 @@ pub fn find_server(id_or_host: &str) -> Result<AwgServer, String> {
 }
 
 /// Runs `script` as `bash -s` over SSH with `env` assignments, optionally uploading a file first.
+/// Single-quotes `s` for the remote POSIX shell.
+fn sh_quote(s: &str) -> String { format!("'{}'", s.replace('\'', r"'\''")) }
+
+/// Output of the install run, shown live in the admin window (polled by `install_log`). Capped to the last lines.
+static INSTALL_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+const INSTALL_LOG_LINES: usize = 3000;
+fn push_install_log(line: &str) {
+    if let Ok(mut log) = INSTALL_LOG.lock() {
+        log.push(line.to_owned());
+        if log.len() > INSTALL_LOG_LINES { let extra = log.len() - INSTALL_LOG_LINES; log.drain(..extra); }
+    }
+}
+pub fn install_log() -> Vec<String> { INSTALL_LOG.lock().map(|log| log.clone()).unwrap_or_default() }
+pub fn clear_install_log() { if let Ok(mut log) = INSTALL_LOG.lock() { log.clear(); } }
+
+/// Calls `f` for every line of `reader`. Splits on `\n` bytes and decodes each line lossily, so bad bytes
+/// cannot cut the output short the way `BufRead::lines` would.
+fn each_line<R: Read>(reader: R, mut f: impl FnMut(String)) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') { buf.pop(); }
+                f(String::from_utf8_lossy(&buf).into_owned());
+            }
+        }
+    }
+}
+
 fn ssh_run(target: &str, key: Option<&str>, env: &[(&str, &str)], script: &str, args: &[&str], upload: Option<(&[u8], &str)>) -> Result<String, String> {
+    ssh_run_with(target, key, env, script, args, upload, &|_| {})
+}
+
+/// Like `ssh_run`, but every output line (stdout and stderr, as it arrives) is also passed to `on_line`.
+fn ssh_run_with(target: &str, key: Option<&str>, env: &[(&str, &str)], script: &str, args: &[&str], upload: Option<(&[u8], &str)>, on_line: &dyn Fn(&str)) -> Result<String, String> {
     if !crate::valid_ssh_target(target) { return Err("Некорректный SSH-адрес".into()); }
     let (dest, port) = crate::split_ssh_target(target);
     let base = |remote: &str| -> Result<Command, String> {
@@ -68,34 +105,64 @@ fn ssh_run(target: &str, key: Option<&str>, env: &[(&str, &str)], script: &str, 
         Ok(ssh)
     };
     if let Some((bytes, remote_path)) = upload {
-        let mut up = base(&format!("cat > {remote_path} && chmod 600 {remote_path}"))?;
+        let p = sh_quote(remote_path);
+        let mut up = base(&format!("cat > {p} && chmod 600 {p}"))?;
         let mut child = up.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
         child.stdin.take().ok_or("нет stdin")?.write_all(bytes).map_err(|e| format!("Загрузка не удалась: {e}"))?;
         let out = child.wait_with_output().map_err(|e| e.to_string())?;
         if !out.status.success() { return Err(format!("Загрузка не удалась: {}", String::from_utf8_lossy(&out.stderr).trim())); }
     }
-    let assigns: String = env.iter().map(|(k, v)| format!("{k}={v} ")).collect();
-    let remote = format!("{assigns}bash -s -- {}", args.join(" "));
+    let assigns: String = env.iter().map(|(k, v)| format!("{k}={} ", sh_quote(v))).collect();
+    let quoted: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
+    let remote = format!("{assigns}bash -s -- {}", quoted.join(" "));
     let mut child = base(&remote)?.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
-    child.stdin.take().ok_or("нет stdin")?.write_all(script.as_bytes()).map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if out.status.success() { Ok(stdout) } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!("Команда на сервере завершилась с ошибкой ({}): {}", out.status.code().unwrap_or(-1), err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim()))
+    let (Some(stdout_pipe), Some(stderr_pipe)) = (child.stdout.take(), child.stderr.take()) else { return Err("нет вывода команды".into()) };
+    // Reader threads forward lines as they come; this thread consumes them, so a chatty server cannot block on a full pipe.
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx_err = tx.clone();
+    let out_reader = std::thread::spawn(move || each_line(stdout_pipe, |line| { let _ = tx.send((true, line)); }));
+    let err_reader = std::thread::spawn(move || each_line(stderr_pipe, |line| { let _ = tx_err.send((false, line)); }));
+    let written = child.stdin.take().ok_or("нет stdin")?.write_all(script.as_bytes());
+    let (mut stdout, mut stderr) = (String::new(), String::new());
+    for (is_stdout, line) in rx {
+        on_line(&line);
+        let text = if is_stdout { &mut stdout } else { &mut stderr };
+        text.push_str(&line); text.push('\n');
+    }
+    let _ = out_reader.join(); let _ = err_reader.join();
+    let status = child.wait().map_err(|e| e.to_string())?;
+    written.map_err(|e| e.to_string())?;
+    if status.success() { Ok(stdout) } else {
+        Err(format!("Команда на сервере завершилась с ошибкой ({}): {}", status.code().unwrap_or(-1), stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim()))
     }
 }
 
 fn binary_sha256() -> &'static str { BINARY_SHA256.split_whitespace().next().unwrap_or("") }
 
+/// Where the awg/awg-quick tools come from: `github` (built from a pinned tag) or `ppa` (Launchpad packages).
+pub fn tools_source(tools: &str) -> Result<&'static str, String> {
+    match tools { "github" => Ok("github"), "ppa" => Ok("ppa"), _ => Err("Источник amneziawg-tools: github или ppa".into()) }
+}
+
 /// Installs AmneziaWG + WARP on a fresh Ubuntu/Debian server and remembers it. `port`: UDP port (random when `None`).
-pub fn install(name: &str, ssh_target: &str, ssh_key: Option<&str>, port: Option<u16>, country: Option<String>) -> Result<AwgServer, String> {
+/// `tools`: `github` or `ppa`, see `tools_source`.
+pub fn install(name: &str, ssh_target: &str, ssh_key: Option<&str>, port: Option<u16>, country: Option<String>, tools: &str) -> Result<AwgServer, String> {
+    push_install_log(&format!("Устанавливаем на {}…", crate::ssh_host(ssh_target)));
+    let result = tools_source(tools).and_then(|tools| install_steps(name, ssh_target, ssh_key, port, country, tools));
+    match &result {
+        Ok(server) => push_install_log(&format!("Готово: UDP {}.", server.port)),
+        Err(e) => push_install_log(&format!("Ошибка: {e}")),
+    }
+    result
+}
+
+fn install_steps(name: &str, ssh_target: &str, ssh_key: Option<&str>, port: Option<u16>, country: Option<String>, tools: &str) -> Result<AwgServer, String> {
     if name.trim().is_empty() || name.len() > 64 { return Err("Имя сервера: 1–64 символа".into()); }
     let port = match port { Some(p) if p >= 1024 => p, Some(_) => return Err("Порт должен быть не меньше 1024".into()), None => { let mut b = [0u8; 2]; crate::compat::random_bytes(&mut b)?; 20000 + (u16::from_be_bytes(b) % 40000) } };
     let uname = ssh_run(ssh_target, ssh_key, &[], "uname -m", &[], None)?;
     if uname.trim() != "x86_64" { return Err(format!("Поддерживается только x86_64 (на сервере {})", uname.trim())); }
     let port_s = port.to_string();
-    let out = ssh_run(ssh_target, ssh_key, &[("AWG_PORT", &port_s), ("AWG_SHA256", binary_sha256())], SETUP, &[], Some((BINARY, "/root/amneziawg-go.upload")))?;
+    let out = ssh_run_with(ssh_target, ssh_key, &[("AWG_PORT", &port_s), ("AWG_SHA256", binary_sha256()), ("AWG_TOOLS", tools)], SETUP, &[], Some((BINARY, "/root/amneziawg-go.upload")), &push_install_log)?;
     let public = out.lines().find_map(|l| l.split("SERVER_PUB=").nth(1)).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).ok_or("Установка завершилась без публичного ключа сервера")?;
     let mut id = [0u8; 16]; crate::compat::random_bytes(&mut id)?;
     let server = AwgServer { id: id.iter().map(|b| format!("{b:02x}")).collect(), name: name.trim().to_string(), ssh_target: ssh_target.to_string(), ssh_key: ssh_key.map(str::to_string), port, server_public_key: public, country };
@@ -133,6 +200,11 @@ pub fn delete_client(server: &AwgServer, name: &str) -> Result<(), String> {
 /// WireGuard handshake/transfer of the WARP side and of the client side.
 pub fn status(server: &AwgServer) -> Result<String, String> {
     ssh_run(&server.ssh_target, server.ssh_key.as_deref(), &[], "export WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go; systemctl is-active awg-quick@awg0 awg-quick@warp0; echo ---; awg show warp0 | grep -E 'handshake|transfer'; echo ---; awg show awg0 | grep -E 'peer|handshake|transfer'", &[], None)
+}
+
+/// Drops the app's record of the server without touching the machine.
+pub fn forget(id: &str) -> Result<(), String> {
+    let mut all = list_servers()?; all.retain(|s| s.id != id); save_servers(&all)
 }
 
 pub fn uninstall(server: &AwgServer) -> Result<(), String> {
@@ -204,6 +276,25 @@ mod tests {
         assert_eq!(hex, binary_sha256());
     }
     #[test] fn scripts_are_embedded() { assert!(SETUP.contains("awg0")); assert!(ADD_CLIENT.contains("# client")); assert!(DEL_CLIENT.contains("remove")); }
+    #[test] fn each_line_strips_line_endings_and_survives_invalid_utf8() {
+        let mut lines = Vec::new();
+        each_line(&b"first\r\nbad \xff byte\nlast"[..], |l| lines.push(l));
+        assert_eq!(lines, ["first", "bad \u{fffd} byte", "last"]);
+    }
+    #[test] fn tools_source_accepts_only_known_values() {
+        assert_eq!(tools_source("github"), Ok("github"));
+        assert_eq!(tools_source("ppa"), Ok("ppa"));
+        assert!(tools_source("apt").is_err());
+        assert!(tools_source("").is_err());
+    }
+    #[test] fn install_log_keeps_recent_lines_only() {
+        clear_install_log();
+        for i in 0..INSTALL_LOG_LINES + 5 { push_install_log(&i.to_string()); }
+        let log = install_log();
+        assert_eq!(log.len(), INSTALL_LOG_LINES);
+        assert_eq!(log.first().map(String::as_str), Some("5"));
+        clear_install_log();
+    }
     #[test] fn vpn_link_roundtrips_to_the_container_description() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         use std::io::Read;

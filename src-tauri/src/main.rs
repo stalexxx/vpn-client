@@ -2,6 +2,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod probes;
+mod groups;
 #[cfg(target_os = "macos")]
 mod awg;
 #[cfg(not(windows))] mod tray;
