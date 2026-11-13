@@ -63,6 +63,7 @@ fi
 chmod 755 "$APP/Contents/Helpers/awgsocks"
 mkdir -p "$APP/Contents/Resources"
 cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/gpui-client/assets/globe.png" "$APP/Contents/Resources/globe.png"
 # Domain/IP lists for geosite:/geoip: exclusions (from the official Xray release archive).
 if [ -n "${GEO_DIR:-}" ]; then
   mkdir -p "$APP/Contents/Resources"
