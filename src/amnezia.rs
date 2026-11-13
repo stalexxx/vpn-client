@@ -133,7 +133,15 @@ fn ssh_run_with(target: &str, key: Option<&str>, env: &[(&str, &str)], script: &
     let status = child.wait().map_err(|e| e.to_string())?;
     written.map_err(|e| e.to_string())?;
     if status.success() { Ok(stdout) } else {
-        Err(format!("Команда на сервере завершилась с ошибкой ({}): {}", status.code().unwrap_or(-1), stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim()))
+        let code = status.code().unwrap_or(-1);
+        let detail = stderr.lines().rev().find(|l| l.trim_start().starts_with("ERROR "))
+            .or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty())).unwrap_or("").trim();
+        let hint = match code {
+            141 => " Возможен обрыв канала вывода (SIGPIPE); проверьте предыдущие строки журнала.",
+            255 => " SSH-соединение прервалось или не установилось; проверьте доступность сервера и журнал.",
+            _ => "",
+        };
+        Err(format!("Команда на сервере завершилась с ошибкой ({code}): {detail}.{hint}"))
     }
 }
 

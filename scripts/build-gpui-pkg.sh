@@ -7,12 +7,16 @@
 #
 # The helper only trusts a root-owned bundle, so the app must be installed from
 # this .pkg (payload is owned by root:wheel), never run from target/.
-# Xray is taken from $XRAY_BIN (default: ~/Applications/Xray/xray).
+# Xray is taken from $XRAY_BIN; prefer the locally downloaded release if available.
 # GEO_DIR=/dir/with/geoip.dat+geosite.dat adds the databases that geoip:/geosite: exclusions need.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/dist}"
+if [ -z "${XRAY_BIN:-}" ] && [ -x "$ROOT/dist/xray-26.11.9/xray" ]; then
+  XRAY_BIN="$ROOT/dist/xray-26.11.9/xray"
+  GEO_DIR="${GEO_DIR:-$ROOT/dist/xray-26.11.9}"
+fi
 XRAY_BIN="${XRAY_BIN:-$HOME/Applications/Xray/xray}"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/src-tauri/Cargo.toml" | head -1)"
 [ -n "$VERSION" ] || { echo "cannot read version from src-tauri/Cargo.toml" >&2; exit 1; }

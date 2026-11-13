@@ -14,9 +14,10 @@ pub fn install() {
 
 pub fn update(connected: Option<bool>, busy: bool, failed: bool) {
     let Some(mtm) = MainThreadMarker::new() else { return };
-    let (icon, tooltip) = if busy { ("🟠", "VPN: подключение или переключение") }
-        else if failed { ("🔴", "VPN: ошибка последней операции") }
-        else { match connected { Some(true) => ("🟢", "VPN подключён"), Some(false) => ("⚪", "VPN отключён"), None => ("⚪", "VPN: состояние недоступно") } };
+    // Plain text glyphs render monochrome in the macOS menu bar.
+    let (icon, tooltip) = if busy { ("◌", "VPN: подключение или переключение") }
+        else if failed { ("!", "VPN: ошибка последней операции") }
+        else { match connected { Some(true) => ("●", "VPN подключён"), Some(false) => ("○", "VPN отключён"), None => ("○", "VPN: состояние недоступно") } };
     STATUS_ITEM.with(|slot| { if let Some(button) = slot.borrow().as_ref().and_then(|item| item.button(mtm)) {
         button.setTitle(&NSString::from_str(icon));
         button.setToolTip(Some(&NSString::from_str(tooltip)));

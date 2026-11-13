@@ -1,7 +1,7 @@
 mod control;
 mod stats;
 mod tray;
-use gpui::{div, img, ObjectFit, BoxShadow, linear_gradient, linear_color_stop, hsla, point, prelude::*, px, rgb, size, App, Application, Bounds, Context, Window, WindowBounds, WindowOptions};
+use gpui::{actions, div, img, KeyBinding, ObjectFit, BoxShadow, linear_gradient, linear_color_stop, hsla, point, prelude::*, px, rgb, size, App, Application, Bounds, Context, Window, WindowBounds, WindowOptions};
 use std::{collections::BTreeSet, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, time::Duration};
 
 #[derive(Clone)]
@@ -186,4 +186,5 @@ impl Render for Client {
  }
 }
 
-fn main() { let control=Arc::new(control::State::default()); control::start(control.clone()).expect("Не удалось запустить MCP-сокет"); Application::new().run(move |cx: &mut App| { tray::install(); let bounds=Bounds::centered(None,size(px(1180.),px(720.)),cx); cx.open_window(WindowOptions { window_bounds:Some(WindowBounds::Windowed(bounds)), window_min_size:Some(size(px(820.),px(560.))), titlebar:Some(gpui::TitlebarOptions { title:Some("VPN Client".into()), appears_transparent:true, traffic_light_position:Some(point(px(12.),px(12.))) }), ..Default::default() }, |_,cx| cx.new(|cx|Client::new(control.clone(),cx))).unwrap(); cx.activate(true); }); }
+actions!(vpn_gpui, [Quit]);
+fn main() { let control=Arc::new(control::State::default()); control::start(control.clone()).expect("Не удалось запустить MCP-сокет"); Application::new().run(move |cx: &mut App| { cx.on_action(|_: &Quit, cx| cx.quit()); cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]); tray::install(); let bounds=Bounds::centered(None,size(px(1180.),px(720.)),cx); cx.open_window(WindowOptions { window_bounds:Some(WindowBounds::Windowed(bounds)), window_min_size:Some(size(px(820.),px(560.))), titlebar:Some(gpui::TitlebarOptions { title:Some("VPN Client".into()), appears_transparent:true, traffic_light_position:Some(point(px(12.),px(12.))) }), ..Default::default() }, |_,cx| cx.new(|cx|Client::new(control.clone(),cx))).unwrap(); cx.activate(true); }); }
