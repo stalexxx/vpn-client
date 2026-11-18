@@ -13,8 +13,8 @@ impl TrayStatus {
             .lock()
             .map_err(|_| "Menu bar status is unavailable")?;
         if let Some(tray) = tray.as_ref() {
-            tray.set_title(Some(if connected { "VPN ●" } else { "VPN ○" }))
-                .map_err(|e| e.to_string())?;
+            #[cfg(target_os = "macos")]
+            tray.set_title(Some(if connected { "VPN ●" } else { "VPN ○" })).map_err(|e| e.to_string())?;
             tray.set_tooltip(Some(if connected {
                 "VPN подключён"
             } else {
@@ -33,9 +33,10 @@ pub fn install(app: &mut tauri::App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Завершить VPN Client", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&disconnect, &show, &admin, &quit])?;
     let connected = crate::helper::status().unwrap_or(false) || vpn_core::xray::has_running_process();
-    let title = if connected { "VPN ●" } else { "VPN ○" };
-    let tray = tauri::tray::TrayIconBuilder::with_id("vpn-status")
-        .title(title)
+    let builder = tauri::tray::TrayIconBuilder::with_id("vpn-status");
+    #[cfg(target_os = "macos")]
+    let builder = builder.title(if connected { "VPN ●" } else { "VPN ○" });
+    let tray = builder
         .tooltip(if connected {
             "VPN подключён"
         } else {

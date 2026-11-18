@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub mod vpn_control;
 #[cfg(unix)]
 pub mod helper;

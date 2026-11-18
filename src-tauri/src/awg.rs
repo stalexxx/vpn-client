@@ -65,12 +65,15 @@ pub async fn awg_uninstall(id: String) -> Result<(), String> {
     blocking(move || { amnezia::uninstall(&amnezia::find_server(&id)?)?; let _ = vpn_core::unpin_awg(&format!("{id}:")); Ok(()) }).await
 }
 
-/// Reveals a saved `.conf` in Finder.
+/// Reveals a saved `.conf` in the file manager.
 #[tauri::command]
 pub fn awg_reveal(path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);
     if p.extension().and_then(|e| e.to_str()) != Some("conf") || !p.is_file() { return Err("Файл не найден".into()); }
-    std::process::Command::new("/usr/bin/open").args(["-R", "--"]).arg(p).status().map(|_| ()).map_err(|e| e.to_string())
+    #[cfg(target_os = "macos")]
+    return std::process::Command::new("/usr/bin/open").args(["-R", "--"]).arg(p).status().map(|_| ()).map_err(|e| e.to_string());
+    #[cfg(not(target_os = "macos"))]
+    return p.parent().ok_or("Файл не найден".to_owned()).and_then(|dir| std::process::Command::new("xdg-open").arg(dir).status().map(|_| ()).map_err(|e| e.to_string()));
 }
 
 #[tauri::command]

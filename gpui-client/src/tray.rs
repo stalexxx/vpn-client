@@ -1,10 +1,16 @@
+#[cfg(target_os = "macos")]
 use objc2::{rc::Retained, MainThreadMarker};
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{NSStatusBar, NSStatusItem};
+#[cfg(target_os = "macos")]
 use objc2_foundation::NSString;
+#[cfg(target_os = "macos")]
 use std::cell::RefCell;
 
+#[cfg(target_os = "macos")]
 thread_local! { static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) }; }
 
+#[cfg(target_os = "macos")]
 pub fn install() {
     assert!(MainThreadMarker::new().is_some());
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(18.0);
@@ -12,6 +18,11 @@ pub fn install() {
     update(None, false, false);
 }
 
+/// No menu-bar icon on Linux yet; the window is the whole UI.
+#[cfg(not(target_os = "macos"))]
+pub fn install() {}
+
+#[cfg(target_os = "macos")]
 pub fn update(connected: Option<bool>, busy: bool, failed: bool) {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let (icon, tooltip) = if busy { ("🟠", "VPN: подключение или переключение") }
@@ -22,3 +33,6 @@ pub fn update(connected: Option<bool>, busy: bool, failed: bool) {
         button.setToolTip(Some(&NSString::from_str(tooltip)));
     }});
 }
+
+#[cfg(not(target_os = "macos"))]
+pub fn update(_connected: Option<bool>, _busy: bool, _failed: bool) {}

@@ -3,7 +3,7 @@
 
 mod probes;
 mod groups;
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
 mod awg;
 #[cfg(not(windows))] mod tray;
 #[cfg(not(windows))] mod install;

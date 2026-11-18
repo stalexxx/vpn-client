@@ -159,7 +159,7 @@ impl Render for Client {
     .child(div().flex().items_center().gap_2().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child("В работе").child(div().text_xs().font_weight(gpui::FontWeight::NORMAL).text_color(rgb(MUTED)).child(active_count.to_string())))
     .child(ghost("probe-now", "Обновить пинги").on_click(cx.listener(|this,_,_,_|this.probes.probe_now()))))
    .child(list)
-   .child(div().flex().justify_between().items_center().w_full().child(div().text_xs().text_color(rgb(MUTED)).child(concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("VPN_BUILD_NUMBER")))).child(ghost("admin", "Администрирование").on_click(|_,_,_| { let _=std::process::Command::new("open").arg("/Applications/VPNAdmin.app").spawn(); })))
+   .child(div().flex().justify_between().items_center().w_full().child(div().text_xs().text_color(rgb(MUTED)).child(concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("VPN_BUILD_NUMBER")))).child(ghost("admin", "Администрирование").on_click(|_,_,_| { #[cfg(target_os = "macos")] { let _=std::process::Command::new("open").arg("/Applications/VPNAdmin.app").spawn(); } })))
  }
 }
 
