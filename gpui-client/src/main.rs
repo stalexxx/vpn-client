@@ -163,4 +163,11 @@ impl Render for Client {
  }
 }
 
-fn main() { let control=Arc::new(control::State::default()); control::start(control.clone()).expect("Не удалось запустить MCP-сокет"); Application::new().run(move |cx: &mut App| { tray::install(); let bounds=Bounds::centered(None,size(px(420.),px(600.)),cx); cx.open_window(WindowOptions { window_bounds:Some(WindowBounds::Windowed(bounds)), window_min_size:Some(size(px(380.),px(480.))), titlebar:Some(gpui::TitlebarOptions { title:Some("VPN Client".into()), ..Default::default() }), ..Default::default() }, |_,cx| cx.new(|cx|Client::new(control.clone(),cx))).unwrap(); cx.activate(true); }); }
+fn main() {
+ let control=Arc::new(control::State::default());
+ if let Err(e)=control::start(control.clone()) {
+  if e=="Приложение VPN уже запущено" { eprintln!("{e}"); std::process::exit(0); }
+  eprintln!("Не удалось запустить MCP-сокет: {e}"); std::process::exit(1);
+ }
+ Application::new().run(move |cx: &mut App| { tray::install(); let bounds=Bounds::centered(None,size(px(420.),px(600.)),cx); cx.open_window(WindowOptions { window_bounds:Some(WindowBounds::Windowed(bounds)), window_min_size:Some(size(px(380.),px(480.))), titlebar:Some(gpui::TitlebarOptions { title:Some("VPN Client".into()), ..Default::default() }), ..Default::default() }, |_,cx| cx.new(|cx|Client::new(control.clone(),cx))).unwrap(); cx.activate(true); });
+}

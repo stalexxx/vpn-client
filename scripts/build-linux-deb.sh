@@ -43,6 +43,6 @@ Description: VPN Client (GPUI)
  Needs the privileged helper: sudo scripts/install-linux-helper.sh
 EOF
 DEB="$OUT/vpn-client_${VERSION}_amd64.deb"
-dpkg-deb --build "$STAGE" "$DEB" >/dev/null
+dpkg-deb --root-owner-group --build "$STAGE" "$DEB" >/dev/null
 echo "== $DEB"
 sha256sum "$DEB"
