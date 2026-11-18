@@ -668,6 +668,19 @@ fn handle(state: &mut HelperState, req: Request) -> Response {
         _ => response(false, connected(state), "Неизвестная команда помощника"),
     }
 }
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    let mut uid: libc::uid_t = 0; let mut gid: libc::gid_t = 0;
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0 { Some(uid) } else { None }
+}
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ok = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut libc::c_void, &mut len) } == 0;
+    if ok { Some(cred.uid) } else { None }
+}
+
 fn serve(uid: u32, xray: PathBuf) -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 { return Err("Помощник должен работать от root".into()); }
     fs::create_dir_all(HELPER_DIR).map_err(|e| e.to_string())?;
@@ -715,9 +728,8 @@ fn serve(uid: u32, xray: PathBuf) -> Result<(), String> {
         let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        let mut peer_uid: libc::uid_t = 0; let mut peer_gid: libc::gid_t = 0;
-        let authorized = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut peer_uid, &mut peer_gid) } == 0
-            && state.lock().map(|state| peer_uid == state.uid).unwrap_or(false);
+        let authorized = peer_uid(&stream)
+            .is_some_and(|uid| state.lock().map(|state| uid == state.uid).unwrap_or(false));
         let reply = if authorized {
             let mut line = String::new();
             match BufReader::new(&stream).take(64 * 1024).read_line(&mut line) {
