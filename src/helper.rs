@@ -1,27 +1,34 @@
 use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    os::unix::{fs::{MetadataExt, PermissionsExt}, net::UnixStream},
-    path::{Path, PathBuf},
-    process::Command,
-    thread,
-    time::{Duration, Instant},
+    os::unix::net::UnixStream,
+    time::Duration,
 };
+#[cfg(target_os = "macos")]
+use std::{os::unix::fs::{MetadataExt, PermissionsExt}, path::{Path, PathBuf}, process::Command, thread, time::Instant};
 
 const SOCKET: &str = "/var/run/vpnclient-tun.sock";
+#[cfg(target_os = "macos")]
 const LABEL: &str = "local.vpn-client.tun-helper";
+#[cfg(target_os = "macos")]
 const HELPER_DEST: &str = "/Library/PrivilegedHelperTools/local.vpn-client.tun-helper";
+#[cfg(target_os = "macos")]
 const XRAY_DEST: &str = "/Library/PrivilegedHelperTools/local.vpn-client.xray";
+#[cfg(target_os = "macos")]
 const AWG_DEST: &str = "/Library/PrivilegedHelperTools/local.vpn-client.awgsocks";
+#[cfg(target_os = "macos")]
 const ASSET_DIR: &str = "/Library/PrivilegedHelperTools/vpnclient-assets";
+#[cfg(target_os = "macos")]
 const PLIST_DEST: &str = "/Library/LaunchDaemons/local.vpn-client.tun-helper.plist";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[cfg(target_os = "macos")]
 fn bundle_helpers() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let contents = exe.parent().and_then(Path::parent).ok_or("VPN Client app bundle path is invalid")?;
     Ok(contents.join("Helpers"))
 }
+#[cfg(target_os = "macos")]
 fn shell_quote(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
 fn helper_status(timeout: Duration) -> Option<Value> {
     let mut stream = UnixStream::connect(SOCKET).ok()?;
@@ -42,6 +49,7 @@ fn helper_is_compatible(status: &Value) -> bool {
         && status.get("awg_support").and_then(Value::as_bool) == Some(true)
         && status.get("api_socket").and_then(Value::as_bool) == Some(true)
 }
+#[cfg(target_os = "macos")]
 fn osascript_admin(command: &str) -> Result<(), String> {
     let script = format!("do shell script \"{}\" with administrator privileges", command.replace('\\', "\\\\").replace('"', "\\\""));
     let output = Command::new("/usr/bin/osascript").args(["-e", &script]).output().map_err(|e| e.to_string())?;
@@ -52,22 +60,30 @@ fn osascript_admin(command: &str) -> Result<(), String> {
         else { Err(format!("Не удалось установить системный компонент: {error}")) }
     }
 }
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;") }
+#[cfg(target_os = "macos")]
 fn launchd_plist(uid: u32, xray: &str) -> String {
     let args = [HELPER_DEST, "serve", &uid.to_string(), xray, "--system"];
     let args = args.iter().map(|a| format!("<string>{}</string>", xml_escape(a))).collect::<String>();
     format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array>{args}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>/var/log/vpn-client-tun-helper.log</string><key>StandardErrorPath</key><string>/var/log/vpn-client-tun-helper.log</string></dict></plist>\n")
 }
+#[cfg(target_os = "macos")]
 const ADMIN_GID: u32 = 80;
+#[cfg(target_os = "macos")]
 // /Applications is root:admin 775; group admin may write there (those users can already sudo), nothing else may be group/other-writable.
 fn component_is_trusted(path: &Path, uid: u32, gid: u32, mode: u32) -> bool {
     if uid != 0 || mode & 0o002 != 0 { return false; }
     mode & 0o020 == 0 || (path == Path::new("/Applications") && gid == ADMIN_GID)
 }
+#[cfg(target_os = "macos")]
 fn verify_bundle_source(path: &Path) -> Result<(), String> { verify_bundle_path(path, true) }
+#[cfg(target_os = "macos")]
 /// Data files (Xray's geo databases) must be root-owned and non-writable like binaries, but are not executable.
 fn verify_bundle_data(path: &Path) -> Result<(), String> { verify_bundle_path(path, false) }
+#[cfg(target_os = "macos")]
 fn exec_bit_ok(mode: u32, executable: bool) -> bool { !executable || mode & 0o111 != 0 }
+#[cfg(target_os = "macos")]
 fn verify_bundle_path(path: &Path, executable: bool) -> Result<(), String> {
     for (index, component) in path.ancestors().enumerate() {
         let meta = std::fs::symlink_metadata(component).map_err(|e| format!("Не удалось проверить {}: {e}", component.display()))?;
@@ -81,6 +97,7 @@ fn verify_bundle_path(path: &Path, executable: bool) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(target_os = "macos")]
 fn install_command(helper: &std::path::Path, xray: &std::path::Path, awg: &std::path::Path, geo: &[std::path::PathBuf], plist: &str) -> String {
     let (mut geo_verify, mut geo_stage, mut geo_install) = (String::new(), String::new(), String::new());
     if geo.len() == 2 {
@@ -102,6 +119,7 @@ fn install_command(helper: &std::path::Path, xray: &std::path::Path, awg: &std::
     )
 }
 
+#[cfg(target_os = "macos")]
 pub fn ensure_installed() -> Result<(), String> {
     if let Some(status) = helper_status(Duration::from_secs(15)) {
         if helper_is_compatible(&status) { return Ok(()); }
@@ -130,6 +148,17 @@ pub fn ensure_installed() -> Result<(), String> {
         thread::sleep(Duration::from_millis(100));
     }
     Err("Системный компонент установлен, но не отвечает с ожидаемой версией. Проверьте журнал /var/log/vpn-client-tun-helper.log.".into())
+}
+#[cfg(target_os = "linux")]
+pub fn ensure_installed() -> Result<(), String> {
+    if let Some(status) = helper_status(Duration::from_secs(15)) {
+        if helper_is_compatible(&status) { return Ok(()); }
+        if status.get("connected").and_then(Value::as_bool) == Some(true) {
+            return Err("Отключите VPN перед обновлением системного компонента, затем повторите подключение.".into());
+        }
+        return Err("Системный компонент несовместим с этой версией; переустановите его: sudo scripts/install-linux-helper.sh".into());
+    }
+    Err("Системный компонент не запущен; установите его: sudo scripts/install-linux-helper.sh".into())
 }
 fn request_value(request: Value) -> Result<Value, String> {
     let mut stream = UnixStream::connect(SOCKET).map_err(|e| format!("Системный компонент недоступен: {e}"))?;
@@ -187,6 +216,7 @@ mod tests {
         assert!(!helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true,"awg_support":true,"api_socket":false})));
         assert!(helper_is_compatible(&json!({"version":APP_VERSION,"connectivity_check":true,"reality_support":true,"hysteria2_support":true,"hysteria_chain_support":true,"awg_support":true,"api_socket":true})));
     }
+    #[cfg(target_os = "macos")]
     #[test]
     fn only_applications_may_be_admin_group_writable() {
         assert!(component_is_trusted(Path::new("/Library/VPNClient"), 0, 0, 0o755));
@@ -198,6 +228,7 @@ mod tests {
         assert!(!component_is_trusted(Path::new("/private/tmp"), 0, 0, 0o1777));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn install_script_is_valid_shell_and_adds_geo_databases_only_when_bundled() {
         use std::path::PathBuf;
@@ -221,6 +252,7 @@ mod tests {
         assert!(script.contains("-m 644 \"$stage/geo0\" '/Library/PrivilegedHelperTools/vpnclient-assets'/geoip.dat"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn data_files_do_not_need_the_executable_bit_but_binaries_do() {
         assert!(exec_bit_ok(0o644, false));
@@ -228,6 +260,7 @@ mod tests {
         assert!(exec_bit_ok(0o755, true));
     }
 
+    #[cfg(target_os = "macos")]
     /// Run on a machine with the app installed from the .pkg: `cargo test -- --ignored installed_bundle`.
     #[test]
     #[ignore]

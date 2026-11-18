@@ -36,6 +36,14 @@ cargo build --release --manifest-path gpui-client/Cargo.toml
 
 Для полноценного TUN-запуска соберите app bundle и разместите в `Contents/Helpers/` исполняемые файлы `vpn-tun-helper` и Xray той же архитектуры, что и приложение. Оба файла и все каталоги на пути к ним должны принадлежать root и не разрешать запись группе или другим пользователям; символические ссылки запрещены. Иначе установка и обновление helper-а будут отклонены. Bundle должен включать корректный `Info.plist` и быть подписан в соответствии с выбранным способом распространения.
 
+На Linux собираются `vpn-core` (MCP/CLI) и `vpn-tun-helper` (первая команда выше; GUI-клиентов под Linux нет). Helper ставится как root systemd-юнит и управляет TUN (`vpntunN`), маршрутами (через Xray) и `/etc/resolv.conf` с журналом побайтового восстановления (симлинк systemd-resolved возвращается как был):
+
+```sh
+cargo build --release --bin vpn-tun-helper
+GOOS_LIST=linux GOARCH_LIST=amd64 tools/awgsocks/build.sh <amneziawg-go на коммите b5928ef>
+sudo scripts/install-linux-helper.sh  # ставит бинари в /usr/local/lib/vpnclient, Xray (или XRAY_BIN) и юнит vpnclient-helper
+```
+
 В приложении задайте адрес уже работающей панели 3x-ui и загрузите профили. Токены панелей хранятся локально в `~/Library/Application Support/VpnClient/panel-tokens.json` с правами 0600; при первом обращении старые токены переносятся из Keychain. Клиентские профили сохраняются локально. Сертификат HTTPS-панели должен проходить стандартную проверку. Для панели, доступной только через SSH, настройте ключ и проверенный ключ сервера в `known_hosts`.
 
 ## MCP

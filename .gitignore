@@ -1,7 +1,5 @@
-/target
-/src-tauri/target
+target/
 .DS_Store
 dist/
 __pycache__/
 
-/gpui-client/target

@@ -335,9 +335,10 @@ impl ApiListen {
 /// access log (it records destination addresses, so it is opt-in and diagnostic only).
 pub fn vless_tun_config_with_options(link: &str, interface: &str, relay_link: Option<&str>, verbose: bool, api: Option<&ApiListen>, bypass: &Bypass) -> Result<Value, String> {
     let macos_name = interface.starts_with("utun") && interface[4..].chars().all(|c| c.is_ascii_digit());
+    let linux_name = interface.starts_with("vpntun") && !interface[6..].is_empty() && interface[6..].chars().all(|c| c.is_ascii_digit());
     // Windows (wintun) adapters have a free-form name; accept a short alphanumeric one.
     let named = !interface.is_empty() && interface.len() <= 32 && interface.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if !macos_name && !(cfg!(windows) && named) {
+    if !macos_name && !linux_name && !(cfg!(windows) && named) {
         return Err("Invalid TUN interface name".into());
     }
     let mut config = vless_config(link, 10808)?;

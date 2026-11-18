@@ -12,9 +12,18 @@ use std::{
 };
 
 const SOCKET: &str = "/var/run/vpnclient-tun.sock";
+#[cfg(target_os = "macos")]
 const HELPER_DIR: &str = "/Library/Application Support/VpnClientHelper";
+#[cfg(target_os = "linux")]
+const HELPER_DIR: &str = "/var/lib/vpnclient-helper";
+#[cfg(target_os = "macos")]
 const ASSET_DIR: &str = "/Library/PrivilegedHelperTools/vpnclient-assets";
+#[cfg(target_os = "linux")]
+const ASSET_DIR: &str = "/var/lib/vpnclient-assets";
+#[cfg(target_os = "macos")]
 const AWG_BIN: &str = "/Library/PrivilegedHelperTools/local.vpn-client.awgsocks";
+#[cfg(target_os = "linux")]
+const AWG_BIN: &str = "/usr/local/lib/vpnclient/awgsocks";
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Deserialize)]
@@ -24,7 +33,7 @@ struct Response { ok: bool, connected: bool, message: String, version: &'static 
 #[derive(Clone, Serialize, Deserialize)]
 struct ProcessRecord { pid: u32, config_path: String, xray_path: String, tun_name: String, #[serde(default)] start_time: String }
 #[derive(Serialize, Deserialize)]
-struct DnsJournal { service: String, original: Vec<String>, applied: Vec<String> }
+struct DnsJournal { service: String, original: Vec<String>, applied: Vec<String>, #[serde(default)] backup: Option<String> }
 struct Tunnel { child: Option<Child>, record: ProcessRecord }
 struct HelperState { uid: u32, xray: PathBuf, active: Option<Tunnel>, last: Option<(String, Option<String>, vpn_core::profile::Bypass)> }
 
@@ -89,6 +98,7 @@ fn write_secure(path: &Path, data: &[u8]) -> Result<(), String> {
     let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path).map_err(|e| e.to_string())?;
     f.write_all(data).and_then(|_| f.sync_all()).map_err(|e| e.to_string())
 }
+#[cfg(target_os = "macos")]
 fn read_dns(service: &str) -> Result<Vec<String>, String> {
     let o = Command::new("/usr/sbin/networksetup").args(["-getdnsservers", service]).output().map_err(|e| e.to_string())?;
     if !o.status.success() { return Err(format!("Не удалось прочитать DNS: {}", String::from_utf8_lossy(&o.stderr).trim())); }
@@ -96,10 +106,79 @@ fn read_dns(service: &str) -> Result<Vec<String>, String> {
     if text.to_lowercase().contains("there aren't any dns servers set") || text.to_lowercase().contains("no dns servers") { return Ok(Vec::new()); }
     text.lines().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.parse::<std::net::IpAddr>().map(|ip| ip.to_string()).map_err(|_| format!("Неизвестный адрес DNS: {s}"))).collect()
 }
+#[cfg(target_os = "linux")]
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+#[cfg(target_os = "linux")]
+fn parse_resolv_conf(text: &str) -> Vec<String> {
+    text.lines().filter_map(|line| {
+        let mut words = line.trim().split_whitespace();
+        if words.next() == Some("nameserver") { words.next().and_then(|ip| ip.parse::<std::net::IpAddr>().ok().map(|a| a.to_string())) } else { None }
+    }).collect()
+}
+#[cfg(target_os = "linux")]
+fn read_dns(_service: &str) -> Result<Vec<String>, String> {
+    let text = fs::read_to_string(RESOLV_CONF).map_err(|e| format!("Не удалось прочитать {RESOLV_CONF}: {e}"))?;
+    Ok(parse_resolv_conf(&text))
+}
+/// Exact original of /etc/resolv.conf for byte-identical restoration: `symlink:<target>` or `file\n<raw>`.
+#[cfg(target_os = "linux")]
+fn resolv_conf_backup() -> Result<String, String> {
+    let meta = fs::symlink_metadata(RESOLV_CONF).map_err(|e| format!("Не удалось прочитать {RESOLV_CONF}: {e}"))?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(RESOLV_CONF).map_err(|e| e.to_string())?;
+        Ok(format!("symlink:{}", target.to_string_lossy()))
+    } else {
+        let content = fs::read_to_string(RESOLV_CONF).map_err(|e| e.to_string())?;
+        Ok(format!("file\n{content}"))
+    }
+}
+#[cfg(target_os = "macos")]
+fn dns_backup() -> Result<Option<String>, String> { Ok(None) }
+#[cfg(target_os = "linux")]
+fn dns_backup() -> Result<Option<String>, String> { resolv_conf_backup().map(Some) }
+#[cfg(target_os = "linux")]
+fn write_resolv_conf_text(text: &str) -> Result<(), String> {
+    let tmp = Path::new("/etc/resolv.conf.vpnclient-tmp");
+    write_secure(tmp, text.as_bytes())?;
+    fs::set_permissions(tmp, fs::Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
+    fs::rename(tmp, RESOLV_CONF).map_err(|e| format!("Не удалось записать {RESOLV_CONF}: {e}"))
+}
+#[cfg(target_os = "linux")]
+fn restore_resolv_conf(journal: &DnsJournal) -> Result<(), String> {
+    match journal.backup.as_deref() {
+        Some(rest) if rest.starts_with("symlink:") => {
+            let _ = fs::remove_file(RESOLV_CONF);
+            std::os::unix::fs::symlink(&rest["symlink:".len()..], RESOLV_CONF).map_err(|e| format!("Не удалось восстановить {RESOLV_CONF}: {e}"))
+        }
+        Some(rest) if rest.starts_with("file\n") => write_resolv_conf_text(&rest["file\n".len()..]),
+        _ => set_dns(&journal.service, &journal.original),
+    }
+}
+#[cfg(target_os = "macos")]
 fn default_route_interface(route_output: &str) -> Result<String, String> {
     route_output.lines().find_map(|line| line.trim().strip_prefix("interface:").map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
         .ok_or_else(|| "Не удалось определить интерфейс маршрута по умолчанию".into())
 }
+/// Parses `ip route get 1.1.1.1`: `1.1.1.1 via … dev <iface> …`.
+#[cfg(target_os = "linux")]
+fn default_route_interface(route_output: &str) -> Result<String, String> {
+    let mut words = route_output.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "dev" { return words.next().filter(|s| !s.is_empty()).map(str::to_owned).ok_or_else(|| "Не удалось определить интерфейс маршрута по умолчанию".to_owned()); }
+    }
+    Err("Не удалось определить интерфейс маршрута по умолчанию".into())
+}
+/// Output of the system's "which interface reaches 1.1.1.1" query.
+fn route_get_output() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    let output = Command::new("/sbin/route").args(["-n", "get", "1.1.1.1"]).output().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    let output = Command::new("/usr/sbin/ip").args(["route", "get", "1.1.1.1"]).output()
+        .or_else(|_| Command::new("ip").args(["route", "get", "1.1.1.1"]).output()).map_err(|e| e.to_string())?;
+    if !output.status.success() { return Err("Не удалось проверить маршрут до 1.1.1.1".into()); }
+    String::from_utf8(output.stdout).map_err(|_| "Некорректный вывод route".into())
+}
+#[cfg(target_os = "macos")]
 fn service_for_interface(interface: &str, service_order: &str) -> Result<String, String> {
     let mut service = None;
     for line in service_order.lines().map(str::trim) {
@@ -117,6 +196,7 @@ fn service_for_interface(interface: &str, service_order: &str) -> Result<String,
     }
     Err(format!("Для интерфейса {interface} не найдена сетевая служба macOS"))
 }
+#[cfg(target_os = "macos")]
 fn active_network_service() -> Result<String, String> {
     let route = Command::new("/sbin/route").args(["-n", "get", "default"]).output().map_err(|e| e.to_string())?;
     if !route.status.success() { return Err(format!("Не удалось прочитать маршрут по умолчанию: {}", String::from_utf8_lossy(&route.stderr).trim())); }
@@ -125,6 +205,10 @@ fn active_network_service() -> Result<String, String> {
     if !order.status.success() { return Err(format!("Не удалось прочитать сетевые службы: {}", String::from_utf8_lossy(&order.stderr).trim())); }
     service_for_interface(&interface, &String::from_utf8(order.stdout).map_err(|_| "Некорректный список сетевых служб")?)
 }
+/// Linux has no per-service DNS: the journal label is the file we manage.
+#[cfg(target_os = "linux")]
+fn active_network_service() -> Result<String, String> { Ok("resolv.conf".to_owned()) }
+#[cfg(target_os = "macos")]
 fn set_dns(service: &str, values: &[String]) -> Result<(), String> {
     let mut c = Command::new("/usr/sbin/networksetup");
     c.arg("-setdnsservers").arg(service);
@@ -132,6 +216,12 @@ fn set_dns(service: &str, values: &[String]) -> Result<(), String> {
     let o = c.output().map_err(|e| e.to_string())?;
     if !o.status.success() { return Err(format!("Не удалось настроить DNS: {}", String::from_utf8_lossy(&o.stderr).trim())); }
     Ok(())
+}
+#[cfg(target_os = "linux")]
+fn set_dns(_service: &str, values: &[String]) -> Result<(), String> {
+    let mut text = String::from("# Managed by vpn-tun-helper; restored on disconnect.\n");
+    for v in values { text.push_str(&format!("nameserver {v}\n")); }
+    write_resolv_conf_text(&text)
 }
 fn dns_restore_action(current: &[String], journal: &DnsJournal) -> DnsRestoreAction {
     if current == journal.applied { DnsRestoreAction::RestoreOriginal }
@@ -156,14 +246,31 @@ fn restore_dns() -> Result<(), String> {
     let path = root_path("dns.json");
     let bytes = match fs::read(&path) { Ok(b) => b, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()), Err(e) => return Err(e.to_string()) };
     let journal: DnsJournal = serde_json::from_slice(&bytes).map_err(|_| "Повреждён журнал восстановления DNS")?;
-    restore_dns_transaction(&journal, || read_dns(&journal.service), |servers| set_dns(&journal.service, servers), || fs::remove_file(&path).map_err(|e| e.to_string()))
+    #[cfg(target_os = "macos")]
+    let set = |servers: &[String]| set_dns(&journal.service, servers);
+    #[cfg(target_os = "linux")]
+    let set = |_: &[String]| restore_resolv_conf(&journal);
+    restore_dns_transaction(&journal, || read_dns(&journal.service), set, || fs::remove_file(&path).map_err(|e| e.to_string()))
 }
-fn choose_utun() -> Result<String, String> {
+#[cfg(target_os = "macos")]
+fn interface_exists(name: &str) -> bool { Command::new("/sbin/ifconfig").arg(name).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false) }
+#[cfg(target_os = "linux")]
+fn interface_exists(name: &str) -> bool { Path::new("/sys/class/net").join(name).exists() }
+#[cfg(target_os = "macos")]
+fn choose_tun() -> Result<String, String> {
     for i in 10..=1024 {
         let name = format!("utun{i}");
-        if !Command::new("/sbin/ifconfig").arg(&name).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false) { return Ok(name); }
+        if !interface_exists(&name) { return Ok(name); }
     }
     Err("Не найден свободный интерфейс utun".into())
+}
+#[cfg(target_os = "linux")]
+fn choose_tun() -> Result<String, String> {
+    for i in 0..64 {
+        let name = format!("vpntun{i}");
+        if !interface_exists(&name) { return Ok(name); }
+    }
+    Err("Не найден свободный интерфейс vpntun".into())
 }
 fn xray_log() -> PathBuf { root_path("xray.log") }
 /// Diagnostic log level, chosen over MCP/UI and applied at the next connection.
@@ -257,10 +364,7 @@ fn tcp_probe(timeout: Duration) -> bool {
     result().unwrap_or(false)
 }
 fn route_uses_tun(tun: &str) -> Result<bool, String> {
-    let output = Command::new("/sbin/route").args(["-n", "get", "1.1.1.1"]).output().map_err(|e| e.to_string())?;
-    if !output.status.success() { return Err("Не удалось проверить маршрут до 1.1.1.1".into()); }
-    let text = String::from_utf8(output.stdout).map_err(|_| "Некорректный вывод route")?;
-    Ok(default_route_interface(&text)? == tun)
+    Ok(default_route_interface(&route_get_output()?)? == tun)
 }
 fn verify_tunnel_connectivity(tun: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -347,10 +451,13 @@ fn wait_ready(child: &mut Child, stdout: impl Read + Send + 'static, timeout: Du
 static AWG_ACTIVE: Mutex<Option<AwgProc>> = Mutex::new(None);
 /// Physical interface seen before the tunnel came up (the default route points into the TUN afterwards).
 static PHYS_IFACE: Mutex<Option<String>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
+fn is_tun_interface(name: &str) -> bool { name.starts_with("utun") }
+#[cfg(target_os = "linux")]
+fn is_tun_interface(name: &str) -> bool { name.starts_with("tun") || name.starts_with("vpn") }
 fn remember_physical_interface() -> Result<String, String> {
-    let route = Command::new("/sbin/route").args(["-n", "get", "default"]).output().map_err(|e| e.to_string())?;
-    match default_route_interface(&String::from_utf8_lossy(&route.stdout)) {
-        Ok(iface) if !iface.starts_with("utun") => { if let Ok(mut g) = PHYS_IFACE.lock() { *g = Some(iface.clone()); } Ok(iface) }
+    match route_get_output().ok().and_then(|o| default_route_interface(&o).ok()) {
+        Some(iface) if !is_tun_interface(&iface) => { if let Ok(mut g) = PHYS_IFACE.lock() { *g = Some(iface.clone()); } Ok(iface) }
         _ => PHYS_IFACE.lock().ok().and_then(|g| g.clone()).ok_or_else(|| "Маршрут по умолчанию ведёт в другой туннель: отключите его перед подключением AmneziaWG.".to_owned()),
     }
 }
@@ -415,7 +522,7 @@ fn start_tunnel(state: &mut HelperState, link: &str, relay_link: Option<&str>, b
     }
     if !hot { restore_dns()?; }
     let _ = fs::remove_file(root_path("config.json"));
-    let tun = choose_utun()?;
+    let tun = choose_tun()?;
     let config = vpn_core::profile::vless_tun_config_with_options(link, &tun, relay_link, verbose_log(), Some(&api_listen()), bypass)?;
     let config_path = root_path("config.json");
     write_secure(&config_path, config.to_string().as_bytes())?;
@@ -428,7 +535,7 @@ fn start_tunnel(state: &mut HelperState, link: &str, relay_link: Option<&str>, b
         let service = active_network_service()?;
         let original = read_dns(&service)?;
         let applied = vec!["1.1.1.1".to_owned(), "1.0.0.1".to_owned()];
-        let journal = DnsJournal { service, original, applied: applied.clone() };
+        let journal = DnsJournal { service, original, applied: applied.clone(), backup: dns_backup()? };
         write_secure(&root_path("dns.json"), &serde_json::to_vec(&journal).map_err(|e| e.to_string())?)?;
         if let Err(e) = set_dns(&journal.service, &applied) {
             return Err(append_rollback_error(e, rollback_start(None, &config_path)));
@@ -468,7 +575,7 @@ fn start_tunnel(state: &mut HelperState, link: &str, relay_link: Option<&str>, b
             Ok(None) => {},
             Err(e) => { startup_error = Some(format!("Не удалось проверить процесс Xray: {e}")); break; }
         }
-        if Command::new("/sbin/ifconfig").arg(&tun).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false) { ready = true; break; }
+        if interface_exists(&tun) { ready = true; break; }
         thread::sleep(Duration::from_millis(100));
     }
     if !ready {
@@ -668,6 +775,17 @@ fn handle(state: &mut HelperState, req: Request) -> Response {
         _ => response(false, connected(state), "Неизвестная команда помощника"),
     }
 }
+fn primary_gid(uid: u32) -> u32 {
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut buf = vec![0u8; 8192];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        if libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr() as *mut libc::c_char, buf.len() as libc::size_t, &mut result) == 0 && !result.is_null() { return pwd.pw_gid; }
+    }
+    #[cfg(target_os = "macos")] { 20 }
+    #[cfg(target_os = "linux")] { uid }
+}
+
 #[cfg(target_os = "macos")]
 fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
     let mut uid: libc::uid_t = 0; let mut gid: libc::gid_t = 0;
@@ -693,7 +811,7 @@ fn serve(uid: u32, xray: PathBuf) -> Result<(), String> {
     let listener = UnixListener::bind(socket_path).map_err(|e| e.to_string())?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     let cpath = std::ffi::CString::new(SOCKET).map_err(|e| e.to_string())?;
-    if unsafe { libc::chown(cpath.as_ptr(), uid, 20) } != 0 { return Err("Не удалось назначить владельца сокета".into()); }
+    if unsafe { libc::chown(cpath.as_ptr(), uid, primary_gid(uid)) } != 0 { return Err("Не удалось назначить владельца сокета".into()); }
     // Left by a previous helper version, whose Xray API listened on a loopback TCP port.
     let _ = fs::remove_file(root_path("api-port"));
     let mut state = HelperState { uid, xray, active: None, last: None };
@@ -875,12 +993,37 @@ mod tests {
         assert!(parse_uid("-1").is_err());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn parses_default_route_interface() {
         assert_eq!(default_route_interface("route to: default\ninterface: en7\n"), Ok("en7".into()));
         assert!(default_route_interface("route to: default\n").is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_default_route_interface() {
+        assert_eq!(default_route_interface("1.1.1.1 via 192.168.1.1 dev enp4s0 src 192.168.1.138 uid 1000 \n    cache \n"), Ok("enp4s0".into()));
+        assert_eq!(default_route_interface("1.1.1.1 dev vpntun0 src 169.254.10.2 uid 0 \n    cache \n"), Ok("vpntun0".into()));
+        assert!(default_route_interface("1.1.1.1 via 192.168.1.1 src 192.168.1.138\n").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_resolv_conf_nameservers() {
+        let text = "# comment\nnameserver 1.1.1.1\nnameserver 127.0.0.53\noptions edns0\nsearch example.com\nnameserver not-an-ip\n";
+        assert_eq!(parse_resolv_conf(text), vec!["1.1.1.1".to_string(), "127.0.0.53".to_string()]);
+        assert!(parse_resolv_conf("# empty\n").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolv_conf_backup_captures_link_or_file() {
+        let backup = resolv_conf_backup().unwrap();
+        assert!(backup.starts_with("symlink:") || backup.starts_with("file\n"), "{backup:?}");
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn maps_interface_to_network_service() {
         let services = "(1) Ethernet Adapter\n(Hardware Port: Ethernet, Device: en0)\n(2) USB LAN\n(Hardware Port: USB 10/100/1000 LAN, Device: en7)\n";
@@ -891,7 +1034,7 @@ mod tests {
 
     #[test]
     fn dns_restore_keeps_conflicting_user_changes() {
-        let journal = DnsJournal { service: "Ethernet".into(), original: vec!["192.0.2.1".into()], applied: vec!["1.1.1.1".into()] };
+        let journal = DnsJournal { service: "Ethernet".into(), original: vec!["192.0.2.1".into()], applied: vec!["1.1.1.1".into()], backup: None };
         assert_eq!(dns_restore_action(&journal.applied, &journal), DnsRestoreAction::RestoreOriginal);
         assert_eq!(dns_restore_action(&journal.original, &journal), DnsRestoreAction::AlreadyRestored);
         assert_eq!(dns_restore_action(&["203.0.113.2".into()], &journal), DnsRestoreAction::Conflict);
@@ -900,7 +1043,7 @@ mod tests {
     #[test]
     fn dns_journal_survives_failed_restoration() {
         use std::cell::Cell;
-        let journal = DnsJournal { service: "Ethernet".into(), original: vec![], applied: vec!["1.1.1.1".into()] };
+        let journal = DnsJournal { service: "Ethernet".into(), original: vec![], applied: vec!["1.1.1.1".into()], backup: None };
         let removed = Cell::new(false);
         let result = restore_dns_transaction(&journal, || Ok(journal.applied.clone()), |_| Err("set failed".into()), || { removed.set(true); Ok(()) });
         assert_eq!(result, Err("set failed".into()));
@@ -910,7 +1053,7 @@ mod tests {
     #[test]
     fn dns_journal_is_removed_only_after_verified_restoration() {
         use std::cell::{Cell, RefCell};
-        let journal = DnsJournal { service: "Ethernet".into(), original: vec![], applied: vec!["1.1.1.1".into()] };
+        let journal = DnsJournal { service: "Ethernet".into(), original: vec![], applied: vec!["1.1.1.1".into()], backup: None };
         let current = RefCell::new(journal.applied.clone());
         let removed = Cell::new(false);
         let result = restore_dns_transaction(&journal, || Ok(current.borrow().clone()), |values| { *current.borrow_mut() = values.to_vec(); Ok(()) }, || { removed.set(true); Ok(()) });
@@ -943,15 +1086,15 @@ mod tests {
     #[test]
     fn xray_api_is_addressed_through_the_unix_socket() {
         let server = api_server(&api_socket());
-        assert_eq!(server, "unix:/Library/Application Support/VpnClientHelper/api.sock");
+        assert_eq!(server, format!("unix:{}", api_socket().display()));
         // Flags first, then the server and the timeout, then positional arguments; the address stays one argument.
         assert_eq!(xray_api_args(&server, "adrules", &["-append"], &["/x/swap-kill.json"]), ["api", "adrules", "-append", "-s", server.as_str(), "-t", "5", "/x/swap-kill.json"]);
         assert_eq!(xray_api_args(&server, "rmrules", &[], &["tail"]), ["api", "rmrules", "-s", server.as_str(), "-t", "5", "tail"]);
         assert_eq!(xray_api_args(&server, "rmo", &[], &["vpn-out"]), ["api", "rmo", "-s", server.as_str(), "-t", "5", "vpn-out"]);
-        assert_eq!(xray_stats_args(&server), ["api", "statsquery", "-t", "2", "--server=unix:/Library/Application Support/VpnClientHelper/api.sock"]);
+        assert_eq!(xray_stats_args(&server), vec!["api".to_string(), "statsquery".to_string(), "-t".to_string(), "2".to_string(), format!("--server={server}")]);
         // The config Xray is started with names the same socket, without the client-side prefix and with a private mode.
         let link = "vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=xhttp&security=tls&sni=example.org&path=%2F";
         let config = vpn_core::profile::vless_tun_config_with_options(link, "utun9", None, false, Some(&api_listen()), &vpn_core::profile::Bypass::default()).unwrap();
-        assert_eq!(config["api"]["listen"], "/Library/Application Support/VpnClientHelper/api.sock,0600");
+        assert_eq!(config["api"]["listen"], serde_json::json!(format!("{},0600", api_socket().display())));
     }
 }

@@ -1202,6 +1202,14 @@ pub fn create_reality_client(host: &str, email: &str, sni: &str) -> Result<(Stri
     create_reality_client_on_port(host, email, sni, 443)
 }
 
+/// Xray binary for local key generation: the installed helper copy first, PATH as fallback.
+fn bundled_xray() -> &'static str {
+    for candidate in ["/Applications/VPNClient.app/Contents/Helpers/xray", "/usr/local/lib/vpnclient/xray"] {
+        if std::path::Path::new(candidate).is_file() { return candidate; }
+    }
+    "xray"
+}
+
 pub fn create_reality_client_on_port(host: &str, email: &str, sni: &str, port: u16) -> Result<(String, u64), String> {
     if port == 0 { return Err("Некорректный порт".into()); }
     if !valid_http_host(host) || !valid_domain_name(sni) { return Err("Некорректный хост или SNI".into()); }
@@ -1218,7 +1226,7 @@ pub fn create_reality_client_on_port(host: &str, email: &str, sni: &str, port: u
         if !stream["realitySettings"]["serverNames"].as_array().is_some_and(|names| names.iter().any(|name| name == sni)) { return Err("На порту 443 уже есть Reality inbound с другим SNI".into()); }
         existing["id"].as_u64().ok_or("Некорректный ID inbound-а")?
     } else {
-        let output = std::process::Command::new("/Applications/VPNClient.app/Contents/Helpers/xray").arg("x25519").output().map_err(|_| "Не удалось запустить генератор ключей Xray")?;
+        let output = std::process::Command::new(bundled_xray()).arg("x25519").output().map_err(|_| "Не удалось запустить генератор ключей Xray")?;
         if !output.status.success() { return Err("Не удалось создать ключи Reality".into()); }
         let text = String::from_utf8(output.stdout).map_err(|_| "Некорректный ответ генератора ключей")?;
         let private = text.lines().find_map(|line| line.strip_prefix("PrivateKey:").map(str::trim)).filter(|v| !v.is_empty()).ok_or("Генератор не вернул закрытый ключ")?;
