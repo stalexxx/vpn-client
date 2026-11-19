@@ -247,10 +247,29 @@ fn restore_dns() -> Result<(), String> {
     let bytes = match fs::read(&path) { Ok(b) => b, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()), Err(e) => return Err(e.to_string()) };
     let journal: DnsJournal = serde_json::from_slice(&bytes).map_err(|_| "Повреждён журнал восстановления DNS")?;
     #[cfg(target_os = "macos")]
+    if read_dns(&journal.service).is_err() && !network_service_exists(&journal.service)? {
+        // A deleted service has no DNS settings left to restore.
+        return fs::remove_file(&path).map_err(|e| e.to_string());
+    }
+    #[cfg(target_os = "macos")]
     let set = |servers: &[String]| set_dns(&journal.service, servers);
     #[cfg(target_os = "linux")]
     let set = |_: &[String]| restore_resolv_conf(&journal);
     restore_dns_transaction(&journal, || read_dns(&journal.service), set, || fs::remove_file(&path).map_err(|e| e.to_string()))
+}
+#[cfg(target_os = "macos")]
+fn network_service_exists(service: &str) -> Result<bool, String> {
+    let output = Command::new("/usr/sbin/networksetup").arg("-listallnetworkservices").output().map_err(|e| e.to_string())?;
+    if !output.status.success() { return Err("Не удалось проверить список сетевых служб; журнал DNS оставлен".into()); }
+    let text = String::from_utf8(output.stdout).map_err(|_| "Некорректный список сетевых служб")?;
+    parse_network_service_exists(service, &text)
+}
+#[cfg(target_os = "macos")]
+fn parse_network_service_exists(service: &str, text: &str) -> Result<bool, String> {
+    let mut lines = text.lines();
+    let header = lines.next().ok_or("Пустой список сетевых служб; журнал DNS оставлен")?;
+    if !header.contains("asterisk") { return Err("Неизвестный формат списка сетевых служб; журнал DNS оставлен".into()); }
+    Ok(lines.any(|line| line.trim().trim_start_matches('*') == service))
 }
 #[cfg(target_os = "macos")]
 fn interface_exists(name: &str) -> bool { Command::new("/sbin/ifconfig").arg(name).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false) }
@@ -1030,6 +1049,15 @@ mod tests {
         assert_eq!(service_for_interface("en7", services), Ok("USB LAN".into()));
         assert!(service_for_interface("en9", services).is_err());
         assert!(service_for_interface("en1", "(1) Ethernet\n(Hardware Port: Ethernet, Device: en10)\n").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detects_deleted_and_disabled_network_services() {
+        let services = "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n*USB LAN\n";
+        assert_eq!(parse_network_service_exists("USB LAN", services), Ok(true));
+        assert_eq!(parse_network_service_exists("Ethernet", services), Ok(false));
+        assert!(parse_network_service_exists("Ethernet", "unexpected output").is_err());
     }
 
     #[test]
