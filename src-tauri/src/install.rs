@@ -141,45 +141,30 @@ fn merge_install_result(progress: &mut Progress, contents: &str) {
         }
     }
 }
-// Never forward arbitrary installer output: it may contain credentials or tokens.
-fn consume(progress: &mut Progress, raw: &str) {
-    let line = strip_ansi(raw); let line = line.trim();
-    if let Some(v) = field(line, "Username") { if !v.is_empty() { progress.username = Some(v.to_owned()); } return; }
-    if let Some(v) = field(line, "Password") { if !v.is_empty() { progress.password = Some(v.to_owned()); } return; }
-    if let Some(v) = field(line, "API Token") { if !v.is_empty() { progress.token = Some(v.to_owned()); } return; }
-    if let Some(v) = field(line, "Access URL") {
-        if let Ok(url) = url::Url::parse(v) {
-            if ["https", "http"].contains(&url.scheme()) && url.host_str().is_some() && url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none() {
-                progress.url = Some(url.to_string());
-                progress.log.push("Установщик сообщил адрес панели.".into());
-            }
+// Preserve the server's output, while keeping credentials out of the visible log.
+fn consume(progress: &mut Progress, raw: &str, ssh_password: Option<&str>) {
+    let line = strip_ansi(raw);
+    let trimmed = line.trim();
+    let mut display = line.clone();
+    for (label, slot) in [("Username", &mut progress.username), ("Password", &mut progress.password), ("API Token", &mut progress.token)] {
+        if let Some(value) = field(trimmed, label) {
+            if !value.is_empty() { *slot = Some(value.to_owned()); }
+            if label != "Username" && !value.is_empty() { display = display.replace(value, "[скрыто]"); }
         }
-        return;
     }
-    let lower = line.to_ascii_lowercase();
-    let message = if lower.contains("permission denied") { Some("SSH: доступ отклонён; проверьте пароль или ключ и права.") }
-    else if lower.contains("host identification has changed") { Some("SSH: ключ сервера изменился. Сверьте новый отпечаток по независимому каналу, прежде чем обновлять known_hosts.") }
-    else if lower.contains("host key verification failed") || lower.contains("no matching host key") || lower.contains("no ed25519 host key is known") || lower.contains("no ecdsa host key is known") || lower.contains("no rsa host key is known") { Some("SSH: ключ сервера не подтверждён. Сверьте его отпечаток по независимому каналу и добавьте проверенный ключ в known_hosts.") }
-    else if lower.contains("connection refused") { Some("SSH: соединение отклонено сервером.") }
-    else if lower.contains("could not resolve hostname") { Some("SSH: не удалось определить адрес сервера.") }
-    else if lower.contains("connection timed out") { Some("SSH: время соединения истекло.") }
-    else if lower.contains("curl: (22)") { Some("Не удалось загрузить установщик: сервер вернул ошибку HTTP.") }
-    else if lower.contains("curl: (6)") { Some("Не удалось загрузить установщик: имя сервера загрузки не разрешено.") }
-    else if lower.contains("curl: (7)") { Some("Не удалось загрузить установщик: соединение с сервером загрузки не установлено.") }
-    else if lower.contains("curl: (60)") { Some("Не удалось загрузить установщик: ошибка проверки TLS-сертификата.") }
-    else if lower.contains("unable to locate package") || lower.contains("could not get lock") { Some("Не удалось установить системные пакеты; проверьте менеджер пакетов на сервере.") }
-    else if lower.contains("fatal error") || lower.starts_with("error:") { Some("Установщик сообщил об ошибке; подробности скрыты, чтобы не раскрыть секреты.") }
-    else if lower.contains("installation complete") || lower.contains("install finished") { Some("Установщик сообщил о завершении установки.") }
-    else if lower.contains("downloading") { Some("Загрузка компонентов…") }
-    else if lower.contains("installing") { Some("Установка компонентов…") }
-    else if lower.contains("the os release is:") { Some("Определена операционная система сервера.") }
-    else { None };
-    if let Some(m) = message { if progress.log.last().map(String::as_str) != Some(m) { progress.log.push(m.into()); } }
-    if progress.log.len() > 200 { progress.log.remove(0); }
+    if let Some(value) = field(trimmed, "Access URL") {
+        if let Ok(url) = url::Url::parse(value) {
+            if ["https", "http"].contains(&url.scheme()) && url.host_str().is_some() && url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none() { progress.url = Some(url.to_string()); }
+        }
+    }
+    for secret in [ssh_password, progress.password.as_deref(), progress.token.as_deref()].into_iter().flatten().filter(|s| !s.is_empty()) {
+        display = display.replace(secret, "[скрыто]");
+    }
+    progress.log.push(display);
 }
-fn read_output<R: std::io::Read>(reader: R, state: &InstallState) {
+fn read_output<R: std::io::Read>(reader: R, state: &InstallState, password: Option<&str>) {
     for line in BufReader::new(reader).split(b'\n') {
-        match line { Ok(bytes) => { let text = String::from_utf8_lossy(&bytes); if let Ok(mut p) = state.0.lock() { consume(&mut p, &text); } }, Err(_) => break }
+        match line { Ok(bytes) => { let text = String::from_utf8_lossy(&bytes); if let Ok(mut p) = state.0.lock() { consume(&mut p, &text, password); } }, Err(_) => break }
     }
 }
 #[tauri::command]
@@ -187,7 +172,7 @@ pub fn install_progress(state: tauri::State<'_, InstallState>) -> Result<Progres
     state.0.lock().map(|p| p.clone()).map_err(|_| "Состояние установки недоступно".into())
 }
 #[tauri::command]
-pub async fn install_panel(app: tauri::AppHandle, target: String, password: Option<String>, install_key: Option<bool>, ssh_key: Option<String>) -> Result<(), String> {
+pub fn install_panel(app: tauri::AppHandle, target: String, password: Option<String>, install_key: Option<bool>, ssh_key: Option<String>) -> Result<(), String> {
     use tauri::Manager;
     if !target.starts_with("root@") || !vpn_core::valid_ssh_target(&target) { return Err("Укажите SSH-цель в формате root@хост или root@хост:порт".into()); }
     let password = password.filter(|p| !p.is_empty());
@@ -214,7 +199,7 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
         match child {
             Ok(mut child) => {
                 let stderr = child.stderr.take().unwrap();
-                std::thread::scope(|scope| { scope.spawn(|| read_output(stderr, &state)); read_output(child.stdout.take().unwrap(), &state); });
+                std::thread::scope(|scope| { scope.spawn(|| read_output(stderr, &state, password.as_deref())); read_output(child.stdout.take().unwrap(), &state, password.as_deref()); });
                 let status = child.wait();
                 let needs_result = status.as_ref().is_ok_and(|s| s.success()) && state.0.lock().map(|p| p.username.is_none() || p.password.is_none() || p.token.is_none() || p.url.is_none()).unwrap_or(false);
                 if needs_result {
@@ -271,8 +256,57 @@ pub async fn install_panel(app: tauri::AppHandle, target: String, password: Opti
             }
             Err(_) => { if let Ok(mut p) = state.0.lock() { p.running = false; p.finished = true; p.log.push("Не удалось запустить системный SSH.".into()); } }
         }
-    }).await.map_err(|_| "Не удалось выполнить установку".to_owned())?;
+    });
     Ok(())
+}
+#[tauri::command]
+pub async fn check_ssh(target: String, password: Option<String>, ssh_key: Option<String>) -> Result<String, String> {
+    if !target.starts_with("root@") || !vpn_core::valid_ssh_target(&target) { return Err("Укажите SSH-цель в формате root@хост или root@хост:порт".into()); }
+    let password = password.filter(|p| !p.is_empty());
+    if password.as_deref().is_some_and(|p| !valid_password(p)) { return Err("Недопустимый SSH-пароль".into()); }
+    let ssh_key = ssh_key.filter(|k| !k.is_empty());
+    if let Some(name) = ssh_key.as_ref().filter(|n| n.as_str() != vpn_core::SYSTEM_SSH_KEY) { vpn_core::resolve_ssh_key(name)?; }
+    tauri::async_runtime::spawn_blocking(move || {
+        let askpass = password.as_deref().map(|_| Askpass::create()).transpose()?;
+        let (dest, port) = vpn_core::split_ssh_target(&target);
+        let output = ssh_command(password.as_deref(), askpass.as_ref(), port, ssh_key.as_deref()).args(["--", dest, "printf 'VPNCLIENT_SSH_OK\\n'"]).stdin(Stdio::null()).output().map_err(|e| format!("Не удалось запустить SSH: {e}"))?;
+        if output.status.success() { return Ok("SSH-подключение успешно: вход на сервер выполнен.".into()); }
+        let mut error = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+        if let Some(secret) = password.as_deref() { error = error.replace(secret, "[скрыто]"); }
+        if error.trim().is_empty() { error = format!("SSH завершился с кодом {}", output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "нет".into())); }
+        Err(error.trim().to_owned())
+    }).await.map_err(|e| format!("Ошибка проверки SSH: {e}"))?
+}
+/// Authorize the configured public key using a one-time SSH password, then verify key login.
+#[tauri::command]
+pub async fn add_ssh_key(target: String, password: String, ssh_key: Option<String>) -> Result<String, String> {
+    if !target.starts_with("root@") || !vpn_core::valid_ssh_target(&target) { return Err("Некорректная SSH-цель".into()); }
+    if !valid_password(&password) { return Err("Введите SSH-пароль (не более 256 символов, без переносов строки).".into()); }
+    let ssh_key = ssh_key.filter(|k| !k.is_empty());
+    let (name, public_key) = if ssh_key.as_deref() == Some(vpn_core::SYSTEM_SSH_KEY) {
+        let home = std::env::var_os("HOME").ok_or("Домашний каталог не найден")?;
+        let dir = std::path::PathBuf::from(home).join(".ssh");
+        ["id_ed25519", "id_rsa"].iter().find_map(|name| vpn_core::ssh_public_key_line(name).ok().map(|key| ((*name).to_owned(), key)))
+            .ok_or_else(|| format!("Для системного SSH не найдена пара id_ed25519 или id_rsa в {}", dir.display()))?
+    } else {
+        key_to_install(ssh_key.as_deref()).ok_or("Подходящая пара SSH-ключей не найдена в ~/.ssh. Создайте ключ или выберите существующий в настройках.")?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Write;
+        let askpass = Askpass::create()?;
+        let (dest, port) = vpn_core::split_ssh_target(&target);
+        let script = "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; IFS= read -r k; grep -qxF \"$k\" ~/.ssh/authorized_keys || printf '%s\\n' \"$k\" >> ~/.ssh/authorized_keys";
+        let mut child = ssh_command(Some(&password), Some(&askpass), port, None).args(["--", dest, script]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| format!("Не удалось запустить SSH: {e}"))?;
+        let write_result = child.stdin.take().ok_or("Не удалось передать публичный ключ")?.write_all(format!("{public_key}\n").as_bytes());
+        let output = child.wait_with_output().map_err(|e| format!("Ошибка SSH: {e}"))?;
+        if !output.status.success() || write_result.is_err() {
+            let error = strip_ansi(&String::from_utf8_lossy(&output.stderr)).replace(&password, "[скрыто]");
+            return Err(if error.trim().is_empty() { "Не удалось добавить ключ на сервер.".into() } else { error.trim().to_owned() });
+        }
+        let verify = ssh_command(None, None, port, ssh_key.as_deref()).args(["--", dest, "true"]).stdin(Stdio::null()).output().map_err(|e| format!("Ключ {name} добавлен, но не удалось проверить вход: {e}"))?;
+        if !verify.status.success() { return Err(format!("Ключ {name} добавлен, но вход по настройкам сервера не подтверждён: {}", strip_ansi(&String::from_utf8_lossy(&verify.stderr)).trim())); }
+        Ok(format!("Ключ {name} добавлен. Вход по SSH-ключу успешно проверен."))
+    }).await.map_err(|e| format!("Ошибка добавления SSH-ключа: {e}"))?
 }
 #[tauri::command]
 pub fn clear_install(state: tauri::State<'_, InstallState>) -> Result<(), String> {
@@ -309,24 +343,18 @@ mod tests {
         assert!(valid_password("abc") && !valid_password("") && !valid_password("a\nb"));
     }
     #[test]
-    fn reports_known_errors_without_forwarding_secrets() {
+    fn preserves_output_and_redacts_known_secrets() {
         let mut p = Progress::default();
-        consume(&mut p, "curl: (22) HTTP error secretpassword");
-        assert_eq!(p.log, ["Не удалось загрузить установщик: сервер вернул ошибку HTTP."]);
-        assert!(!p.log.join(" ").contains("secretpassword"));
-    }
-    #[test]
-    fn credentials_and_unknown_lines_never_enter_log() {
-        let mut p = Progress::default();
-        consume(&mut p, "\x1b[32mUsername: secretuser\x1b[0m");
-        consume(&mut p, "Password: secretpass"); consume(&mut p, "API Token: secrettoken");
-        consume(&mut p, "Error: secretuser secretpass secrettoken");
-        consume(&mut p, "Access URL: http://example.com:2053/base/");
-        assert_eq!(p.username.as_deref(), Some("secretuser"));
-        assert_eq!(p.password.as_deref(), Some("secretpass"));
-        assert_eq!(p.token.as_deref(), Some("secrettoken"));
+        consume(&mut p, "an arbitrary installer message", Some("ssh-secret"));
+        consume(&mut p, "Password: panel-secret", Some("ssh-secret"));
+        consume(&mut p, "API Token: token-secret", Some("ssh-secret"));
+        consume(&mut p, "error: ssh-secret panel-secret token-secret", Some("ssh-secret"));
+        consume(&mut p, "Access URL: http://example.com:2053/base/", None);
+        assert_eq!(p.log[0], "an arbitrary installer message");
+        assert_eq!(p.password.as_deref(), Some("panel-secret"));
+        assert_eq!(p.token.as_deref(), Some("token-secret"));
         assert_eq!(p.url.as_deref(), Some("http://example.com:2053/base/"));
-        let log = p.log.join(" "); for secret in ["secretuser", "secretpass", "secrettoken"] { assert!(!log.contains(secret)); }
+        for secret in ["ssh-secret", "panel-secret", "token-secret"] { assert!(!p.log.join(" ").contains(secret)); }
     }
     #[test]
     fn panel_is_bound_to_localhost_with_a_valid_confirmed_script() {

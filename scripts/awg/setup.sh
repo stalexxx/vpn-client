@@ -2,6 +2,9 @@
 # Installs AmneziaWG (userspace amneziawg-go) with Cloudflare WARP as the exit. Env: AWG_PORT, AWG_SHA256. Binary expected at /root/amneziawg-go.upload.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# Do not automatically restart services while configuring packages on a remote host.
+export NEEDRESTART_MODE=l
+trap 'rc=$?; echo "ERROR установка прервана: строка ${BASH_LINENO[0]:-$LINENO}, код $rc" >&2' ERR
 # Errors go to stderr too: the app shows the last stderr line as the reason for a failed install.
 fail(){ echo "ERROR $*" >&2; exit 4; }
 echo "$AWG_SHA256  /root/amneziawg-go.upload" | sha256sum -c - >/dev/null || { echo "ERROR checksum" >&2; exit 3; }
@@ -74,7 +77,6 @@ if [ ! -f $DIR/obf.env ]; then
     for i in 1 2 3 4; do echo "H$i=$(r 5-2000000000)"; done; } > $DIR/obf.env
 fi
 . $DIR/obf.env
-EXT=$(ip route show default | awk '{print $5; exit}')
 # A re-run must keep existing clients: their "# client <name>" blocks are carried over from the old awg0.conf.
 CLIENTS=""; [ -f $DIR/awg0.conf ] && CLIENTS=$(sed -n '/^# client /,$p' $DIR/awg0.conf || true)
 cat > $DIR/awg0.conf <<C
@@ -115,11 +117,11 @@ WantedBy=multi-user.target
 U
 done
 # Ubuntu images often run ufw with "deny incoming": without a rule the AmneziaWG UDP port drops every client packet.
-if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then ufw allow "$PORT"/udp comment 'AmneziaWG' >/dev/null; fi
+if command -v ufw >/dev/null && ufw status | grep '^Status: active' >/dev/null; then ufw allow "$PORT"/udp comment 'AmneziaWG' >/dev/null; fi
 # Some hosts keep an nftables input allowlist (table inet audit_filter, default drop): ufw alone does not open the port there.
 if nft list table inet audit_filter >/dev/null 2>&1; then
-  nft list chain inet audit_filter input | grep -q "udp dport $PORT accept" || nft add rule inet audit_filter input udp dport "$PORT" accept
-  if [ -f /etc/nftables.conf ] && ! sed -n '/^table inet audit_filter/,/^}/p' /etc/nftables.conf | grep -qE "udp dport .*\b$PORT\b"; then
+  nft list chain inet audit_filter input | grep "udp dport $PORT accept" >/dev/null || nft add rule inet audit_filter input udp dport "$PORT" accept
+  if [ -f /etc/nftables.conf ] && ! sed -n '/^table inet audit_filter/,/^}/p' /etc/nftables.conf | grep -E "udp dport .*\b$PORT\b" >/dev/null; then
     cp -p /etc/nftables.conf /etc/nftables.conf.bak-awg
     sed -i -E "/^table inet audit_filter/,/^}/ s/^([[:space:]]*)udp dport \{(.*)\} accept(.*)$/\1udp dport {\2, $PORT} accept   # AmneziaWG\3/" /etc/nftables.conf
   fi

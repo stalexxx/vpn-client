@@ -1,6 +1,6 @@
 [package]
 name = "vpn-gpui"
-version = "0.3.35"
+version = "0.3.37"
 edition = "2021"
 
 [dependencies]

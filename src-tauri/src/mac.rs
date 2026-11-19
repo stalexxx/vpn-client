@@ -175,7 +175,11 @@ pub(crate) fn open_admin_window(app: &tauri::AppHandle) -> Result<(), String> {
         window.set_focus().map_err(|e| e.to_string())?;
         return Ok(());
     }
-    WebviewWindowBuilder::new(app, "admin", WebviewUrl::App("admin.html".into()))
+    #[cfg(feature = "admin-only")]
+    let admin_page = "admin-gpui.html";
+    #[cfg(not(feature = "admin-only"))]
+    let admin_page = "admin.html";
+    WebviewWindowBuilder::new(app, "admin", WebviewUrl::App(admin_page.into()))
         .title("Администрирование VPN")
         .inner_size(1100.0, 760.0)
         .resizable(true)
@@ -189,7 +193,13 @@ fn open_admin(app: tauri::AppHandle) -> Result<(), String> { open_admin_window(&
 
 
 #[cfg(feature = "admin-only")]
-fn app_context() -> tauri::Context<tauri::Wry> { tauri::generate_context!("tauri.admin.conf.json") }
+fn app_context() -> tauri::Context<tauri::Wry> {
+    let mut context = tauri::generate_context!("tauri.admin.conf.json");
+    for window in &mut context.config_mut().app.windows {
+        window.url = tauri::WebviewUrl::App("admin-gpui.html".into());
+    }
+    context
+}
 #[cfg(not(feature = "admin-only"))]
 fn app_context() -> tauri::Context<tauri::Wry> { tauri::generate_context!() }
 
@@ -216,6 +226,8 @@ pub fn main() {
             get_bypass_settings,
             set_bypass_settings,
             install::install_panel,
+            install::check_ssh,
+            install::add_ssh_key,
             install::install_progress,
             install::clear_install,
             list_servers,
