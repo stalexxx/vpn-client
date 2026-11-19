@@ -14,6 +14,12 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSResponder", "NSView", "objc2-core-foundation"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# ksni, а не libappindicator: чистый Rust поверх D-Bus без GTK и GLib-loop.
+# libappindicator регистрирует имя шины асинхронно через GMainLoop, которого
+# в GPUI-приложении нет, — иконка молча не появляется.
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+
 [patch.crates-io]
 # xattr 0.2.3 uses libc::ENOATTR, removed from libc's Linux API; fixed copy, ENODATA on Linux/Android.
 xattr = { path = "../vendor/xattr" }

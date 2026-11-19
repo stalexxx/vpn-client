@@ -15,9 +15,10 @@ BIN="$ROOT/gpui-client/target/release/vpn-gpui"
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
-mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin" "$STAGE/usr/share/applications" "$STAGE/usr/share/pixmaps" "$OUT"
+mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin" "$STAGE/usr/share/applications" "$STAGE/usr/share/pixmaps" "$STAGE/usr/share/vpn-client" "$OUT"
 install -m 755 "$BIN" "$STAGE/usr/bin/vpn-gpui"
 install -m 644 "$ROOT/assets/icon-1024.png" "$STAGE/usr/share/pixmaps/vpn-client.png"
+install -m 644 "$ROOT/gpui-client/assets/globe.png" "$STAGE/usr/share/vpn-client/globe.png"
 cat > "$STAGE/usr/share/applications/vpn-client.desktop" <<EOF
 [Desktop Entry]
 Type=Application

@@ -154,7 +154,7 @@ impl Render for Client {
    }
   }
 
-  let image_path=std::env::current_exe().ok().and_then(|p|p.parent()?.parent().map(|p|p.join("Resources/globe.png"))).filter(|p|p.exists()).unwrap_or_else(||std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/globe.png"));
+  let image_path=[std::env::current_exe().ok().and_then(|p|p.parent()?.parent().map(|p|p.join("Resources/globe.png"))), Some(std::path::PathBuf::from("/usr/share/vpn-client/globe.png"))].into_iter().flatten().find(|p|p.exists()).unwrap_or_else(||std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/globe.png"));
   let button_tone=if busy.is_some(){WARN}else if vpn_failed {ERR}else if connected {0xdba4ff}else{0x8070a8};
   let (glow_hue,glow_alpha)=if busy.is_some(){(0.10,0.60)}else if vpn_failed {(0.0,0.55)}else if connected {(0.77,0.90)}else{(0.74,0.20)};
   let button_state=if busy.is_some(){state}else if connected {"ПОДКЛЮЧЕНО"}else if status==Some(false){"ОТКЛЮЧЕНО"}else{"НЕТ СТАТУСА"};
@@ -187,4 +187,4 @@ impl Render for Client {
 }
 
 actions!(vpn_gpui, [Quit]);
-fn main() { let control=Arc::new(control::State::default()); if let Err(e)=control::start(control.clone()) { if e=="Приложение VPN уже запущено" { eprintln!("{e}"); std::process::exit(0); } eprintln!("Не удалось запустить MCP-сокет: {e}"); std::process::exit(1); } Application::new().run(move |cx: &mut App| { cx.on_action(|_: &Quit, cx| cx.quit()); cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]); tray::install(); let bounds=Bounds::centered(None,size(px(1180.),px(720.)),cx); cx.open_window(WindowOptions { window_bounds:Some(WindowBounds::Windowed(bounds)), window_min_size:Some(size(px(820.),px(560.))), titlebar:Some(gpui::TitlebarOptions { title:Some("VPN Client".into()), appears_transparent:true, traffic_light_position:Some(point(px(12.),px(12.))) }), ..Default::default() }, |_,cx| cx.new(|cx|Client::new(control.clone(),cx))).unwrap(); cx.activate(true); }); }
+fn main() { let control=Arc::new(control::State::default()); if let Err(e)=control::start(control.clone()) { if e=="Приложение VPN уже запущено" { eprintln!("{e}"); std::process::exit(0); } eprintln!("Не удалось запустить MCP-сокет: {e}"); std::process::exit(1); } Application::new().run(move |cx: &mut App| { cx.on_action(|_: &Quit, cx| cx.quit()); cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]); tray::install(); let bounds=Bounds::centered(None,size(px(1180.),px(720.)),cx); cx.open_window(WindowOptions { window_bounds:Some(WindowBounds::Windowed(bounds)), window_min_size:Some(size(px(820.),px(560.))), app_id:Some("vpn-gpui".into()), titlebar:Some(gpui::TitlebarOptions { title:Some("VPN Client".into()), appears_transparent:true, traffic_light_position:Some(point(px(12.),px(12.))) }), ..Default::default() }, |_,cx| cx.new(|cx|Client::new(control.clone(),cx))).unwrap(); cx.activate(true); }); }
