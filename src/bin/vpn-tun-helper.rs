@@ -27,7 +27,9 @@ const AWG_BIN: &str = "/usr/local/lib/vpnclient/awgsocks";
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Deserialize)]
-struct Request { action: String, #[serde(default)] link: Option<String>, #[serde(default)] relay_link: Option<String>, #[serde(default)] lines: Option<usize>, #[serde(default)] filter: Option<String>, #[serde(default)] level: Option<String>, #[serde(default)] bypass: Option<vpn_core::profile::Bypass> }
+struct Request { action: String, #[serde(default)] link: Option<String>, #[serde(default)] relay_link: Option<String>, #[serde(default)] lines: Option<usize>, #[serde(default)] filter: Option<String>, #[serde(default)] level: Option<String>, #[serde(default)] bypass: Option<vpn_core::profile::Bypass>, #[serde(default)] enabled: Option<bool> }
+#[derive(Clone, Serialize, Deserialize)]
+struct LastProfile { link: String, #[serde(default)] relay_link: Option<String>, #[serde(default)] bypass: vpn_core::profile::Bypass }
 #[derive(Serialize)]
 struct Response { ok: bool, connected: bool, message: String, version: &'static str, connectivity_check: bool, reality_support: bool, hysteria2_support: bool, hysteria_chain_support: bool, awg_support: bool, api_socket: bool }
 #[derive(Clone, Serialize, Deserialize)]
@@ -97,6 +99,35 @@ fn read_record() -> Result<Option<ProcessRecord>, String> {
 fn write_secure(path: &Path, data: &[u8]) -> Result<(), String> {
     let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path).map_err(|e| e.to_string())?;
     f.write_all(data).and_then(|_| f.sync_all()).map_err(|e| e.to_string())
+}
+/// Last successfully connected profile (secret links, root-only 0600). Written on every
+/// successful connect/switch, kept across reboots and explicit `stop` so the helper can
+/// reconnect automatically at startup. Delete `last-link.json` or turn `autoconnect` off
+/// to stop dialling on boot.
+fn last_link_path() -> PathBuf { root_path("last-link.json") }
+fn autoconnect_path() -> PathBuf { root_path("autoconnect") }
+fn load_last_profile() -> Option<LastProfile> {
+    let bytes = fs::read(last_link_path()).ok()?;
+    let profile: LastProfile = serde_json::from_slice(&bytes).ok()?;
+    if profile.link.trim().is_empty() { return None; }
+    Some(profile)
+}
+fn save_last_profile(link: &str, relay_link: Option<&str>, bypass: &vpn_core::profile::Bypass) {
+    let profile = LastProfile { link: link.to_owned(), relay_link: relay_link.map(str::to_owned), bypass: bypass.clone() };
+    match serde_json::to_vec(&profile) {
+        Ok(bytes) => { if let Err(e) = write_secure(&last_link_path(), &bytes) { eprintln!("vpn-tun-helper: cannot persist last profile: {e}"); } }
+        Err(e) => eprintln!("vpn-tun-helper: cannot encode last profile: {e}"),
+    }
+}
+/// Whether boot-time autoconnect is allowed. Missing file means enabled (connect to the
+/// last profile after a reboot with no extra setup); `0`, `off`, `false` or `no` disables it.
+fn parse_autoconnect(text: &str) -> bool {
+    !matches!(text.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no" | "disable" | "disabled")
+}
+fn autoconnect_enabled() -> bool { fs::read_to_string(autoconnect_path()).map(|v| parse_autoconnect(&v)).unwrap_or(true) }
+fn remember_profile(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass: &vpn_core::profile::Bypass) {
+    state.last = Some((link.to_owned(), relay_link.map(str::to_owned), bypass.clone()));
+    save_last_profile(link, relay_link, bypass);
 }
 #[cfg(target_os = "macos")]
 fn read_dns(service: &str) -> Result<Vec<String>, String> {
@@ -685,7 +716,7 @@ fn switch(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass:
     let relay = relay_link.map(str::to_owned);
     if !connected(state) {
         return match start(state, link, relay_link, bypass, false) {
-            Ok(m) => { state.last = Some((link.to_owned(), relay, bypass.clone())); response(true, true, m) }
+            Ok(m) => { remember_profile(state, link, relay_link, bypass); response(true, true, m) }
             Err(e) => response(false, connected(state), e),
         };
     }
@@ -693,7 +724,7 @@ fn switch(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass:
     // Preferred path: replace the VPN outbound inside the running Xray; the TUN, routes and DNS stay up, and every
     // intermediate state of the swap blackholes traffic instead of letting it around the tunnel.
     match hot_switch(state, link, relay_link, bypass) {
-        HotSwitch::Switched => { state.last = Some((link.to_owned(), relay, bypass.clone())); return response(true, true, "VPN переключён на новый профиль без разрыва туннеля."); }
+        HotSwitch::Switched => { remember_profile(state, link, relay_link, bypass); return response(true, true, "VPN переключён на новый профиль без разрыва туннеля."); }
         HotSwitch::Failed(error) => return response(false, connected(state), error),
         HotSwitch::NotApplicable(reason) => eprintln!("горячая замена профиля недоступна ({reason}); перезапускаем Xray"),
     }
@@ -701,12 +732,12 @@ fn switch(state: &mut HelperState, link: &str, relay_link: Option<&str>, bypass:
     let previous = state.last.clone();
     if let Err(e) = stop(state, true) { return response(false, connected(state), e); }
     match start(state, link, relay_link, bypass, true) {
-        Ok(m) => { state.last = Some((link.to_owned(), relay, bypass.clone())); response(true, true, m) }
+        Ok(m) => { remember_profile(state, link, relay_link, bypass); response(true, true, m) }
         Err(e) => {
             // start() already rolled the network back (DNS restored); try to restore the old tunnel.
             if let Some((old_link, old_relay, old_bypass)) = previous {
                 match start(state, &old_link, old_relay.as_deref(), &old_bypass, false) {
-                    Ok(_) => { state.last = Some((old_link, old_relay, old_bypass)); return response(false, true, format!("{e}; возвращён прежний профиль")); }
+                    Ok(_) => { remember_profile(state, &old_link, old_relay.as_deref(), &old_bypass); return response(false, true, format!("{e}; возвращён прежний профиль")); }
                     Err(e2) => { state.last = None; return response(false, connected(state), format!("{e}; прежний профиль тоже не поднялся: {e2}")); }
                 }
             }
@@ -802,9 +833,17 @@ fn connected(state: &HelperState) -> bool { tunnel_running(state) }
 fn handle(state: &mut HelperState, req: Request) -> Response {
     match req.action.as_str() {
         "status" => { let is_connected = connected(state); response(true, is_connected, if is_connected { "TUN подключён" } else { "TUN отключён" }) },
-        "start" => match req.link.as_deref() { Some(link) => { let was = connected(state); match start(state, link, req.relay_link.as_deref(), &req.bypass.clone().unwrap_or_default(), false) { Ok(m) => { if !was { state.last = Some((link.to_owned(), req.relay_link.clone(), req.bypass.clone().unwrap_or_default())); } response(true, true, m) }, Err(e) => response(false, connected(state), e) } }, None => response(false, connected(state), "Не передан профиль клиента") },
+        "start" => match req.link.as_deref() { Some(link) => { let was = connected(state); let bypass = req.bypass.clone().unwrap_or_default(); match start(state, link, req.relay_link.as_deref(), &bypass, false) { Ok(m) => { if !was { remember_profile(state, link, req.relay_link.as_deref(), &bypass); } response(true, true, m) }, Err(e) => response(false, connected(state), e) } }, None => response(false, connected(state), "Не передан профиль клиента") },
         "switch" => match req.link.as_deref() { Some(link) => switch(state, link, req.relay_link.as_deref(), &req.bypass.clone().unwrap_or_default()), None => response(false, connected(state), "Не передан профиль клиента") },
         "stop" => match stop(state, false) { Ok(()) => response(true, false, "VPN отключён; DNS восстановлен"), Err(e) => response(false, connected(state), e) },
+        "get_autoconnect" => response(true, connected(state), if autoconnect_enabled() { "on" } else { "off" }),
+        "set_autoconnect" => match req.enabled {
+            Some(enabled) => match write_secure(&autoconnect_path(), if enabled { b"1" } else { b"0" }) {
+                Ok(()) => response(true, connected(state), if enabled { "Автоподключение при старте включено" } else { "Автоподключение при старте выключено" }),
+                Err(e) => response(false, connected(state), e),
+            },
+            None => response(false, connected(state), "Не передан флаг enabled"),
+        },
         "log" => {
             let lines = req.lines.unwrap_or(50).clamp(1, 300);
             let filter = req.filter.as_deref().filter(|f| !f.is_empty() && f.len() <= 64);
@@ -893,12 +932,47 @@ fn serve(uid: u32, xray: PathBuf) -> Result<(), String> {
         if let Err(e) = restore_dns() { eprintln!("vpn-tun-helper: startup DNS recovery: {e}"); }
     }
     if state.active.is_none() { kill_awg(); }
+    // A previous run saved its profile on disk: keep it in memory so profile switches
+    // and fallbacks keep working even after this process restarts.
+    if state.active.is_some() {
+        if let Some(saved) = load_last_profile() {
+            state.last = Some((saved.link, saved.relay_link, saved.bypass));
+        }
+    }
     let state = Arc::new(Mutex::new(state));
     let monitor_state = Arc::clone(&state);
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(1));
         if let Ok(mut state) = monitor_state.lock() { reap_exited_process(&mut state); }
     });
+    // Boot-time autoconnect: the systemd unit / LaunchDaemon starts the helper on every boot,
+    // so dialling the last profile here (with retries while the network comes up) connects
+    // the VPN automatically after a reboot. The socket stays responsive while this retries.
+    let boot_profile = state.lock().ok().and_then(|mut state| {
+        if state.active.is_some() || !autoconnect_enabled() { return None; }
+        let saved = load_last_profile()?;
+        state.last = Some((saved.link.clone(), saved.relay_link.clone(), saved.bypass.clone()));
+        Some(saved)
+    });
+    if let Some(profile) = boot_profile {
+        let auto_state = Arc::clone(&state);
+        thread::spawn(move || {
+            for attempt in 1..=36 {
+                if !autoconnect_enabled() { eprintln!("vpn-tun-helper: autoconnect disabled, giving up"); return; }
+                let done = auto_state.lock().map(|mut state| {
+                    if connected(&state) { return true; }
+                    let bypass = profile.bypass.clone();
+                    match start(&mut state, &profile.link, profile.relay_link.as_deref(), &bypass, false) {
+                        Ok(message) => { remember_profile(&mut state, &profile.link, profile.relay_link.as_deref(), &bypass); eprintln!("vpn-tun-helper: autoconnect succeeded: {message}"); true }
+                        Err(e) => { eprintln!("vpn-tun-helper: autoconnect attempt {attempt}/36: {e}"); false }
+                    }
+                }).unwrap_or(true);
+                if done { return; }
+                thread::sleep(Duration::from_secs(10));
+            }
+            eprintln!("vpn-tun-helper: autoconnect gave up after 36 attempts");
+        });
+    }
     for incoming in listener.incoming() {
         let mut stream = match incoming { Ok(s) => s, Err(_) => continue };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -1174,5 +1248,27 @@ mod tests {
         let link = "vless://12345678-1234-1234-1234-123456789abc@example.org:443?type=xhttp&security=tls&sni=example.org&path=%2F";
         let config = vpn_core::profile::vless_tun_config_with_options(link, "utun9", None, false, Some(&api_listen()), &vpn_core::profile::Bypass::default()).unwrap();
         assert_eq!(config["api"]["listen"], serde_json::json!(format!("{},0600", api_socket().display())));
+    }
+
+    #[test]
+    fn autoconnect_flag_defaults_to_on() {
+        for on in ["", "1", "on", "ON", " true ", "yes", "anything-else"] { assert!(parse_autoconnect(on), "{on:?}"); }
+        for off in ["0", "off", "OFF", "false", "False ", "no", "disable", "disabled"] { assert!(!parse_autoconnect(off), "{off:?}"); }
+    }
+
+    #[test]
+    fn last_profile_round_trips_through_json() {
+        let bypass = vpn_core::profile::Bypass { bittorrent: false, entries: vec!["example.com".into()] };
+        let profile = LastProfile { link: "vless://uuid@host:443?security=reality".into(), relay_link: Some("vless://relay".into()), bypass };
+        let bytes = serde_json::to_vec(&profile).unwrap();
+        let back: LastProfile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.link, profile.link);
+        assert_eq!(back.relay_link, profile.relay_link);
+        assert_eq!(back.bypass, profile.bypass);
+        // Older files without bypass/relay still load with safe defaults.
+        let legacy: LastProfile = serde_json::from_str(r#"{"link":"awg://abc"}"#).unwrap();
+        assert_eq!(legacy.link, "awg://abc");
+        assert_eq!(legacy.relay_link, None);
+        assert_eq!(legacy.bypass, vpn_core::profile::Bypass::default());
     }
 }

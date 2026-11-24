@@ -184,6 +184,14 @@ pub fn log_level() -> Result<String, String> {
 pub fn set_log_level(level: &str) -> Result<String, String> {
     Ok(request_value(json!({"action":"set_log_level","level":level}))?.get("message").and_then(Value::as_str).unwrap_or("").to_owned())
 }
+/// Boot-time autoconnect flag stored by the helper next to the last profile.
+/// Enabled by default once a profile was saved; the helper dials it after every reboot.
+pub fn autoconnect_enabled() -> Result<bool, String> {
+    Ok(request_value(json!({"action":"get_autoconnect"}))?.get("message").and_then(Value::as_str).unwrap_or("on") == "on")
+}
+pub fn set_autoconnect(enabled: bool) -> Result<String, String> {
+    Ok(request_value(json!({"action":"set_autoconnect","enabled":enabled}))?.get("message").and_then(Value::as_str).unwrap_or("").to_owned())
+}
 /// Cumulative per-outbound byte counters: {direct:{up,down}, vpn:{up,down}, ts_ms}.
 pub fn stats() -> Result<Value, String> {
     let response = request_value(json!({"action":"stats"}))?;

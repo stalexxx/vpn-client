@@ -1,6 +1,6 @@
 #!/bin/bash
 # Talks to vpn-tun-helper over its Unix socket (works on macOS and Linux).
-# usage: scripts/vpn.sh status | start <link> [relay-link] | stop | stats | log [lines] [filter] | log-level [info|warning]
+# usage: scripts/vpn.sh status | start <link> [relay-link] | stop | stats | log [lines] [filter] | log-level [info|warning] | autoconnect [on|off]
 set -euo pipefail
 action="${1:-status}"
 python3 - "$action" "$@" <<'EOF'
@@ -17,8 +17,15 @@ elif action == "log":
 elif action == "log-level":
     if len(args) > 1: req = {"action": "set_log_level", "level": args[1]}
     else: req = {"action": "get_log_level"}
+elif action == "autoconnect":
+    if len(args) > 1:
+        val = args[1].lower()
+        if val in ("on", "1", "enable", "enabled"): req = {"action": "set_autoconnect", "enabled": True}
+        elif val in ("off", "0", "disable", "disabled"): req = {"action": "set_autoconnect", "enabled": False}
+        else: sys.exit("usage: vpn.sh autoconnect [on|off]")
+    else: req = {"action": "get_autoconnect"}
 elif action not in ("status", "stop", "stats"):
-    sys.exit("usage: vpn.sh status | start <link> [relay-link] | stop | stats | log [lines] [filter] | log-level [info|warning]")
+    sys.exit("usage: vpn.sh status | start <link> [relay-link] | stop | stats | log [lines] [filter] | log-level [info|warning] | autoconnect [on|off]")
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(70 if action == "start" else 20)
 try: s.connect("/var/run/vpnclient-tun.sock")
